@@ -334,6 +334,23 @@ void title_memory(size_t& gpu_optimal, size_t& standard) {
     }
 }
 
+void* alloc(size_t size, uint64_t attributes) { return XMemAlloc(size, attributes); }
+void free(void* p, uint64_t attributes) { XMemFree(p, attributes); }
+
+void* gpu_alloc(size_t size, size_t alignment) {
+    MEM_ADDRESS_REQUIREMENTS req{};
+    req.LowestStartingAddress = reinterpret_cast<void*>(1ull << 32);
+    req.HighestEndingAddress = reinterpret_cast<void*>((1ull << 40) - 1);
+    req.Alignment = alignment > 65536 ? alignment : 0;
+    MEM_EXTENDED_PARAMETER param{};
+    param.Type = MemExtendedParameterAddressRequirements;
+    param.Pointer = &req;
+    return VirtualAlloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &param, 1);
+}
+void gpu_free(void* p) {
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+}
+
 bool write_physical(const uint64_t* pages, size_t page_count, size_t offset, const void* data, size_t len) {
     const auto* src = static_cast<const uint8_t*>(data);
     std::lock_guard g(g_lock);

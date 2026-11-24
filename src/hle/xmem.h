@@ -15,4 +15,11 @@ bool write_physical(const uint64_t* pages, size_t page_count, size_t offset, con
 // Title memory sizes for the current console: (GPU-optimal, standard).
 void title_memory(size_t& gpu_optimal, size_t& standard);
 
+// The title's general allocator (its hooks if it has them), as XMemAlloc / XMemFree.
+void* alloc(size_t size, uint64_t attributes);
+void free(void* p, uint64_t attributes);
+// Zeroed, committed memory below 2^40 (where console GPU addresses live), aligned to 64 KiB at least.
+void* gpu_alloc(size_t size, size_t alignment);
+void gpu_free(void* p);
+
 }  // namespace kl::xmem
