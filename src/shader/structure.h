@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace kl::shader::cfg {
@@ -18,7 +19,8 @@ struct Node {
     std::vector<Node> body, other;
 };
 
-std::vector<Node> plan(const std::vector<Term>& terms, const std::vector<Region>& regions);
+// why: the first place the plan had to run blocks by number, if any.
+std::vector<Node> plan(const std::vector<Term>& terms, const std::vector<Region>& regions, std::string* why = nullptr);
 const char* build_stamp();
 
 }  // namespace kl::shader::cfg

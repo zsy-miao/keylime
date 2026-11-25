@@ -1986,7 +1986,7 @@ struct T {
         find_regions();
         std::vector<cfg::Region> cr;
         for (auto& r : regions) cr.push_back({r.lo, r.hi});
-        auto nodes = cfg::plan(terms(), cr);
+        auto nodes = cfg::plan(terms(), cr, &out.plan_note);
         count_plan(nodes);
         run(nodes, starts);
         if (p.stage == HwStage::Ms) mesh_epilogue();

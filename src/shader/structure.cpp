@@ -1,6 +1,7 @@
 #include "shader/structure.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace kl::shader::cfg {
 namespace {
@@ -13,6 +14,7 @@ struct Planner {
     uint32_t n;
     std::vector<std::vector<uint32_t>> preds;
     std::vector<char> active;
+    std::string why;
 
     Planner(const std::vector<Term>& t, const std::vector<Region>& r) : terms(t), regions(r), n(uint32_t(t.size())) {
         preds.resize(n + 1);
@@ -40,12 +42,35 @@ struct Planner {
         return false;
     }
 
-    bool entered_mid_loop() const {
+    // Loops may be entered in the middle only from the block just before them (a rotated
+    // loop: a jump to its condition at the bottom); those run their body by number.
+    bool entered_mid_loop() {
         for (auto& r : regions)
             for (uint32_t k = r.lo + 1; k <= r.hi && k < n; ++k)
                 for (uint32_t p : preds[k])
-                    if (p < r.lo || p > r.hi) return true;
+                    if ((p < r.lo || p > r.hi) && p + 1 != r.lo) {
+                        note("block %u enters the loop at blocks %u-%u in its middle (block %u)", p, r.lo, r.hi, k);
+                        return true;
+                    }
         return false;
+    }
+    int mid_entered(uint32_t k) const {
+        int best = -1;
+        for (size_t r = 0; r < regions.size(); ++r) {
+            auto& g = regions[r];
+            if (active[r] || g.lo != k + 1) continue;
+            bool mid = false;
+            for (uint32_t s : succ(k)) mid |= s > g.lo && s <= g.hi;
+            if (mid && (best < 0 || g.hi > regions[size_t(best)].hi)) best = int(r);
+        }
+        return best;
+    }
+    template <class... A>
+    void note(const char* f, A... a) {
+        if (!why.empty()) return;
+        char b[160];
+        snprintf(b, sizeof b, f, a...);
+        why = b;
     }
 
     bool valid(uint32_t lo, uint32_t hi, uint32_t exit, uint32_t entry, const std::vector<uint32_t>& esc) const {
@@ -91,7 +116,16 @@ struct Planner {
     }
 
     bool fallback(uint32_t k, uint32_t hi, std::vector<Node>& out) {
-        if (k <= hi) out.push_back({Node::Range, k, hi});
+        if (k <= hi) {
+            note("block %u: %s", k ? k - 1 : 0, terms[k ? k - 1 : 0].kind == Exit::Jump ? "a jump" : "a branch");
+            out.push_back({Node::Range, k, hi});
+        }
+        return true;
+    }
+    bool exits_ok(const Region& r, const std::vector<uint32_t>& out_ok) const {
+        for (uint32_t x = r.lo; x <= r.hi; ++x)
+            for (uint32_t s : succ(x))
+                if ((s < r.lo || s > r.hi) && s != r.hi + 1 && s != n && !has(out_ok, s)) return false;
         return true;
     }
 
@@ -101,21 +135,55 @@ struct Planner {
                 const Region& r = regions[size_t(ri)];
                 std::vector<uint32_t> out_ok = esc;
                 out_ok.push_back(exit);
-                for (uint32_t x = r.lo; x <= r.hi; ++x)
-                    for (uint32_t s : succ(x))
-                        if ((s < r.lo || s > r.hi) && s != r.hi + 1 && s != n && !has(out_ok, s)) return fallback(k, hi, out);
+                if (!exits_ok(r, out_ok)) {
+                    note("the loop at blocks %u-%u leaves to a block other than the one after it", r.lo, r.hi);
+                    return fallback(k, hi, out);
+                }
                 Node l{Node::Loop, uint32_t(ri)};
                 active[size_t(ri)] = 1;
                 std::vector<uint32_t> inner = out_ok;
                 inner.push_back(r.lo);
+                inner.push_back(r.hi + 1);
                 if (valid(r.lo, r.hi, r.hi + 1, ANY, inner)) seq(r.lo, r.hi, r.hi + 1, inner, l.body);
-                else l.body.push_back({Node::Range, r.lo, r.hi});
+                else {
+                    note("the loop at blocks %u-%u does not nest", r.lo, r.hi);
+                    l.body.push_back({Node::Range, r.lo, r.hi});
+                }
                 active[size_t(ri)] = 0;
                 out.push_back(std::move(l));
                 return rest(r.hi + 1, hi, exit, esc, out);
             }
             out.push_back({Node::Block, k});
             const Term& t = terms[k];
+            if (int ri = mid_entered(k); ri >= 0 && uint32_t(ri) < regions.size() && regions[size_t(ri)].hi <= hi) {
+                const Region& r = regions[size_t(ri)];
+                std::vector<uint32_t> out_ok = esc;
+                out_ok.push_back(exit);
+                bool ok = exits_ok(r, out_ok);
+                for (uint32_t s : succ(k)) ok &= (s >= r.lo && s <= r.hi + 1) || s == n || has(out_ok, s);
+                if (!ok) return fallback(k + 1, hi, out);
+                uint32_t c = 0;
+                for (uint32_t s : succ(k))
+                    if (s > r.lo && s <= r.hi) c = s;
+                Node l{Node::Loop, uint32_t(ri)};
+                active[size_t(ri)] = 1;
+                std::vector<uint32_t> inner = out_ok;
+                inner.push_back(r.lo);
+                inner.push_back(r.hi + 1);
+                if (valid(r.lo, c - 1, c, ANY, inner) && valid(c, r.hi, r.hi + 1, ANY, inner)) {
+                    Node top{Node::If, r.lo}, bottom{Node::If, c};
+                    seq(r.lo, c - 1, c, inner, top.body);
+                    seq(c, r.hi, r.hi + 1, inner, bottom.body);
+                    l.body.push_back(std::move(top));
+                    l.body.push_back(std::move(bottom));
+                } else {
+                    note("the loop at blocks %u-%u is entered at block %u and does not nest", r.lo, r.hi, c);
+                    l.body.push_back({Node::Range, r.lo, r.hi});
+                }
+                active[size_t(ri)] = 0;
+                out.push_back(std::move(l));
+                return rest(r.hi + 1, hi, exit, esc, out);
+            }
             if (t.kind == Exit::End) return true;
             if (t.kind == Exit::Next) {
                 ++k;
@@ -175,16 +243,18 @@ struct Planner {
 
 const char* build_stamp() { return __DATE__ " " __TIME__; }
 
-std::vector<Node> plan(const std::vector<Term>& terms, const std::vector<Region>& regions) {
+std::vector<Node> plan(const std::vector<Term>& terms, const std::vector<Region>& regions, std::string* why) {
     uint32_t n = uint32_t(terms.size());
     std::vector<Node> out;
     if (!n) return out;
     Planner p(terms, regions);
     if (p.entered_mid_loop() || !p.valid(0, n - 1, n, ANY, {})) {
+        p.note("%s", "the program's branches do not nest");
         out.push_back({Node::Range, 0, n - 1});
-        return out;
+    } else {
+        p.seq(0, n - 1, n, {}, out);
     }
-    p.seq(0, n - 1, n, {}, out);
+    if (why) *why = p.why;
     return out;
 }
 

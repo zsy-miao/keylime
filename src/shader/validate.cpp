@@ -214,8 +214,8 @@ int validate(const fs::path& dir, bool driver) {
                 r = vk::vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
                 double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 cs_seconds += sec;
-                printf("  %.2f s (%zu KB code, %zu KB SPIR-V, %u blocks, %u by number)\n", sec, p.code.size() >> 10, (t.spirv.size() * 4) >> 10,
-                       t.blocks, t.guarded_blocks);
+                printf("  %.2f s (%zu KB code, %zu KB SPIR-V, %u blocks, %u by number%s%s)\n", sec, p.code.size() >> 10, (t.spirv.size() * 4) >> 10,
+                       t.blocks, t.guarded_blocks, t.plan_note.empty() ? "" : ": ", t.plan_note.c_str());
             } else if (p.stage == HwStage::Ms) {
                 vk::vkDestroyShaderModule(d, m, nullptr);
                 continue;

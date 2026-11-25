@@ -28,6 +28,7 @@ struct Translation {
     uint8_t mrt_mask = 0;
     bool writes_depth = false, discards = false;
     uint32_t blocks = 0, guarded_blocks = 0;
+    std::string plan_note;  // why some blocks run by number
 };
 
 // Host choices for one translation.
