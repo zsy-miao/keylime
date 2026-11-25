@@ -1385,6 +1385,7 @@ struct Builder {
             return;
         }
         uint32_t type = args[0][0], max = uint32_t(std::min<uint64_t>(x.max, 1u << 16));
+        if (type == 105) type = 2;
         if (type > 2) {
             once("ExecuteIndirect with argument type %u is skipped (not supported yet)", type);
             return;
@@ -1409,9 +1410,10 @@ struct Builder {
         // (memory a dropped dispatch never wrote), a command becomes empty instead of a GPU hang.
         uint32_t words = bytes[type] / 4;
         uint64_t tight;
-        uint32_t* r = g_clamp[type] ? record(c, max * words + 1, tight) : nullptr;
+        uint32_t* r = g_clamp[type] ? record(c, max * words + 2, tight) : nullptr;
         if (!r) return;
         r[max * words] = max;
+        r[max * words + 1] = 0;
         auto& blk = c->records[c->block];
         VkBuffer db = blk.buffer;
         VkDeviceSize doff = tight - blk.device;

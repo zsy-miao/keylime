@@ -1361,8 +1361,9 @@ struct T {
             // Float min/max: compare-and-swap loop.
             bool mn = is("fmin");
             Id hdr = b.id(), body_ = b.id(), cont_ = b.id(), merge_ = b.id();
-            Id prev_var = b.local(p_fn_u32, u(0));
+            Id prev_var = b.local(p_fn_u32, u(0)), tries_var = b.local(p_fn_u32, u(0));
             store(prev_var, b.op(spv::OpAtomicLoad, t_u32, {ptr, u(spv::ScopeDevice), u(0)}));
+            store(tries_var, u(0));
             b.op_void(spv::OpBranch, {hdr});
             b.label(hdr);
             b.op_void(spv::OpLoopMerge, {merge_, cont_, 0});
@@ -1373,9 +1374,12 @@ struct T {
             want = sel(t_u32, go, want, prev);
             Id got = b.op(spv::OpAtomicCompareExchange, t_u32, {ptr, u(spv::ScopeDevice), u(0), u(0), want, prev});
             store(prev_var, got);
+            Id tries = b.op(spv::OpIAdd, t_u32, {load(tries_var, t_u32), u(1)});
+            store(tries_var, tries);
             b.op_void(spv::OpBranch, {cont_});
             b.label(cont_);
-            b.op_void(spv::OpBranchConditional, {b.op(spv::OpIEqual, t_bool, {got, prev}), merge_, hdr});
+            Id done = b.op(spv::OpLogicalOr, t_bool, {b.op(spv::OpIEqual, t_bool, {got, prev}), b.op(spv::OpUGreaterThanEqual, t_bool, {tries, u(256)})});
+            b.op_void(spv::OpBranchConditional, {done, merge_, hdr});
             b.label(merge_);
             old = load(prev_var, t_u32);
         } else {
