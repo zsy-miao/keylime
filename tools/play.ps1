@@ -1,10 +1,15 @@
 <# keylime: run GTA VI with a live log console. Logs also go to D:\keylime\logs\keylime.log.
    tools\play.ps1                 normal run
-   tools\play.ps1 -Trace          very detailed logging (KEYLIME_TRACE=1) #>
-param([switch]$Trace, [string]$Game = 'D:\GTA6.Xbox.v1.0.2.1-CYBERLEEK')
+   tools\play.ps1 -Trace          very detailed logging (KEYLIME_TRACE=1)
+   tools\play.ps1 -Update         get the latest version from GitHub and build it first #>
+param([switch]$Trace, [switch]$Update, [string]$Game = 'D:\GTA6.Xbox.v1.0.2.1-CYBERLEEK')
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root 'build\keylime.exe'
 $Host.UI.RawUI.WindowTitle = 'keylime log'
+if ($Update) {
+    & (Join-Path $PSScriptRoot 'update.ps1')
+    if ($LASTEXITCODE -ne 0) { Read-Host 'Update failed. Press Enter to play the version already built'; }
+}
 if (-not (Test-Path $exe)) {
     Write-Host 'Building keylime first...' -ForegroundColor Yellow
     & (Join-Path $PSScriptRoot 'build.ps1')
