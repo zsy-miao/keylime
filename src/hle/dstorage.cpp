@@ -123,12 +123,13 @@ struct Lane {
     uint64_t id;
     uint16_t capacity;
     std::vector<Cmd> unsubmitted;
+    std::vector<Cmd> held_back;   // left for the title's Submit when the queue submitted itself
     std::deque<Cmd> reads;        // submitted, not started
     std::deque<Cmd> statuses;     // submitted, waiting for earlier reads
     std::map<uint64_t, HRESULT> running;  // started reads by seq (result S_FALSE while running)
     HRESULT first_failure = S_OK;
     bool closed = false;
-    size_t held() const { return unsubmitted.size() + reads.size() + statuses.size() + running.size(); }
+    size_t held() const { return unsubmitted.size() + held_back.size() + reads.size() + statuses.size() + running.size(); }
 };
 
 struct Scheduler {
@@ -138,9 +139,16 @@ struct Scheduler {
     uint64_t next_id = 1, next_seq = 1, rr = 0;
     std::atomic<uint64_t> requests{0}, bytes{0}, failures{0};
 
-    void submit(Lane& l) {
-        for (auto& c : l.unsubmitted) (c.is_status ? l.statuses : l.reads).push_back(c);
+    void submit(Lane& l, bool by_title = true) {
+        std::vector<Cmd> cmds;
+        if (by_title) cmds.swap(l.held_back);
+        cmds.insert(cmds.end(), l.unsubmitted.begin(), l.unsubmitted.end());
         l.unsubmitted.clear();
+        for (auto& c : cmds) {
+            bool hold = !by_title && (c.is_status ? !l.held_back.empty() : (c.req.options & PAGE_DESTINATION) != 0);
+            if (hold) l.held_back.push_back(c);
+            else (c.is_status ? l.statuses : l.reads).push_back(c);
+        }
     }
     // Status entries whose earlier reads have all finished.
     void complete(Lane& l) {
@@ -326,8 +334,10 @@ void close_lane(uint64_t id) {
     Lane& l = it->second;
     l.closed = true;
     for (auto& c : l.unsubmitted) if (c.is_status) release(c.array);
+    for (auto& c : l.held_back) if (c.is_status) release(c.array);
     for (auto& c : l.statuses) release(c.array);
     l.unsubmitted.clear();
+    l.held_back.clear();
     l.reads.clear();
     l.statuses.clear();
     s.finished.wait(g, [&] {
@@ -348,14 +358,22 @@ void enqueue(Instance<Queue>* q, Cmd c) {
             return;
         }
         if (it->second.held() + 1 < std::max<size_t>(it->second.capacity, 2)) break;
+        if (!it->second.held_back.empty()) {
+            static bool warned = false;
+            if (!warned) warned = true, KL_WARN("dstorage", "a full queue's reads into physical pages start before the title's Submit");
+            s.submit(it->second);
+            s.complete(it->second);
+            s.work.notify_all();
+        }
         s.finished.wait(g);
     }
     Lane& l = s.lanes[q->state.id];
     c.seq = s.next_seq++;
     l.unsubmitted.push_back(c);
-    // The console submits on its own once half the queue is enqueued.
+    // The console submits on its own once half the queue is enqueued. Reads into physical pages
+    // wait for the title's Submit: it fills their page lists just before calling it.
     if (l.unsubmitted.size() >= std::max<size_t>(l.capacity / 2, 1)) {
-        s.submit(l);
+        s.submit(l, false);
         s.complete(l);
         s.work.notify_all();
     }

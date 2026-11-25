@@ -30,6 +30,7 @@ struct Caps {
     uint32_t vram_type = ~0u, rebar_type = ~0u, host_type = ~0u, readback_type = ~0u;
     uint64_t host_import_alignment = 0;
     bool sparse = false;          // sparse residency buffers and a queue to bind them
+    bool depth_bounds = false;
     uint64_t sparse_space = 0;    // sparseAddressSpaceSize
 };
 

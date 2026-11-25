@@ -147,6 +147,10 @@ void WINAPI state1(void* l, uint64_t a) {
     if (auto* s = S(l)) s->add(OP, a);
     stats::add(stats::OtherCommands);
 }
+void WINAPI depth_bounds(void* l, float lo, float hi) {
+    if (auto* s = S(l)) s->add(Op::DepthBounds, DepthBounds{lo, hi});
+    stats::add(stats::OtherCommands);
+}
 void WINAPI set_pipeline(void* l, uint64_t a) {
     if (auto* s = S(l)) s->add(Op::SetPipeline, a);
     stats::add(stats::OtherCommands);
@@ -280,7 +284,7 @@ void fill_list_methods(void** t, bool newer) {
     at(55, (void*)&state1<Op::Discard>);
     at(59, (void*)&execute_indirect);
     at(60, (void*)&copy_memory);
-    at(68, (void*)&ignored);
+    at(68, (void*)&depth_bounds);
     at(69, (void*)&write32);
     at(70, (void*)&write64);
     at(71, (void*)&wait_value);

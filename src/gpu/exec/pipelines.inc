@@ -861,6 +861,9 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
         ds.stencilTestEnable = d.stencil_enable && a.stencil ? VK_TRUE : VK_FALSE;
         ds.front = stencil(d.front, d);
         ds.back = stencil(d.back, d);
+        ds.depthBoundsTestEnable = d.bounds && host::get().caps.depth_bounds ? VK_TRUE : VK_FALSE;
+        ds.minDepthBounds = 0.0f;
+        ds.maxDepthBounds = 1.0f;
     }
     VkPipelineColorBlendAttachmentState cb[8]{};
     for (uint32_t i = 0; i < a.count; ++i) {
@@ -880,9 +883,11 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
                             VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
                             VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+    std::vector<VkDynamicState> dyns(dyn, dyn + (k->mesh ? 4 : sizeof dyn / sizeof dyn[0]));
+    if (ds.depthBoundsTestEnable) dyns.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dy.dynamicStateCount = k->mesh ? 4 : sizeof dyn / sizeof dyn[0];
-    dy.pDynamicStates = dyn;
+    dy.dynamicStateCount = uint32_t(dyns.size());
+    dy.pDynamicStates = dyns.data();
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ri.colorAttachmentCount = a.count;
     ri.pColorAttachmentFormats = a.color;

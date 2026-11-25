@@ -15,7 +15,7 @@ enum class Op : uint16_t {
     SetPipeline, Draw, DrawIndexed, Dispatch, DispatchMesh, Barrier, CopyBuffer, CopyTexture, CopyResource,
     ClearRtv, ClearDsv, ClearUavUint, ClearUavFloat, Topology, Viewports, Scissors, BlendFactor, StencilRef,
     Heaps, RootSignature, RootTable, RootConstant, RootConstants, RootView, IndexBuffer, VertexBuffers, Targets,
-    ExecuteIndirect, Write32, Write64, WaitValue, CopyMem, Resolve, ResolveQueries, Query, Discard, Count
+    ExecuteIndirect, Write32, Write64, WaitValue, CopyMem, Resolve, ResolveQueries, Query, Discard, DepthBounds, Count
 };
 
 // Payloads (shared by the recorders and the executor). `gfx` is 1 for graphics, 0 for compute.
@@ -51,6 +51,7 @@ struct Indirect { void* signature; uint64_t args, offset, max, count, count_offs
 struct WaitValue { uint64_t address, compare, reference; uint32_t bytes, mask; };
 struct Heaps { uint32_t count, pad; void* heaps[8]; };
 struct Viewports { uint32_t count, pad; float v[16][6]; };
+struct DepthBounds { float min, max; };
 struct Scissors { uint32_t count, pad; int32_t r[16][4]; };
 }  // namespace cmd
 

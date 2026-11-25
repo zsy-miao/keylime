@@ -31,6 +31,7 @@ struct Builder {
     cmd::Scissors scs{};
     float blend[4] = {1, 1, 1, 1};
     uint32_t stencil_ref = 0;
+    cmd::DepthBounds depth_bounds{0.0f, 1.0f};
     cmd::Targets targets{};
     bool rendering = false;
     Attachments att;
@@ -342,6 +343,8 @@ struct Builder {
         vk::vkCmdSetScissor(cb, 0, 1, &sc);
         vk::vkCmdSetBlendConstants(cb, blend);
         vk::vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_ref);
+        if (st->depth.bounds && att.depth != VK_FORMAT_UNDEFINED && host::get().caps.depth_bounds)
+            vk::vkCmdSetDepthBounds(cb, std::clamp(depth_bounds.min, 0.0f, 1.0f), std::clamp(depth_bounds.max, 0.0f, 1.0f));
         if (mesh) return true;
         vk::vkCmdSetPrimitiveTopology(cb, vk_topology(topology));
         bool strip = topology == 3 || topology == 5 || topology == 11 || topology == 13;
@@ -810,6 +813,7 @@ struct Builder {
                 case Op::Viewports: get(vps); break;
                 case Op::Scissors: get(scs); break;
                 case Op::BlendFactor: get(blend); break;
+                case Op::DepthBounds: get(depth_bounds); break;
                 case Op::StencilRef: {
                     uint64_t v;
                     get(v);

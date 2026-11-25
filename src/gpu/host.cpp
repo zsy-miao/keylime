@@ -198,6 +198,7 @@ bool start() {
     h.caps.device_fault = want_fault && ffault.deviceFault;
     ffault.deviceFaultVendorBinary = VK_FALSE;
     h.caps.cache_control = f13.pipelineCreationCacheControl;
+    h.caps.depth_bounds = f2.features.depthBounds;
     {
         char v[4]{};
         bool off = GetEnvironmentVariableA("KEYLIME_FLAT", v, sizeof v) && v[0] == '0';
