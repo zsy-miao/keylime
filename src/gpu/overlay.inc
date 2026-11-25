@@ -112,8 +112,8 @@ void build() {
     snprintf(b, sizeof b, "DRAWS %llu/S  DISPATCHES %llu/S  SUBMITS %llu/S", (unsigned long long)rate[DrawsRun],
              (unsigned long long)rate[DispatchesRun], (unsigned long long)rate[Submits]);
     text(x, y, b), y += line;
-    snprintf(b, sizeof b, "SHADERS  COMPILING %llu  BUILT %llu  SKIPPED WAITING %llu/S", v(Compiling), v(PipelinesBuilt),
-             (unsigned long long)rate[WaitingOnCompile]);
+    snprintf(b, sizeof b, "SHADERS  FOR DRAWS %llu  EARLY %llu  OPTIMIZING %llu  BUILT %llu  SKIPPED WAITING %llu/S", v(CompileUrgent),
+             v(CompileWarm), v(CompileOptimized), v(PipelinesBuilt), (unsigned long long)rate[WaitingOnCompile]);
     text(x, y, b), y += line;
     snprintf(b, sizeof b, "VRAM %llu / %llu MIB  IMAGES %llu  UPLOADS %llu/S", v(ImageMiB), v(VramBudgetMiB), v(ImagesResident),
              (unsigned long long)rate[TextureUploads]);

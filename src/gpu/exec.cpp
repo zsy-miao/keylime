@@ -661,6 +661,7 @@ void queue_gauges() {
     stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size() + g_warm.size());
     stats::set(stats::CompileUrgent, g_urgent.size());
     stats::set(stats::CompileOptimized, g_jobs.size());
+    stats::set(stats::CompileWarm, g_warm.size());
 }
 void notify() {
     { std::lock_guard g(g_done_lock); }
