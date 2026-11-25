@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -60,7 +61,7 @@ struct Gate {
 struct HostQueue {
     VkQueue q = VK_NULL_HANDLE;
     uint32_t family = 0;
-    std::mutex lock;
+    std::mutex lock, qlock;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkSemaphore timeline = VK_NULL_HANDLE;
     std::atomic<uint64_t> submitted{0};
@@ -236,50 +237,141 @@ struct Semaphore {
     uint64_t value;
 };
 
-void submit(HostQueue& h, const std::vector<Cb*>& cbs, const std::vector<Semaphore>& waits, std::vector<Semaphore> signals) {
+struct Pending {
+    HostQueue* h = nullptr;
     std::vector<VkCommandBufferSubmitInfo> ci;
-    for (Cb* c : cbs) {
-        vk::vkEndCommandBuffer(c->cb);
-        VkCommandBufferSubmitInfo x{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-        x.commandBuffer = c->cb;
-        ci.push_back(x);
+    std::vector<Semaphore> waits, signals;
+    uint64_t value = 0;
+    bool sent = false;
+};
+// Work goes to the driver only once everything it waits on has been signalled or handed to the
+// driver: NVIDIA's Windows driver blocks in vkQueueSubmit2 on a wait with no signal ahead of it,
+// and while it blocks, vkSignalSemaphore and fence reads from other threads block too.
+std::mutex g_sub_lock;
+std::condition_variable g_sub_cv;
+std::deque<std::shared_ptr<Pending>> g_pending;
+std::unordered_map<VkSemaphore, uint64_t> g_sent;
+std::atomic<size_t> g_pending_n{0};
+std::atomic<uint64_t> g_held{0};
+
+uint64_t counter(VkSemaphore s) {
+    uint64_t v = 0;
+    vk::vkGetSemaphoreCounterValue(dev(), s, &v);
+    return v;
+}
+
+bool ready(const Pending& p) {
+    for (auto& x : p.waits) {
+        if (!x.value) continue;
+        auto it = g_sent.find(x.s);
+        if (it != g_sent.end() && it->second >= x.value) continue;
+        if (counter(x.s) >= x.value) continue;
+        return false;
     }
-    uint64_t value = h.submitted.load() + 1;
-    signals.push_back({h.timeline, value});
+    return true;
+}
+
+void send(Pending& p) {
+    HostQueue& h = *p.h;
     std::vector<VkSemaphoreSubmitInfo> w, s;
-    auto all_waits = waits;
-    if (h.gate_value) all_waits.push_back({h.gate, h.gate_value});
-    for (auto& x : all_waits) {
+    for (auto& x : p.waits) {
         VkSemaphoreSubmitInfo i{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
         i.semaphore = x.s, i.value = x.value, i.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         w.push_back(i);
     }
-    for (auto& x : signals) {
+    for (auto& x : p.signals) {
+        if (x.value && x.s != h.timeline && counter(x.s) >= x.value) continue;
         VkSemaphoreSubmitInfo i{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
         i.semaphore = x.s, i.value = x.value, i.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         s.push_back(i);
     }
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.commandBufferInfoCount = uint32_t(ci.size());
-    si.pCommandBufferInfos = ci.data();
+    si.commandBufferInfoCount = uint32_t(p.ci.size());
+    si.pCommandBufferInfos = p.ci.data();
     si.waitSemaphoreInfoCount = uint32_t(w.size());
     si.pWaitSemaphoreInfos = w.data();
     si.signalSemaphoreInfoCount = uint32_t(s.size());
     si.pSignalSemaphoreInfos = s.data();
-    note("q%d submit %llu: %zu command buffers, %zu waits, %zu signals", int(&h - g_q), (unsigned long long)value, cbs.size(),
-         all_waits.size(), signals.size());
-    VkResult r = vk::vkQueueSubmit2(h.q, 1, &si, VK_NULL_HANDLE);
+    VkResult r;
+    {
+        std::lock_guard q(h.qlock);
+        r = vk::vkQueueSubmit2(h.q, 1, &si, VK_NULL_HANDLE);
+    }
     if (r == VK_ERROR_DEVICE_LOST) device_lost("submitting work");
     if (r != VK_SUCCESS) {
         static int n = 0;
         if (n++ < 8) KL_ERROR("vk", "queue submission failed: %s", vk::result_text(r));
-        // Keep the counter honest: signal from the host so waits on it do not hang.
         VkSemaphoreSignalInfo sg{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-        sg.semaphore = h.timeline, sg.value = value;
+        sg.semaphore = h.timeline, sg.value = p.value;
         vk::vkSignalSemaphore(dev(), &sg);
     }
-    h.submitted.store(value);
-    for (Cb* c : cbs) c->value = value, h.busy.push_back(c);
+    for (auto& x : p.signals)
+        if (x.value) {
+            auto& v = g_sent[x.s];
+            if (x.value > v) v = x.value;
+        }
+    p.sent = true;
+}
+
+void pump() {
+    for (bool again = true; again;) {
+        again = false;
+        bool blocked[2] = {};
+        for (auto it = g_pending.begin(); it != g_pending.end(); ++it) {
+            int qi = int((*it)->h - g_q);
+            if (blocked[qi]) continue;
+            if (!ready(**it)) {
+                blocked[qi] = true;
+                continue;
+            }
+            note("q%d submit %llu sent (it was held)", qi, (unsigned long long)(*it)->value);
+            send(**it);
+            g_pending.erase(it);
+            again = true;
+            break;
+        }
+    }
+    g_pending_n.store(g_pending.size());
+    g_sub_cv.notify_all();
+}
+
+std::shared_ptr<Pending> submit(HostQueue& h, const std::vector<Cb*>& cbs, const std::vector<Semaphore>& waits,
+                                std::vector<Semaphore> signals) {
+    auto p = std::make_shared<Pending>();
+    p->h = &h;
+    for (Cb* c : cbs) {
+        vk::vkEndCommandBuffer(c->cb);
+        VkCommandBufferSubmitInfo x{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        x.commandBuffer = c->cb;
+        p->ci.push_back(x);
+    }
+    p->value = h.submitted.load() + 1;
+    signals.push_back({h.timeline, p->value});
+    p->signals = std::move(signals);
+    p->waits = waits;
+    if (h.gate_value) p->waits.push_back({h.gate, h.gate_value});
+    h.submitted.store(p->value);
+    for (Cb* c : cbs) c->value = p->value, h.busy.push_back(c);
+    std::lock_guard l(g_sub_lock);
+    bool behind = false;
+    for (auto& x : g_pending) behind |= x->h == &h;
+    bool now = !behind && ready(*p);
+    note("q%d submit %llu: %zu command buffers, %zu waits, %zu signals%s", int(&h - g_q), (unsigned long long)p->value, cbs.size(),
+         p->waits.size(), p->signals.size(), now ? "" : ", held until its waits are signalled");
+    if (now) {
+        send(*p);
+        if (!g_pending.empty()) pump();
+    } else {
+        ++g_held;
+        g_pending.push_back(p);
+        g_pending_n.store(g_pending.size());
+    }
+    return p;
+}
+
+void kick_held() {
+    std::lock_guard l(g_sub_lock);
+    if (!g_pending.empty()) pump();
 }
 
 // Opens each queue's gates in order, once the memory compares as asked (D3D12 comparison
@@ -331,8 +423,11 @@ void gatekeeper(HostQueue& h) {
         sg.semaphore = h.gate, sg.value = g.opens;
         VkResult r = vk::vkSignalSemaphore(dev(), &sg);
         if (r == VK_ERROR_DEVICE_LOST) device_lost("opening a GPU wait");
-        std::lock_guard l(h.gates_lock);
-        h.gates.pop_front();
+        {
+            std::lock_guard l(h.gates_lock);
+            h.gates.pop_front();
+        }
+        kick_held();
     }
 }
 
@@ -452,7 +547,7 @@ void open_cache() {
     }
     KL_INFO("gpu", "pipeline cache: %zu KB loaded from %s", data.size() >> 10, CACHE_FILE);
 }
-void save_cache() {
+void save_cache(bool force = false) {
     static std::mutex m;
     static auto last = std::chrono::steady_clock::now();
     static uint64_t saved_at = 0;
@@ -460,7 +555,7 @@ void save_cache() {
     if (!g || !g_cache) return;
     uint64_t built = stats::g_counters[stats::PipelinesBuilt].load();
     auto now = std::chrono::steady_clock::now();
-    if (built == saved_at || now - last < std::chrono::seconds(30)) return;
+    if (built == saved_at || (!force && now - last < std::chrono::seconds(30))) return;
     last = now, saved_at = built;
     size_t n = 0;
     if (vk::vkGetPipelineCacheData(dev(), g_cache, &n, nullptr) != VK_SUCCESS || !n) return;
@@ -473,12 +568,12 @@ void save_cache() {
         if (ok) MoveFileExA("cache\\pipelines.tmp", CACHE_FILE, MOVEFILE_REPLACE_EXISTING);
     }
 }
-void save_used();
+void save_used(bool force = false);
 void job(std::function<void()> f, bool urgent = false) {
     stats::add(stats::Compiling);
     static std::once_flag once;
     std::call_once(once, [] {
-        unsigned n = std::max(2u, std::min(8u, std::thread::hardware_concurrency() / 3));
+        unsigned n = std::max(4u, std::min(16u, std::thread::hardware_concurrency() * 2 / 3));
         for (unsigned i = 0; i < n; ++i)
             std::thread([] {
                 SetThreadDescription(GetCurrentThread(), L"keylime-compile");
@@ -555,7 +650,7 @@ void note_used(Compiled* k) {
     std::lock_guard g(g_used_lock);
     if (!g_used_before.count(k->key) && g_used_now.insert(k->key).second) ++g_used_added;
 }
-void save_used() {
+void save_used(bool force) {
     static std::mutex m;
     static auto last = std::chrono::steady_clock::now();
     static uint64_t saved_at = 0;
@@ -563,7 +658,7 @@ void save_used() {
     if (!g) return;
     uint64_t added = g_used_added.load();
     auto now = std::chrono::steady_clock::now();
-    if (added == saved_at || now - last < std::chrono::seconds(5)) return;
+    if (added == saved_at || (!force && now - last < std::chrono::seconds(1))) return;
     last = now, saved_at = added;
     std::vector<uint64_t> keys;
     {
@@ -577,8 +672,12 @@ void save_used() {
         bool ok = fclose(f) == 0;
         if (ok) MoveFileExA("cache\\used-pipelines.tmp", USED_FILE, MOVEFILE_REPLACE_EXISTING);
     }
-    KL_INFO("gpu", "pipelines: %zu listed as used (%llu new this run, %llu started early)", keys.size(), (unsigned long long)added,
-            (unsigned long long)g_started_early.load());
+    static uint64_t logged = 0;
+    if (force || added - logged >= 16) {
+        logged = added;
+        KL_INFO("gpu", "pipelines: %zu listed as used (%llu new this run, %llu started early)", keys.size(), (unsigned long long)added,
+                (unsigned long long)g_started_early.load());
+    }
 }
 
 void shaders(pipeline::State* st, Compiled* k);
@@ -1963,6 +2062,13 @@ void execute(int qi, uint32_t count, void* const* lists) {
     collect();
 }
 
+void kick() { kick_held(); }
+
+void save_lists(bool with_cache) {
+    save_used(true);
+    if (with_cache) save_cache(true);
+}
+
 void signal(int qi, VkSemaphore s, uint64_t v) {
     HostQueue& h = g_q[qi & 1];
     {
@@ -2024,6 +2130,8 @@ void dump_state() {
             jobs, (unsigned long long)stats::g_counters[stats::Compiling].load(),
             (unsigned long long)stats::g_counters[stats::PipelinesBuilt].load(),
             (unsigned long long)stats::g_counters[stats::WaitingOnCompile].load());
+    KL_INFO("hang", "submissions: %zu held until their waits are signalled (%llu held this run)", g_pending_n.load(),
+            (unsigned long long)g_held.load());
     std::vector<Event> ev;
     {
         std::lock_guard g(g_ev_lock);
@@ -2066,13 +2174,17 @@ bool run(int qi, const std::function<void(VkCommandBuffer)>& f, VkSemaphore wait
     int other = (qi & 1) ^ 1;
     uint64_t up = images::upload_value(other);
     if (up && g_q[other].timeline && up > completed(g_q[other])) w.push_back({g_q[other].timeline, up});
-    submit(h, cbs, w, s);
+    auto p = submit(h, cbs, w, s);
+    std::unique_lock l(g_sub_lock);
+    while (!g_sub_cv.wait_for(l, std::chrono::seconds(5), [&] { return p->sent; }))
+        KL_WARN("gpu", "presenting waits for queue %d's held work (%zu submissions held)", qi & 1, g_pending.size());
     return true;
 }
 
 void with_queue(int qi, const std::function<void(VkQueue)>& f) {
     HostQueue& h = g_q[qi & 1];
     std::lock_guard g(h.lock);
+    std::lock_guard q(h.qlock);
     f(h.q);
 }
 

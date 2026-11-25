@@ -88,6 +88,7 @@ static void report_safely(EXCEPTION_POINTERS* ep, const char* how) {
 }
 
 static void minidump(EXCEPTION_POINTERS* ep) {
+    kl::gpu::exec::save_lists(false);
     std::thread t([ep, tid = GetCurrentThreadId()] {
         HANDLE f = CreateFileW(L"logs/crash.dmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         if (f == INVALID_HANDLE_VALUE) return;
@@ -222,6 +223,7 @@ static void stacks_later() {
                 KL_WARN("hang", "no frame shown for %d s: what every queue is waiting on follows", still);
                 kl::gpu::exec::dump_state();
                 kl::gpu::fence::dump_state();
+                kl::gpu::exec::save_lists(true);
             }
         }
     }).detach();

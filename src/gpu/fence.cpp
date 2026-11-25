@@ -61,9 +61,28 @@ std::mutex g_wlock;
 std::condition_variable g_wcv;
 std::vector<Watch> g_watch;
 
+void nap() {
+    thread_local HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!t) {
+        Sleep(1);
+        return;
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -2500;
+    SetWaitableTimerEx(t, &due, 0, nullptr, nullptr, nullptr, 0);
+    WaitForSingleObject(t, INFINITE);
+}
+
+uint64_t counter(Fence* f) {
+    uint64_t now = 0;
+    VkResult r = vk::vkGetSemaphoreCounterValue(host::get().device, f->sem, &now);
+    if (r == VK_ERROR_DEVICE_LOST) exec::device_lost("reading a fence");
+    return now;
+}
+
+// Polls the semaphores (a quarter millisecond apart) rather than blocking in the driver on them.
 void completion_thread() {
     SetThreadDescription(GetCurrentThread(), L"keylime-gpu-completion");
-    auto& h = host::get();
     for (;;) {
         std::vector<Watch> w;
         {
@@ -71,23 +90,22 @@ void completion_thread() {
             g_wcv.wait(g, [] { return !g_watch.empty(); });
             w = g_watch;
         }
-        std::vector<VkSemaphore> sems;
-        std::vector<uint64_t> vals;
-        for (auto& x : w) sems.push_back(x.f->sem), vals.push_back(x.value);
-        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wi.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
-        wi.semaphoreCount = uint32_t(sems.size());
-        wi.pSemaphores = sems.data();
-        wi.pValues = vals.data();
-        VkResult r = vk::vkWaitSemaphores(h.device, &wi, 20'000'000);  // 20 ms: new watches join
-        if (r == VK_ERROR_DEVICE_LOST) exec::device_lost("waiting for fences");
-        std::lock_guard g(g_wlock);
-        std::erase_if(g_watch, [&](Watch& x) {
-            uint64_t now = 0;
-            vk::vkGetSemaphoreCounterValue(h.device, x.f->sem, &now);
-            if (now < x.value) return false;
+        std::vector<Watch> hit;
+        for (auto& x : w) {
+            uint64_t now = counter(x.f);
+            if (now < x.value) continue;
             reached(x.f, now);
-            return true;
+            hit.push_back(x);
+        }
+        if (hit.empty()) {
+            nap();
+            continue;
+        }
+        std::lock_guard g(g_wlock);
+        std::erase_if(g_watch, [&](const Watch& x) {
+            for (auto& y : hit)
+                if (y.f == x.f && y.value == x.value) return true;
+            return false;
         });
     }
 }
@@ -105,22 +123,18 @@ uint64_t WINAPI completed_m(Fence* f) { return f->value.load(std::memory_order_a
 HRESULT WINAPI set_event_on_completion(Fence* f, uint64_t value, HANDLE event) {
     if (!event) {
         // Block until reached: the GPU really runs here, so this can wait.
-        uint64_t sv = value;
-        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wi.semaphoreCount = 1;
-        wi.pSemaphores = &f->sem;
-        wi.pValues = &sv;
         auto t0 = GetTickCount64();
         bool warned = false;
         while (f->value.load() < value) {
-            VkResult r = vk::vkWaitSemaphores(host::get().device, &wi, 100'000'000);
-            if (r == VK_SUCCESS) reached(f, value);
-            else if (r == VK_ERROR_DEVICE_LOST) exec::device_lost("a CPU wait for a fence");
+            uint64_t now = counter(f);
+            if (now >= value) {
+                reached(f, now);
+                break;
+            }
+            nap();
             uint64_t ms = GetTickCount64() - t0;
             if (!warned && ms > 3000) {
                 warned = true;
-                uint64_t now = 0;
-                vk::vkGetSemaphoreCounterValue(host::get().device, f->sem, &now);
                 KL_WARN("gpu", "a CPU wait for fence value %llu has taken 3 s (fence at %llu, highest signal %llu)",
                         (unsigned long long)value, (unsigned long long)now, (unsigned long long)high(f));
             }
@@ -226,6 +240,7 @@ void signal_cpu(Fence* f, uint64_t value) {
         si.semaphore = f->sem;
         si.value = value;
         KL_VK_CHECK(vk::vkSignalSemaphore(host::get().device, &si));
+        exec::kick();
     }
     std::lock_guard g(f->lock);
     f->value.store(value, std::memory_order_release);
