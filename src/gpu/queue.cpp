@@ -62,7 +62,14 @@ void WINAPI marker(Queue*) {}
 HRESULT WINAPI signal(Queue* q, void* fobj, uint64_t value) {
     auto* f = fence::from(fobj);
     if (!f) return E_INVALIDARG;
-    exec::signal(q->host, fence::semaphore(f), value);
+    if (fence::raise(f, value)) {
+        exec::signal(q->host, fence::semaphore(f), value);
+    } else {
+        static std::atomic<int> n{0};
+        if (n++ < 4)
+            KL_INFO("gpu", "a queue signals a fence with %llu, not above its earlier signals (%llu): kept off the GPU",
+                    (unsigned long long)value, (unsigned long long)fence::high(f));
+    }
     fence::watch(f, value);
     return S_OK;
 }
@@ -71,7 +78,7 @@ HRESULT WINAPI wait(Queue* q, void* fobj, uint64_t value) {
     auto* f = fence::from(fobj);
     if (!f) return E_INVALIDARG;
     if (fence::completed(f) >= value) return S_OK;
-    exec::wait(q->host, fence::semaphore(f), value);
+    exec::wait(q->host, fence::semaphore(f), value, value <= fence::high(f));
     return S_OK;
 }
 HRESULT WINAPI timestamp_frequency(Queue*, uint64_t* out) {

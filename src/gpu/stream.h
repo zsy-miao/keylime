@@ -48,7 +48,7 @@ struct CopyTexture { CopyLocation dst, src; uint32_t x, y, z, has_box; uint32_t 
 struct CopyResource { void* dst; void* src; };
 // ExecuteIndirect: argument and count buffers as title addresses (count 0: none).
 struct Indirect { void* signature; uint64_t args, offset, max, count, count_offset; };
-struct WaitValue { uint64_t address, compare, reference; };
+struct WaitValue { uint64_t address, compare, reference; uint32_t bytes, mask; };
 struct Heaps { uint32_t count, pad; void* heaps[8]; };
 struct Viewports { uint32_t count, pad; float v[16][6]; };
 struct Scissors { uint32_t count, pad; int32_t r[16][4]; };

@@ -5,6 +5,7 @@
 #include <thread>
 #include <vector>
 
+#include "gpu/exec.h"
 #include "gpu/host.h"
 #include "log.h"
 
@@ -78,10 +79,7 @@ void completion_thread() {
         wi.pSemaphores = sems.data();
         wi.pValues = vals.data();
         VkResult r = vk::vkWaitSemaphores(h.device, &wi, 20'000'000);  // 20 ms: new watches join
-        if (r == VK_ERROR_DEVICE_LOST) {
-            KL_ERROR("gpu", "GPU device lost");
-            Sleep(INFINITE);
-        }
+        if (r == VK_ERROR_DEVICE_LOST) exec::device_lost("waiting for fences");
         std::lock_guard g(g_wlock);
         std::erase_if(g_watch, [&](Watch& x) {
             uint64_t now = 0;
@@ -111,8 +109,24 @@ HRESULT WINAPI set_event_on_completion(Fence* f, uint64_t value, HANDLE event) {
         wi.semaphoreCount = 1;
         wi.pSemaphores = &f->sem;
         wi.pValues = &sv;
+        auto t0 = GetTickCount64();
+        bool warned = false;
         while (f->value.load() < value) {
-            if (vk::vkWaitSemaphores(host::get().device, &wi, 100'000'000) == VK_SUCCESS) reached(f, value);
+            VkResult r = vk::vkWaitSemaphores(host::get().device, &wi, 100'000'000);
+            if (r == VK_SUCCESS) reached(f, value);
+            else if (r == VK_ERROR_DEVICE_LOST) exec::device_lost("a CPU wait for a fence");
+            uint64_t ms = GetTickCount64() - t0;
+            if (!warned && ms > 3000) {
+                warned = true;
+                uint64_t now = 0;
+                vk::vkGetSemaphoreCounterValue(host::get().device, f->sem, &now);
+                KL_WARN("gpu", "a CPU wait for fence value %llu has taken 3 s (fence at %llu, highest signal %llu)",
+                        (unsigned long long)value, (unsigned long long)now, (unsigned long long)high(f));
+            }
+            if (ms > 15000) {
+                KL_ERROR("gpu", "a CPU wait for fence value %llu gave up after 15 s", (unsigned long long)value);
+                break;
+            }
         }
         return S_OK;
     }
@@ -154,6 +168,38 @@ Fence* from(void* obj) {
 }
 VkSemaphore semaphore(Fence* f) { return f->sem; }
 uint64_t completed(Fence* f) { return f->value.load(); }
+
+bool raise(Fence* f, uint64_t value) {
+    std::lock_guard g(f->lock);
+    if (value <= f->sem_high) return false;
+    f->sem_high = value;
+    return true;
+}
+
+uint64_t high(Fence* f) {
+    std::lock_guard g(f->lock);
+    return f->sem_high;
+}
+
+void dump_state() {
+    std::vector<Watch> w;
+    {
+        std::lock_guard g(g_wlock);
+        w = g_watch;
+    }
+    KL_INFO("hang", "fences: %zu signals not reached yet", w.size());
+    for (size_t i = 0; i < w.size() && i < 16; ++i) {
+        uint64_t now = 0;
+        vk::vkGetSemaphoreCounterValue(host::get().device, w[i].f->sem, &now);
+        size_t waiters;
+        {
+            std::lock_guard g(w[i].f->lock);
+            waiters = w[i].f->waiters.size();
+        }
+        KL_INFO("hang", "  fence %p: waits for %llu, at %llu, title sees %llu, %zu events waiting", (void*)w[i].f,
+                (unsigned long long)w[i].value, (unsigned long long)now, (unsigned long long)w[i].f->value.load(), waiters);
+    }
+}
 
 void watch(Fence* f, uint64_t value) {
     {

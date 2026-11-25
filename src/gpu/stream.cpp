@@ -112,8 +112,11 @@ void WINAPI write32(void* l, uint64_t address, uint32_t value, uint32_t, uint32_
 void WINAPI write64(void* l, uint64_t address, uint64_t value, uint32_t, uint32_t flags) {
     if (auto* s = S(l)) s->add(Op::Write64, Write{address, value, 8, flags});
 }
-void WINAPI wait_value(void* l, uint64_t address, uint32_t cmp, uint64_t ref) {
-    if (auto* s = S(l)) s->add(Op::WaitValue, WaitValue{address, cmp, ref});
+void WINAPI wait_value(void* l, uint64_t address, uint32_t cmp, uint32_t ref, uint32_t mask, uint32_t) {
+    if (auto* s = S(l)) s->add(Op::WaitValue, WaitValue{address, cmp, ref, 4, mask});
+}
+void WINAPI wait_value64(void* l, uint64_t address, uint32_t cmp, uint64_t ref, uint32_t) {
+    if (auto* s = S(l)) s->add(Op::WaitValue, WaitValue{address, cmp, ref, 8, 0});
 }
 void WINAPI resolve_queries(void* l, void*, uint32_t, uint32_t, uint32_t count, void* dst, uint64_t off) {
     if (auto* s = S(l)) s->add(Op::ResolveQueries, ResolveQueries{buffer_address(dst, off), count});
@@ -269,7 +272,7 @@ void fill_list_methods(void** t, bool newer) {
     at(69, (void*)&write32);
     at(70, (void*)&write64);
     at(71, (void*)&wait_value);
-    at(72, (void*)&wait_value);
+    at(72, (void*)&wait_value64);
     at(78, (void*)&dispatch_x);
     at(83, (void*)&copy_texture_region);
     at(84, (void*)&copy_resource);

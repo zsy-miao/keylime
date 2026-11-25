@@ -19,6 +19,9 @@ void watch(Fence* f, uint64_t value);
 // CPU-side signal (also what a queue signal amounts to once reached).
 void signal_cpu(Fence* f, uint64_t value);
 uint64_t completed(Fence* f);
+bool raise(Fence* f, uint64_t value);
+uint64_t high(Fence* f);
+void dump_state();
 
 HRESULT WINAPI create(void* device, uint64_t initial, uint32_t flags, const Iid* iid, void** out);
 

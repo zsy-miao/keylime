@@ -28,7 +28,9 @@ VkQueue vk_queue(int q);
 
 void execute(int q, uint32_t count, void* const* lists);
 void signal(int q, VkSemaphore timeline, uint64_t value);
-void wait(int q, VkSemaphore timeline, uint64_t value);
+void wait(int q, VkSemaphore timeline, uint64_t value, bool signal_submitted);
+void dump_state();
+[[noreturn]] void device_lost(const char* where);
 // Records `f` into a command buffer and submits it on `q`, waiting for / signalling binary
 // semaphores (either may be null). Used by presentation. Returns false if nothing was submitted.
 bool run(int q, const std::function<void(VkCommandBuffer)>& f, VkSemaphore wait_binary, VkSemaphore signal_binary);

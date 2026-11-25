@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "gpu/exec.h"
+#include "gpu/fence.h"
 #include "hle/files.h"
 #include "hle/hle.h"
 #include "loader.h"
@@ -203,7 +205,7 @@ static void stacks_later() {
             dump_stacks("KEYLIME_STACKS_AT");
         }).detach();
     }
-    // Watchdog: frames were being shown and then stop for 6 s -> where is everyone?
+    // Watchdog: frames were being shown and then stop -> where is everyone, and what does the GPU wait on?
     std::thread([] {
         uint64_t last = 0;
         int still = 0, dumps = 0;
@@ -214,7 +216,13 @@ static void stacks_later() {
                 last = now, still = 0;
                 continue;
             }
-            if (++still == 6 && dumps++ < 3) dump_stacks("no frame shown for 6 s");
+            ++still;
+            if ((still == 5 || still == 20) && dumps++ < 4) {
+                dump_stacks(still == 5 ? "no frame shown for 5 s" : "no frame shown for 20 s");
+                KL_WARN("hang", "no frame shown for %d s: what every queue is waiting on follows", still);
+                kl::gpu::exec::dump_state();
+                kl::gpu::fence::dump_state();
+            }
         }
     }).detach();
 }

@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <functional>
 #include <condition_variable>
+#include <cstdarg>
 #include <unordered_map>
 #include <vector>
 
@@ -50,6 +51,12 @@ struct Cb {
     uint64_t used = 0;
 };
 
+struct Gate {
+    cmd::WaitValue w{};
+    VkSemaphore sem = VK_NULL_HANDLE;
+    uint64_t sem_value = 0, opens = 0, since = 0;
+};
+
 struct HostQueue {
     VkQueue q = VK_NULL_HANDLE;
     uint32_t family = 0;
@@ -68,7 +75,8 @@ struct HostQueue {
     uint64_t gate_value = 0;
     std::mutex gates_lock;
     std::condition_variable gates_cv;
-    std::deque<std::pair<cmd::WaitValue, uint64_t>> gates;
+    std::deque<Gate> gates;
+    std::atomic<uint64_t> opened_late{0};
 };
 HostQueue g_q[2];
 VkPipelineLayout g_layout = VK_NULL_HANDLE;
@@ -95,19 +103,54 @@ bool safe_move(uint64_t dst, uint64_t src, uint64_t len) {
     }
 }
 
-// A GPU wait on title memory (PM4 WAIT_REG_MEM order: always, <, <=, ==, !=, >=, >).
-bool met(const cmd::WaitValue& w) {
+struct Event {
+    uint64_t ms;
+    char text[120];
+};
+std::mutex g_ev_lock;
+Event g_ev[64];
+uint64_t g_ev_n = 0;
+
+void note(const char* fmt, ...) {
+    Event e;
+    e.ms = GetTickCount64();
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(e.text, sizeof e.text, fmt, a);
+    va_end(a);
+    std::lock_guard g(g_ev_lock);
+    g_ev[g_ev_n++ % 64] = e;
+}
+
+uint64_t read_value(const cmd::WaitValue& w, bool& ok) {
     uint64_t v = 0;
-    if (!safe_move(uint64_t(&v), w.address, (w.reference >> 32) ? 8 : 4)) return false;
+    ok = w.address && safe_move(uint64_t(&v), w.address, w.bytes == 8 ? 8 : 4);
+    if (w.bytes != 8) v &= w.mask ? w.mask : 0xffffffffull;
+    return v;
+}
+
+bool met(const cmd::WaitValue& w) {
+    bool ok;
+    uint64_t v = read_value(w, ok);
+    if (!ok) return true;
+    uint64_t r = w.bytes == 8 ? w.reference : (w.reference & (w.mask ? w.mask : 0xffffffffull));
     switch (w.compare) {
-        case 0: return true;
-        case 1: return v < w.reference;
-        case 2: return v <= w.reference;
-        case 3: return v == w.reference;
-        case 4: return v != w.reference;
-        case 6: return v > w.reference;
-        default: return v >= w.reference;
+        case 1: return false;
+        case 2: return v < r;
+        case 3: return v == r;
+        case 4: return v <= r;
+        case 5: return v > r;
+        case 6: return v != r;
+        case 7: return v >= r;
+        default: return true;
     }
+}
+
+bool gate_met(const Gate& g) {
+    if (!g.sem) return met(g.w);
+    uint64_t v = 0;
+    vk::vkGetSemaphoreCounterValue(dev(), g.sem, &v);
+    return v >= g.sem_value;
 }
 
 // ---------------------------------------------------------- retiring ----
@@ -223,7 +266,10 @@ void submit(HostQueue& h, const std::vector<Cb*>& cbs, const std::vector<Semapho
     si.pWaitSemaphoreInfos = w.data();
     si.signalSemaphoreInfoCount = uint32_t(s.size());
     si.pSignalSemaphoreInfos = s.data();
+    note("q%d submit %llu: %zu command buffers, %zu waits, %zu signals", int(&h - g_q), (unsigned long long)value, cbs.size(),
+         all_waits.size(), signals.size());
     VkResult r = vk::vkQueueSubmit2(h.q, 1, &si, VK_NULL_HANDLE);
+    if (r == VK_ERROR_DEVICE_LOST) device_lost("submitting work");
     if (r != VK_SUCCESS) {
         static int n = 0;
         if (n++ < 8) KL_ERROR("vk", "queue submission failed: %s", vk::result_text(r));
@@ -236,41 +282,73 @@ void submit(HostQueue& h, const std::vector<Cb*>& cbs, const std::vector<Semapho
     for (Cb* c : cbs) c->value = value, h.busy.push_back(c);
 }
 
-// Opens each queue's gates in order, once the memory compares as asked (or after 250 ms: what
-// should write it may have been dropped, and the GPU must not stall for it).
+// Opens each queue's gates in order, once the memory compares as asked (D3D12 comparison
+// functions, as VIctory's forks and XCL read them) or a fence is reached; past a bound the gate
+// opens anyway: what should write it may have been dropped, and the GPU must not stall for it.
 void gatekeeper(HostQueue& h) {
     for (;;) {
-        std::pair<cmd::WaitValue, uint64_t> g;
+        Gate g;
         {
             std::unique_lock l(h.gates_lock);
             h.gates_cv.wait(l, [&] { return !h.gates.empty(); });
             g = h.gates.front();
         }
-        static std::atomic<uint32_t> seen{0};
-        if (g.first.compare < 32 && !(seen.fetch_or(1u << g.first.compare) & (1u << g.first.compare)))
-            KL_INFO("gpu", "GPU waits on memory with comparison %llu run (polled on the CPU)", (unsigned long long)g.first.compare);
+        if (!g.sem) {
+            static std::atomic<uint32_t> seen{0};
+            if (g.w.compare < 32 && !(seen.fetch_or(1u << g.w.compare) & (1u << g.w.compare)))
+                KL_INFO("gpu", "GPU waits on memory with comparison %llu run (polled on the CPU)", (unsigned long long)g.w.compare);
+        }
+        auto limit = std::chrono::milliseconds(g.sem ? 3000 : 250);
         auto t0 = std::chrono::steady_clock::now();
-        while (!met(g.first)) {
+        bool late = false;
+        while (!gate_met(g)) {
             auto dt = std::chrono::steady_clock::now() - t0;
-            if (dt > std::chrono::milliseconds(250)) {
-                uint64_t v = 0;
-                safe_move(uint64_t(&v), g.first.address, 8);
-                static int n = 0;
-                if (n++ < 16)
-                    KL_WARN("gpu", "a GPU wait on memory %llx (comparison %llu, value %llx, wanted %llx) gave up after 250 ms",
-                            (unsigned long long)g.first.address, (unsigned long long)g.first.compare, (unsigned long long)v,
-                            (unsigned long long)g.first.reference);
+            if (dt > limit) {
+                late = true;
+                h.opened_late++;
+                static std::atomic<int> n{0};
+                if (n++ < 16) {
+                    if (g.sem) {
+                        uint64_t v = 0;
+                        vk::vkGetSemaphoreCounterValue(dev(), g.sem, &v);
+                        KL_WARN("gpu", "a queue wait for fence value %llu (fence at %llu, nothing signals it yet) gave up after 3 s",
+                                (unsigned long long)g.sem_value, (unsigned long long)v);
+                    } else {
+                        bool ok;
+                        uint64_t v = read_value(g.w, ok);
+                        KL_WARN("gpu", "a GPU wait on memory %llx (comparison %llu, %u bytes, value %llx, wanted %llx) gave up after 250 ms",
+                                (unsigned long long)g.w.address, (unsigned long long)g.w.compare, g.w.bytes, (unsigned long long)v,
+                                (unsigned long long)g.w.reference);
+                    }
+                }
                 break;
             }
             if (dt < std::chrono::milliseconds(2)) std::this_thread::yield();
             else Sleep(1);
         }
+        note("q%d gate %llu opened%s", int(&h - g_q), (unsigned long long)g.opens, late ? " after giving up" : "");
         VkSemaphoreSignalInfo sg{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-        sg.semaphore = h.gate, sg.value = g.second;
-        vk::vkSignalSemaphore(dev(), &sg);
+        sg.semaphore = h.gate, sg.value = g.opens;
+        VkResult r = vk::vkSignalSemaphore(dev(), &sg);
+        if (r == VK_ERROR_DEVICE_LOST) device_lost("opening a GPU wait");
         std::lock_guard l(h.gates_lock);
         h.gates.pop_front();
     }
+}
+
+void push_gate(HostQueue& h, Gate g) {
+    {
+        std::lock_guard l(h.gates_lock);
+        g.opens = ++h.gate_value;
+        g.since = GetTickCount64();
+        if (g.sem)
+            note("q%d gate %llu: fence %llu", int(&h - g_q), (unsigned long long)g.opens, (unsigned long long)g.sem_value);
+        else
+            note("q%d gate %llu: memory %llx cmp %llu ref %llx", int(&h - g_q), (unsigned long long)g.opens,
+                 (unsigned long long)g.w.address, (unsigned long long)g.w.compare, (unsigned long long)g.w.reference);
+        h.gates.push_back(g);
+    }
+    h.gates_cv.notify_one();
 }
 
 void full_barrier(VkCommandBuffer cb) {
@@ -950,11 +1028,9 @@ struct Builder {
         out->push_back(c);
         prepare_and_submit(hq, int(&hq - g_q), std::move(*out));
         out->clear();
-        {
-            std::lock_guard l(hq.gates_lock);
-            hq.gates.push_back({w, ++hq.gate_value});
-        }
-        hq.gates_cv.notify_one();
+        Gate gt;
+        gt.w = w;
+        push_gate(hq, gt);
         c = next, cb = next->cb;
         bound = VK_NULL_HANDLE;
         set_bound[0] = set_bound[1] = false;
@@ -1880,10 +1956,76 @@ void signal(int qi, VkSemaphore s, uint64_t v) {
     collect();
 }
 
-void wait(int qi, VkSemaphore s, uint64_t v) {
+void wait(int qi, VkSemaphore s, uint64_t v, bool signal_submitted) {
     HostQueue& h = g_q[qi & 1];
     std::lock_guard g(h.lock);
-    submit(h, {}, {{s, v}}, {});
+    if (signal_submitted || !h.gate) {
+        submit(h, {}, {{s, v}}, {});
+        return;
+    }
+    Gate gt;
+    gt.sem = s, gt.sem_value = v;
+    push_gate(h, gt);
+}
+
+void dump_state() {
+    uint64_t now = GetTickCount64();
+    for (int i = 0; i < 2; ++i) {
+        HostQueue& h = g_q[i];
+        if (!h.q) continue;
+        uint64_t gate_at = 0;
+        if (h.gate) vk::vkGetSemaphoreCounterValue(dev(), h.gate, &gate_at);
+        std::vector<Gate> gs;
+        {
+            std::lock_guard l(h.gates_lock);
+            gs.assign(h.gates.begin(), h.gates.end());
+        }
+        KL_INFO("hang", "queue %d: submitted %llu, GPU done %llu, gate %llu of %llu, %zu gates waiting, %llu opened late",
+                i, (unsigned long long)h.submitted.load(), (unsigned long long)completed(h), (unsigned long long)gate_at,
+                (unsigned long long)h.gate_value, gs.size(), (unsigned long long)h.opened_late.load());
+        for (size_t k = 0; k < gs.size() && k < 4; ++k) {
+            auto& g = gs[k];
+            if (g.sem) {
+                uint64_t v = 0;
+                vk::vkGetSemaphoreCounterValue(dev(), g.sem, &v);
+                KL_INFO("hang", "  gate %llu (%llu ms): fence wants %llu, at %llu", (unsigned long long)g.opens,
+                        (unsigned long long)(now - g.since), (unsigned long long)g.sem_value, (unsigned long long)v);
+            } else {
+                bool ok;
+                uint64_t v = read_value(g.w, ok);
+                KL_INFO("hang", "  gate %llu (%llu ms): memory %llx cmp %llu wants %llx, holds %llx%s", (unsigned long long)g.opens,
+                        (unsigned long long)(now - g.since), (unsigned long long)g.w.address, (unsigned long long)g.w.compare,
+                        (unsigned long long)g.w.reference, (unsigned long long)v, ok ? "" : " (unreadable)");
+            }
+        }
+    }
+    size_t jobs;
+    {
+        std::lock_guard g(g_jobs_lock);
+        jobs = g_jobs.size();
+    }
+    KL_INFO("hang", "pipelines: %zu compile jobs queued, %llu compiling, %llu built, %llu draws or dispatches dropped waiting",
+            jobs, (unsigned long long)stats::g_counters[stats::Compiling].load(),
+            (unsigned long long)stats::g_counters[stats::PipelinesBuilt].load(),
+            (unsigned long long)stats::g_counters[stats::WaitingOnCompile].load());
+    std::vector<Event> ev;
+    {
+        std::lock_guard g(g_ev_lock);
+        uint64_t n = g_ev_n < 64 ? g_ev_n : 64;
+        for (uint64_t k = g_ev_n - n; k < g_ev_n; ++k) ev.push_back(g_ev[k % 64]);
+    }
+    KL_INFO("hang", "last %zu queue events:", ev.size());
+    for (auto& e : ev) KL_INFO("hang", "  -%llu ms %s", (unsigned long long)(now - e.ms), e.text);
+}
+
+void device_lost(const char* where) {
+    static std::atomic<bool> once{false};
+    if (!once.exchange(true)) {
+        KL_ERROR("gpu", "the GPU stopped (Vulkan device lost while %s): a shader or command hung the GPU, so this run ends here", where);
+        dump_state();
+        TerminateProcess(GetCurrentProcess(), 0xDEAD0005);
+    }
+    for (;;) Sleep(1000);
 }
 
 bool run(int qi, const std::function<void(VkCommandBuffer)>& f, VkSemaphore wait_bin, VkSemaphore signal_bin) {
