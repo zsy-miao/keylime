@@ -197,7 +197,7 @@ struct Image {
     bool depth = false, stencil = false, rt = false, storage = false;
     VkImageView sampled = VK_NULL_HANDLE, storage_view = VK_NULL_HANDLE;
     uint32_t slot = 0;
-    bool initialized = false, dirty = true, gpu_owned = false, watched = false;
+    bool initialized = false, dirty = true, gpu_owned = false, watched = false, dead = false;
     std::map<uint64_t, VkImageView> targets;
 };
 
@@ -367,6 +367,7 @@ Image* obtain(uint64_t address, const resource::ResourceDesc& d) {
     if (!im) return nullptr;
     if (it != g_images.end()) {
         Image* old = it->second;
+        old->dead = true;  // pending lists may still name it: they skip it from now on
         it->second = im;
         im->slot = old->slot;  // the address keeps its slot; the old image goes when the GPU is done
         retire([old] {
@@ -715,6 +716,7 @@ void prepare(VkCommandBuffer cb) {
         std::lock_guard g(g_lock);
         std::sort(work.begin(), work.end());
         work.erase(std::unique(work.begin(), work.end()), work.end());
+        work.erase(std::remove_if(work.begin(), work.end(), [](Image* im) { return im->dead; }), work.end());
         for (Image* im : work) {
             if (!im->initialized) {
                 im->initialized = true;

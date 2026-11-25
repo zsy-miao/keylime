@@ -647,7 +647,12 @@ struct Builder {
         return n;
     }
     void trace_draw(const char* why, pipeline::State* st, Compiled* k, const uint32_t* rec) {
-        static std::atomic<int> done{0};
+        static std::atomic<int> done{0}, seen{0};
+        static int skip = [] {
+            char v[16]{};
+            return GetEnvironmentVariableA("KEYLIME_TRACE_SKIP", v, 16) ? atoi(v) : 0;
+        }();
+        if (seen++ < skip) return;
         if (done.load() >= trace_budget()) return;
         ++done;
         uint64_t vh = 0, ph = 0;
@@ -656,8 +661,8 @@ struct Builder {
             if (s.stage == 1) ph = s.hash;
             if (s.stage > 1) continue;
             char path[128];
-            CreateDirectoryA("logs\traced", nullptr);
-            snprintf(path, sizeof path, "logs\traced\%s-%016llx.bin", s.stage ? "ps" : "vs", (unsigned long long)s.hash);
+            CreateDirectoryA("D:/keylime/logs/traced", nullptr);
+            snprintf(path, sizeof path, "D:/keylime/logs/traced/%s-%016llx.bin", s.stage ? "ps" : "vs", (unsigned long long)s.hash);
             if (FILE* f = fopen(path, "wb")) fwrite(s.code.data(), 1, s.code.size(), f), fclose(f);
         }
         char sg[512] = {}, *o = sg;
@@ -669,11 +674,43 @@ struct Builder {
         KL_INFO("draw", "%s: vs %016llx ps %016llx topo %u | %u targets (fmt %d, %ux%u) depth %d | vb0 %llx/%u ib %llx | vs sgprs %s| ps sgprs %s",
                 why, (unsigned long long)vh, (unsigned long long)ph, topology, att.count, int(att.color[0]), extent.width, extent.height,
                 int(att.depth), (unsigned long long)vb[0].address, vb[0].stride, (unsigned long long)ib.address, sg, pg);
+        {
+            const auto& bl = st->blend[0];
+            KL_INFO("draw", "  blend0 enable %u src %u dst %u op %u | alpha src %u dst %u op %u | mask %x | rts %u fmt0 %u dsv %u | cull %u depth %u/%u/%u",
+                    bl.enable, bl.src, bl.dst, bl.op, bl.src_alpha, bl.dst_alpha, bl.op_alpha, bl.write_mask, st->rt_count,
+                    st->rt_formats[0], st->dsv_format, st->raster.cull, st->depth.depth_enable, st->depth.depth_write, st->depth.depth_func);
+        }
+        if (k && k->ps)
+            for (auto& u : k->ps->used)
+                if (u.root == shader::RootType::Table && u.kind == shader::ResourceType::Cbv) {
+                    uint64_t table = bind[1].args[u.slot & 63].value;
+                    if (!table) continue;
+                    const uint32_t* w = reinterpret_cast<const uint32_t*>(table + uint64_t(u.table_offset_dwords) * 4);
+                    uint64_t base = uint64_t(w[0]) | uint64_t(w[1] & 0xffff) << 32;
+                    const float* c = reinterpret_cast<const float*>(base);
+                    KL_INFO("draw", "  ps cb at %llx: %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)base, c[0], c[1], c[2], c[3],
+                            c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11]);
+                }
         for (auto& e : st->input)
             KL_INFO("draw", "  input %s%u format %u slot %u offset %u%s", e.semantic.c_str(), e.index, e.format, e.slot, e.offset,
                     e.per_instance ? " per instance" : "");
         if (k)
             for (auto& a : k->attrs) KL_INFO("draw", "  attribute location %u binding %u vk format %d offset %u", a.location, a.binding, int(a.format), a.offset);
+        if (k && k->vs)
+            for (auto& u : k->vs->used) {
+                if (u.root != shader::RootType::Table) continue;
+                uint64_t table = bind[1].args[u.slot & 63].value;
+                if (!table) continue;
+                const uint32_t* w = reinterpret_cast<const uint32_t*>(table + uint64_t(u.table_offset_dwords) * 4);
+                uint64_t base = uint64_t(w[0]) | uint64_t(w[1] & 0xffff) << 32;
+                KL_INFO("draw", "  vs reads kind %d slot %u +%u dwords %u: %08x %08x %08x %08x (base %llx stride %u records %u)", int(u.kind),
+                        u.slot, u.table_offset_dwords, u.dwords, w[0], w[1], w[2], w[3], (unsigned long long)base, (w[1] >> 16) & 0x3fff, w[2]);
+                if (base) {
+                    const float* f = reinterpret_cast<const float*>(base);
+                    KL_INFO("draw", "    data: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4], f[5],
+                            f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                }
+            }
         if (k && k->vs)
             for (auto& in : k->vs->vs_inputs) KL_INFO("draw", "  vs input row %u mask %x -> v%u", in.row, in.mask, in.vgpr);
         if (vb[0].address) {

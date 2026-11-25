@@ -5,6 +5,8 @@
 // geometry shader taking each triangle and emitting a 4-vertex strip.
 #include "shader/rectlist.h"
 
+#include <array>
+
 #include "shader/spirv.h"
 
 namespace kl::shader {
@@ -68,14 +70,48 @@ std::vector<uint32_t> rect_geometry(const std::vector<uint8_t>& locations, bool 
             emit(pos[k], vs);
         }
     } else {
-        for (uint32_t k = 0; k < 3; ++k) {
-            std::vector<Id> vs;
-            for (size_t v = 0; v < n; ++v) vs.push_back(val[v][k]);
-            emit(pos[k], vs);
+        // The right-angle corner is the vertex opposite the longest edge (titles use either v0 or v1).
+        Id t_bool = b.t_bool();
+        auto comp = [&](Id v, uint32_t i) { return b.op(spv::OpCompositeExtract, t_f32, {v, i}); };
+        auto ndc = [&](Id p, uint32_t i) { return b.op(spv::OpFDiv, t_f32, {comp(p, i), comp(p, 3)}); };
+        auto len2 = [&](Id p, Id q) {
+            Id dx = b.op(spv::OpFSub, t_f32, {ndc(p, 0), ndc(q, 0)}), dy = b.op(spv::OpFSub, t_f32, {ndc(p, 1), ndc(q, 1)});
+            return b.op(spv::OpFAdd, t_f32, {b.op(spv::OpFMul, t_f32, {dx, dx}), b.op(spv::OpFMul, t_f32, {dy, dy})});
+        };
+        Id l01 = len2(pos[0], pos[1]), l12 = len2(pos[1], pos[2]), l20 = len2(pos[2], pos[0]);
+        auto ge = [&](Id x, Id y) { return b.op(spv::OpFOrdGreaterThanEqual, t_bool, {x, y}); };
+        auto band = [&](Id x, Id y) { return b.op(spv::OpLogicalAnd, t_bool, {x, y}); };
+        auto bnot = [&](Id x) { return b.op(spv::OpLogicalNot, t_bool, {x}); };
+        Id c1 = band(ge(l20, l01), ge(l20, l12));
+        Id c2 = band(bnot(c1), ge(l01, l12));
+        Id c0 = band(bnot(c1), bnot(c2));
+        auto w = [&](Id c) { return b.op(spv::OpSelect, t_f32, {c, b.c_f32(1.0f), b.c_f32(0.0f)}); };
+        Id W[3] = {w(c0), w(c1), w(c2)};
+        // Roles in winding order: a (before the corner), c (the corner), b (after it).
+        Id wc[3] = {W[0], W[1], W[2]}, wa[3] = {W[1], W[2], W[0]}, wb[3] = {W[2], W[0], W[1]};
+        auto pick = [&](const Id* v, const Id* wt) {
+            Id r = b.op(spv::OpVectorTimesScalar, t_v4, {v[0], wt[0]});
+            r = b.op(spv::OpFAdd, t_v4, {r, b.op(spv::OpVectorTimesScalar, t_v4, {v[1], wt[1]})});
+            return b.op(spv::OpFAdd, t_v4, {r, b.op(spv::OpVectorTimesScalar, t_v4, {v[2], wt[2]})});
+        };
+        auto roles = [&](const Id* v, Id out[4]) {
+            Id A = pick(v, wa), C = pick(v, wc), B = pick(v, wb);
+            out[0] = A, out[1] = C, out[2] = b.op(spv::OpFSub, t_v4, {b.op(spv::OpFAdd, t_v4, {A, B}), C}), out[3] = B;
+        };
+        Id P[4];
+        roles(pos, P);
+        std::vector<std::array<Id, 4>> V(n);
+        for (size_t v = 0; v < n; ++v) {
+            Id r[4];
+            roles(val[v], r);
+            V[v] = {r[0], r[1], r[2], r[3]};
         }
-        std::vector<Id> vs3;
-        for (size_t v = 0; v < n; ++v) vs3.push_back(fourth(val[v][0], val[v][1], val[v][2]));
-        emit(fourth(pos[0], pos[1], pos[2]), vs3);
+        // Strip a, c, d, b: triangles (a, c, d) and (d, c, b), both in the original winding.
+        for (uint32_t k = 0; k < 4; ++k) {
+            std::vector<Id> vs;
+            for (size_t v = 0; v < n; ++v) vs.push_back(V[v][k]);
+            emit(P[k], vs);
+        }
     }
     b.op_void(spv::OpEndPrimitive, {});
     b.op_void(spv::OpReturn, {});

@@ -156,12 +156,27 @@ void image_words(uint32_t* w, const resource::Info& r, uint32_t format, uint32_t
     w[5] = ((mips - 1) & 0xf) << 4;  // MAX_MIP
 }
 
+// A buffer view's V#: structured (stride), raw (byte-addressed, stride 0) or typed (element size).
+void buffer_view(uint32_t* w, uint64_t address, uint32_t format, uint64_t first, uint32_t count, uint32_t stride, bool raw) {
+    if (stride) {
+        buffer_words(w, address + first * stride, stride, count, 0);
+    } else if (raw || !format) {
+        buffer_words(w, address + first * 4, 0, count * 4, 0);
+    } else {
+        uint32_t bytes = 4, block = 1;
+        texture::element(format, bytes, block);
+        buffer_words(w, address + first * bytes, bytes, count, format);
+    }
+    memory::ensure(address + first * (stride ? stride : 4), 1);
+}
+
 struct CbvDesc { uint64_t location; uint32_t size; uint32_t pad; };
 void WINAPI create_cbv(void*, const CbvDesc* d, uint64_t handle) {
     if (!handle || !d) return;
     auto* w = reinterpret_cast<uint32_t*>(handle);
     memset(w, 0, 32);
-    buffer_words(w, d->location, 0, d->size, 0);
+    // Constant buffers are 16-byte rows (shaders index them as structured buffers of float4).
+    buffer_words(w, d->location, 16, (d->size + 15) / 16, 0);
     memory::ensure(d->location, d->size ? d->size : 1);
 }
 
@@ -182,12 +197,8 @@ void WINAPI create_srv(void*, void* res, const SrvDesc* d, uint64_t handle) {
     if (!res) return;  // null view: all zero reads zero
     if (!resource::info(res, r)) return;
     if (r.desc.dimension == resource::BUFFER) {
-        uint32_t stride = d ? d->buffer.stride : 0;
-        uint64_t first = d ? d->buffer.first : 0;
-        uint32_t count = d ? d->buffer.count : uint32_t(r.desc.width);
-        uint32_t esize = stride ? stride : 4;
-        buffer_words(w, r.address + first * esize, stride, stride ? count : count * 4, 0);
-        memory::ensure(r.address + first * esize, 1);
+        if (d) buffer_view(w, r.address, d->format, d->buffer.first, d->buffer.count, d->buffer.stride, d->buffer.flags & 1);
+        else buffer_view(w, r.address, 0, 0, uint32_t(r.desc.width / 4), 0, true);
         return;
     }
     uint32_t format = d && d->format ? d->format : r.desc.format;
@@ -230,12 +241,8 @@ void WINAPI create_uav(void*, void* res, void*, const UavDesc* d, uint64_t handl
     resource::Info r;
     if (!res || !resource::info(res, r)) return;
     if (r.desc.dimension == resource::BUFFER) {
-        uint32_t stride = d ? d->buffer.stride : 0;
-        uint64_t first = d ? d->buffer.first : 0;
-        uint32_t count = d ? d->buffer.count : uint32_t(r.desc.width / 4);
-        uint32_t esize = stride ? stride : 4;
-        buffer_words(w, r.address + first * esize, stride, stride ? count : count * 4, 0);
-        memory::ensure(r.address + first * esize, 1);
+        if (d) buffer_view(w, r.address, d->format, d->buffer.first, d->buffer.count, d->buffer.stride, d->buffer.flags & 1);
+        else buffer_view(w, r.address, 0, 0, uint32_t(r.desc.width / 4), 0, true);
         return;
     }
     uint32_t format = d && d->format ? d->format : r.desc.format;
@@ -269,14 +276,10 @@ void WINAPI create_placed_view(void*, const resource::ResourceDesc* rd, const vo
     if (rd->dimension == resource::BUFFER) {
         if (uav) {
             const auto* d = static_cast<const UavDesc*>(vd);
-            uint32_t stride = d->buffer.stride, esize = stride ? stride : 4;
-            buffer_words(w, r.address + d->buffer.first * esize, stride, stride ? d->buffer.count : d->buffer.count * 4, 0);
-            memory::ensure(r.address + d->buffer.first * esize, 1);
+            buffer_view(w, r.address, d->format, d->buffer.first, d->buffer.count, d->buffer.stride, d->buffer.flags & 1);
         } else {
             const auto* d = static_cast<const SrvDesc*>(vd);
-            uint32_t stride = d->buffer.stride, esize = stride ? stride : 4;
-            buffer_words(w, r.address + d->buffer.first * esize, stride, stride ? d->buffer.count : d->buffer.count * 4, 0);
-            memory::ensure(r.address + d->buffer.first * esize, 1);
+            buffer_view(w, r.address, d->format, d->buffer.first, d->buffer.count, d->buffer.stride, d->buffer.flags & 1);
         }
         return;
     }
