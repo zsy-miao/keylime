@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -62,6 +63,7 @@ struct HostQueue {
 };
 HostQueue g_q[2];
 VkPipelineLayout g_layout = VK_NULL_HANDLE;
+VkPipelineCache g_cache = VK_NULL_HANDLE;
 memory::Block g_zero;  // binds where a vertex stream is missing
 bool g_started = false;
 
@@ -280,6 +282,50 @@ void notify() {
     { std::lock_guard g(g_done_lock); }
     g_done_cv.notify_all();
 }
+
+// Driver pipeline cache, kept in cache\pipelines.bin across runs: written every 30 s while
+// new pipelines are being built.
+constexpr const char* CACHE_FILE = "cache\\pipelines.bin";
+void open_cache() {
+    std::vector<uint8_t> data;
+    if (FILE* f = fopen(CACHE_FILE, "rb")) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0) data.resize(size_t(n));
+        if (!data.empty() && fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+        fclose(f);
+    }
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = data.size();
+    ci.pInitialData = data.empty() ? nullptr : data.data();
+    if (vk::vkCreatePipelineCache(dev(), &ci, nullptr, &g_cache) != VK_SUCCESS) {
+        ci.initialDataSize = 0, ci.pInitialData = nullptr;
+        KL_VK_CHECK(vk::vkCreatePipelineCache(dev(), &ci, nullptr, &g_cache));
+    }
+    KL_INFO("gpu", "pipeline cache: %zu KB loaded from %s", data.size() >> 10, CACHE_FILE);
+}
+void save_cache() {
+    static std::mutex m;
+    static auto last = std::chrono::steady_clock::now();
+    static uint64_t saved_at = 0;
+    std::unique_lock g(m, std::try_to_lock);
+    if (!g || !g_cache) return;
+    uint64_t built = stats::g_counters[stats::PipelinesBuilt].load();
+    auto now = std::chrono::steady_clock::now();
+    if (built == saved_at || now - last < std::chrono::seconds(30)) return;
+    last = now, saved_at = built;
+    size_t n = 0;
+    if (vk::vkGetPipelineCacheData(dev(), g_cache, &n, nullptr) != VK_SUCCESS || !n) return;
+    std::vector<uint8_t> data(n);
+    if (vk::vkGetPipelineCacheData(dev(), g_cache, &n, data.data()) != VK_SUCCESS) return;
+    CreateDirectoryA("cache", nullptr);
+    if (FILE* f = fopen("cache\\pipelines.tmp", "wb")) {
+        bool ok = fwrite(data.data(), 1, n, f) == n;
+        fclose(f);
+        if (ok) MoveFileExA("cache\\pipelines.tmp", CACHE_FILE, MOVEFILE_REPLACE_EXISTING);
+    }
+}
 void job(std::function<void()> f, bool urgent = false) {
     stats::add(stats::Compiling);
     static std::once_flag once;
@@ -300,6 +346,7 @@ void job(std::function<void()> f, bool urgent = false) {
                     f();
                     stats::g_counters[stats::Compiling].fetch_sub(1);
                     notify();
+                    save_cache();
                 }
             }).detach();
     });
@@ -410,7 +457,7 @@ VkPipeline compute_pipeline(Compiled* k, bool fast) {
     ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, k->csm, "main", nullptr};
     ci.layout = g_layout;
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = vk::vkCreateComputePipelines(dev(), VK_NULL_HANDLE, 1, &ci, nullptr, &p);
+    VkResult r = vk::vkCreateComputePipelines(dev(), g_cache, 1, &ci, nullptr, &p);
     if (r != VK_SUCCESS) {
         static int n = 0;
         if (n++ < 16) KL_WARN("gpu", "compute pipeline not built by the driver%s: %s", fast ? " (unoptimized)" : "", vk::result_text(r));
@@ -669,7 +716,7 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
     ci.pDynamicState = &dy;
     ci.layout = g_layout;
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult res = vk::vkCreateGraphicsPipelines(dev(), VK_NULL_HANDLE, 1, &ci, nullptr, &p);
+    VkResult res = vk::vkCreateGraphicsPipelines(dev(), g_cache, 1, &ci, nullptr, &p);
     if (res != VK_SUCCESS) {
         static int n = 0;
         if (n++ < 16) KL_WARN("gpu", "graphics pipeline not built by the driver: %s", vk::result_text(res));
@@ -1482,6 +1529,7 @@ bool start() {
     li.pushConstantRangeCount = 1;
     li.pPushConstantRanges = &pc;
     if (!KL_VK_CHECK(vk::vkCreatePipelineLayout(h.device, &li, nullptr, &g_layout))) return false;
+    open_cache();
     if (!memory::make_block(1 << 16, false, g_zero)) return false;
     memset(g_zero.map, 0, size_t(g_zero.size));
     g_started = true;
