@@ -1,6 +1,6 @@
-// keylime GPU: pipeline state objects. For now they keep copies of their
-// shader binaries (RDNA 2 code) and the stream they came from; translation
-// happens later, first for the UI shaders.
+// keylime GPU: pipeline state objects. They keep copies of their shader
+// binaries (RDNA 2 code) and fixed-function state; the executor starts
+// translating and compiling them as soon as they are created.
 #include <windows.h>
 
 #include <atomic>
@@ -11,6 +11,7 @@
 #include "gpu/pipeline.h"
 
 #include "gpu/device.h"
+#include "gpu/exec.h"
 #include "gpu/fence.h"
 #include "gpu/texture.h"
 #include "log.h"
@@ -136,6 +137,7 @@ void read_input(State& s, const uint8_t* p) {
 
 HRESULT finish(Pipeline* p, const Iid* iid, void** out) {
     stats::add(stats::Pipelines);
+    exec::prepare(&p->state);
     uint64_t n = ++g_count;
     if ((n & (n - 1)) == 0) KL_INFO("gpu", "%llu pipelines created (%llu KB of shader code)", (unsigned long long)n, (unsigned long long)(g_bytes >> 10));
     return query(p, iid, out);

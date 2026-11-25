@@ -329,6 +329,7 @@ void wait_for(F done) {
 void shaders(pipeline::State* st, Compiled* k);
 VkPipeline compute_pipeline(Compiled* k, bool fast);
 void optimize(Compiled* k);
+void prebuild(pipeline::State* st, Compiled* k);
 
 // The first thread to claim a pipeline translates its shaders; compute pipelines then get
 // their optimized build.
@@ -340,6 +341,8 @@ void translate_claimed(pipeline::State* st, Compiled* k, bool queue_optimize) {
     if (st->compute && k->ok) {
         if (queue_optimize) job([k] { optimize(k); }, true);
         else optimize(k);
+    } else if (k->ok) {
+        prebuild(st, k);
     }
 }
 
@@ -540,7 +543,7 @@ VkPrimitiveTopology vk_topology(uint32_t t) {
 }
 
 void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, uint64_t key);
-VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo) {
+uint64_t request_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, bool urgent) {
     uint64_t key = 0xcbf29ce484222325ull;
     auto mix = [&](uint64_t v) { key = (key ^ v) * 0x100000001b3ull; };
     int expand = topo == RECTLIST ? 0 : topo == QUADLIST ? 1 : -1;
@@ -552,9 +555,13 @@ VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
         if (it == k->variants.end()) {
             k->variants[key] = VK_NULL_HANDLE;
             k->pending.insert(key);
-            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, true);
+            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, urgent);
         }
     }
+    return key;
+}
+VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo) {
+    uint64_t key = request_variant(k, st, a, topo, true);
     VkPipeline out = VK_NULL_HANDLE;
     wait_briefly([&] {
         std::lock_guard g(st->lock);
@@ -670,6 +677,22 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
     }
     stats::add(stats::PipelinesBuilt);
     finish(p);
+}
+
+// The variant the pipeline declares (its render target and depth formats, a list of its
+// topology type), built ahead so the first draw likely finds it ready.
+void prebuild(pipeline::State* st, Compiled* k) {
+    static const uint32_t topo_of[] = {0, 1, 2, 4};
+    if (st->topology_type == 0 || st->topology_type > 3) return;
+    Attachments a;
+    a.count = std::min(st->rt_count, 8u);
+    for (uint32_t i = 0; i < a.count; ++i) a.color[i] = images::vk_format(st->rt_formats[i]);
+    while (a.count && a.color[a.count - 1] == VK_FORMAT_UNDEFINED) --a.count;
+    if (st->dsv_format) {
+        a.depth = images::vk_format(st->dsv_format);
+        a.stencil = a.depth == VK_FORMAT_D16_UNORM_S8_UINT || a.depth == VK_FORMAT_D24_UNORM_S8_UINT || a.depth == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }
+    request_variant(k, st, a, topo_of[st->topology_type], false);
 }
 
 // --------------------------------------------------------------- builder ----
@@ -1464,6 +1487,10 @@ bool start() {
     g_started = true;
     KL_INFO("gpu", "executor ready: title command lists run on %s", h.name.c_str());
     return true;
+}
+
+void prepare(pipeline::State* st) {
+    if (g_started && st) obtain(st);
 }
 
 int queue_for(uint32_t kind) { return kind == 2 ? COMPUTE : GRAPHICS; }

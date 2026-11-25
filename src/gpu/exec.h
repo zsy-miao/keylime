@@ -1,8 +1,8 @@
 // keylime GPU: running title command lists on the host GPU.
 //
 // At submission each list's recorded stream becomes one Vulkan command
-// buffer: pipelines are built from translated shaders on first use (and
-// cached), root arguments become a small per-draw record of user SGPRs that
+// buffer: pipelines are built from translated shaders by background workers
+// from the moment the title creates them, root arguments become a small per-draw record of user SGPRs that
 // shaders read through a push-constant pointer, descriptors stay the title's
 // own RDNA 2 words in title memory, and every image lives in GENERAL layout
 // with full barriers where the title asks for any.
@@ -12,9 +12,15 @@
 
 #include "gpu/vk.h"
 
+namespace kl::gpu::pipeline {
+struct State;
+}
+
 namespace kl::gpu::exec {
 
 bool start();  // once, after images::start
+// A pipeline state object was created: its shaders start translating and compiling now.
+void prepare(pipeline::State* st);
 
 constexpr int GRAPHICS = 0, COMPUTE = 1;
 int queue_for(uint32_t list_kind);  // D3D12 list type -> our queue
