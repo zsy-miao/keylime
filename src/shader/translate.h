@@ -35,6 +35,7 @@ struct Translation {
 struct Options {
     std::map<uint8_t, uint8_t> ps_location;  // PS input row -> location (the linked VS output row)
     uint32_t sgpr_offset = 0;                // dwords into the draw record where this stage's SGPRs start
+    bool flat = false;                       // title memory is reached at a flat base + address (no page walk)
 };
 
 bool translate(const Program& p, Translation& out, std::string& error, const Options* opt = nullptr);

@@ -33,6 +33,7 @@ void remapped(uint64_t address, uint64_t len);
 
 // Device address of the page table's directory (for shaders' push constants).
 uint64_t page_table();
+bool flat();             // title memory has a flat GPU view (GUARD_RECORD+32 holds its base)
 
 // Title memory a GPU resource or heap covers. Shader stores to imported pages that none covers
 // are skipped and logged (the page-table entry carries a guard bit); KEYLIME_STORE_GUARD=0 turns

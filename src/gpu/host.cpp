@@ -166,13 +166,15 @@ bool start() {
     if (h.queues.compute_family == ~0u) h.queues.compute_family = h.queues.graphics_family;
     if (h.queues.transfer_family == ~0u) h.queues.transfer_family = h.queues.compute_family;
     std::set<uint32_t> fams = {h.queues.graphics_family, h.queues.compute_family, h.queues.transfer_family};
-    float prio = 1.0f;
+    // Sparse binds get a queue of their own in the graphics family (the flat GPU view of title memory).
+    bool sparse_queue = (qf[h.queues.graphics_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && qf[h.queues.graphics_family].queueCount >= 2;
+    float prio[2] = {1.0f, 1.0f};
     std::vector<VkDeviceQueueCreateInfo> qci;
     for (uint32_t f : fams) {
         VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         q.queueFamilyIndex = f;
-        q.queueCount = 1;
-        q.pQueuePriorities = &prio;
+        q.queueCount = f == h.queues.graphics_family && sparse_queue ? 2 : 1;
+        q.pQueuePriorities = prio;
         qci.push_back(q);
     }
 
@@ -196,6 +198,16 @@ bool start() {
     h.caps.device_fault = want_fault && ffault.deviceFault;
     ffault.deviceFaultVendorBinary = VK_FALSE;
     h.caps.cache_control = f13.pipelineCreationCacheControl;
+    {
+        char v[4]{};
+        bool off = GetEnvironmentVariableA("KEYLIME_FLAT", v, sizeof v) && v[0] == '0';
+        h.caps.sparse = !off && sparse_queue && f2.features.sparseBinding && f2.features.sparseResidencyBuffer &&
+                        f2.features.sparseResidencyAliased && h.props.sparseProperties.residencyNonResidentStrict;
+        h.caps.sparse_space = h.props.limits.sparseAddressSpaceSize;
+    }
+    f2.features.sparseResidencyImage2D = f2.features.sparseResidencyImage3D = VK_FALSE;
+    f2.features.sparseResidency2Samples = f2.features.sparseResidency4Samples = VK_FALSE;
+    f2.features.sparseResidency8Samples = f2.features.sparseResidency16Samples = VK_FALSE;
     if (!h.caps.buffer_address || !f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         KL_ERROR("vk", "the GPU lacks buffer device address / dynamic rendering / sync2 / timeline semaphores");
         return false;
@@ -224,6 +236,9 @@ bool start() {
     vk::vkGetDeviceQueue(h.device, h.queues.graphics_family, 0, &h.queues.graphics);
     vk::vkGetDeviceQueue(h.device, h.queues.compute_family, 0, &h.queues.compute);
     vk::vkGetDeviceQueue(h.device, h.queues.transfer_family, 0, &h.queues.transfer);
+    if (sparse_queue) vk::vkGetDeviceQueue(h.device, h.queues.graphics_family, 1, &h.queues.sparse);
+    KL_INFO("vk", "sparse binding %s (address space %llu GiB)", h.caps.sparse ? "on" : "off",
+            (unsigned long long)(h.caps.sparse_space >> 30));
     KL_INFO("vk", "device ready: queues graphics %u, compute %u, transfer %u", h.queues.graphics_family,
             h.queues.compute_family, h.queues.transfer_family);
     g_ready = true;

@@ -20,6 +20,7 @@ namespace kl::gpu::host {
 struct Queues {
     uint32_t graphics_family = ~0u, compute_family = ~0u, transfer_family = ~0u;
     VkQueue graphics = VK_NULL_HANDLE, compute = VK_NULL_HANDLE, transfer = VK_NULL_HANDLE;
+    VkQueue sparse = VK_NULL_HANDLE;  // a second queue of the graphics family, only for sparse binds (memory.cpp)
 };
 
 struct Caps {
@@ -28,6 +29,8 @@ struct Caps {
     uint64_t rebar_bytes = 0, vram_bytes = 0;
     uint32_t vram_type = ~0u, rebar_type = ~0u, host_type = ~0u, readback_type = ~0u;
     uint64_t host_import_alignment = 0;
+    bool sparse = false;          // sparse residency buffers and a queue to bind them
+    uint64_t sparse_space = 0;    // sparseAddressSpaceSize
 };
 
 struct Host {

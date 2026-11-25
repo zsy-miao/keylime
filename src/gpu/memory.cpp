@@ -112,8 +112,123 @@ uint64_t* table_for(uint64_t d) {
     return g_tables[d] = t;
 }
 
+// The flat view: one sparse buffer whose byte N is title address N, its 64 KiB pages bound to the
+// imports that hold them (an alias binds the same memory twice). Shaders then reach title memory
+// at base + address, with no page walk (the console GPU sees CPU addresses the same way).
+// Unbound pages read zeros and drop stores (residencyNonResidentStrict).
+// The imports' memory types are not in the sparse buffer's memoryTypeBits, which the spec asks
+// for; NVIDIA binds and reads them correctly (measured), so it is used where the driver allows.
+// The title's GPU memory lies in two clusters (below ~66 GiB, and heap near 2 TiB), past the 1 TiB
+// of sparse address space, so each title GiB gets a slot of the buffer: a table of 2^17 entries
+// (GUARD_RECORD+32 holds its address) gives `slot's device address - GiB's title address`, and a
+// shader's access is that entry + the address. GiBs below LOW keep their own number as the slot (so
+// accesses there may run across GiBs); slot SPARE is never bound (unknown GiBs read zeros).
+constexpr uint64_t FLAT_BYTES = 512 * GIB, LOW = 384, SPARE = 511;
+VkBuffer g_flat = VK_NULL_HANDLE;
+uint64_t g_flat_device = 0;
+Block g_slots;
+uint64_t g_flat_outside = 0, g_flat_partial = 0;
+std::unordered_map<uint64_t, uint64_t> g_slot_of;  // title GiB (>= LOW) -> slot
+uint64_t g_next_slot = LOW;
+
+// The slot of title GiB `g` (assigned on first use); SPARE when none is left.
+uint64_t slot_of(uint64_t g) {
+    if (g < LOW) return g;
+    if (auto it = g_slot_of.find(g); it != g_slot_of.end()) return it->second;
+    if (g_next_slot >= SPARE || g >= DIRECTORY) {
+        if (g_flat_outside++ < 8) KL_WARN("gpu", "flat view: no slot left for title GiB %llx", (unsigned long long)g);
+        return SPARE;
+    }
+    uint64_t slot = g_next_slot++;
+    g_slot_of[g] = slot;
+    reinterpret_cast<uint64_t*>(g_slots.map)[g] = g_flat_device + slot * GIB - g * GIB;
+    KL_INFO("gpu", "flat view: title GiB %llx is slot %llu", (unsigned long long)g, (unsigned long long)slot);
+    return slot;
+}
+VkFence g_bind_fence = VK_NULL_HANDLE;
+std::vector<VkSparseMemoryBind> g_binds;
+
+bool make_flat() {
+    auto& h = host::get();
+    if (!h.caps.sparse || !h.queues.sparse) return false;
+    VkExternalMemoryBufferCreateInfo ebi{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    ebi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.pNext = &ebi;
+    bi.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT | VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
+    bi.size = std::min(FLAT_BYTES, h.caps.sparse_space / 2);
+    bi.usage = ALL_USES;
+    static const std::vector<uint32_t> fam = families();
+    share(bi, fam);
+    if (vk::vkCreateBuffer(h.device, &bi, nullptr, &g_flat) != VK_SUCCESS) return false;
+    VkMemoryRequirements req;
+    vk::vkGetBufferMemoryRequirements(h.device, g_flat, &req);
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (req.alignment != PAGE || vk::vkCreateFence(h.device, &fi, nullptr, &g_bind_fence) != VK_SUCCESS) {
+        KL_WARN("gpu", "flat view: sparse page is %llu KiB, not 64: off", (unsigned long long)(req.alignment >> 10));
+        vk::vkDestroyBuffer(h.device, g_flat, nullptr);
+        g_flat = VK_NULL_HANDLE;
+        return false;
+    }
+    g_flat_device = address_of(g_flat);
+    if (!make_block(DIRECTORY * 8, true, g_slots)) return false;
+    auto* t = reinterpret_cast<uint64_t*>(g_slots.map);
+    for (uint64_t g = 0; g < DIRECTORY; ++g) t[g] = g_flat_device + (g < LOW ? g : SPARE) * GIB - g * GIB;
+    KL_INFO("gpu", "flat view of title memory: %llu GiB sparse buffer at %llx (shaders add the address, no page walk)",
+            (unsigned long long)(bi.size >> 30), (unsigned long long)g_flat_device);
+    return true;
+}
+
+// Queues binds of the 64 KiB pages of [start, end) to `mem`, whose byte `mem_off` holds `start`
+// (`alloc` bytes in all), or unbinds them when `mem` is null.
+void flat_map(uint64_t start, uint64_t end, VkDeviceMemory mem, uint64_t mem_off, uint64_t alloc) {
+    if (!g_flat) return;
+    for (uint64_t p = start & ~(PAGE - 1); p < end; p += PAGE) {
+        uint64_t slot = slot_of(p >> 30);
+        if (slot == SPARE) continue;
+        VkSparseMemoryBind b{slot * GIB + (p & (GIB - 1)), PAGE, VK_NULL_HANDLE, 0, 0};
+        if (mem) {
+            int64_t off = int64_t(mem_off) + int64_t(p) - int64_t(start);
+            if (off < 0 || (off & int64_t(PAGE - 1)) || uint64_t(off) + PAGE > alloc) {
+                g_flat_partial++;  // a page the import holds only part of: it reads zeros in the flat view
+                continue;
+            }
+            b.memory = mem, b.memoryOffset = uint64_t(off);
+        }
+        g_binds.push_back(b);
+    }
+}
+
+// Sends the queued binds; the GPU work submitted after this sees them.
+void flat_flush() {
+    if (g_binds.empty()) return;
+    auto& h = host::get();
+    VkSparseBufferMemoryBindInfo bb{g_flat, uint32_t(g_binds.size()), g_binds.data()};
+    VkBindSparseInfo bsi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+    bsi.bufferBindCount = 1;
+    bsi.pBufferBinds = &bb;
+    VkResult r = vk::vkQueueBindSparse(h.queues.sparse, 1, &bsi, g_bind_fence);
+    if (r == VK_SUCCESS) r = vk::vkWaitForFences(h.device, 1, &g_bind_fence, VK_TRUE, ~0ull);
+    vk::vkResetFences(h.device, 1, &g_bind_fence);
+    if (r != VK_SUCCESS) {
+        static int n = 0;
+        if (n++ < 8) KL_ERROR("gpu", "flat view: binding %zu pages failed: %s", g_binds.size(), vk::result_text(r));
+    }
+    g_binds.clear();
+}
+
 // Points the pages of [start, end) at device address `device` (start's), or at scratch if 0.
-void map_pages(uint64_t start, uint64_t end, uint64_t device) {
+// `mem`/`mem_off`/`alloc`: the import behind `device`, for the flat view.
+void map_pages(uint64_t start, uint64_t end, uint64_t device, VkDeviceMemory mem = VK_NULL_HANDLE, uint64_t mem_off = 0, uint64_t alloc = 0) {
+    if (device) {  // which GiB of the title's address space the GPU sees (for the flat view's layout)
+        static std::unordered_set<uint64_t> seen;
+        for (uint64_t g = start >> 30; g <= (end - 1) >> 30; ++g)
+            if (seen.insert(g).second && seen.size() <= 200)
+                KL_INFO("gpu", "GPU-visible GiB %llx (%llx-%llx, %llu MiB)", (unsigned long long)g, (unsigned long long)start, (unsigned long long)end,
+                        (unsigned long long)((end - start) >> 20));
+    }
+    flat_map(start, end, device ? mem : VK_NULL_HANDLE, mem_off, alloc);
+    flat_flush();
     for (uint64_t p = start & ~(PAGE - 1); p < end; p += PAGE) {
         uint64_t d = p >> 30;
         if (d >= DIRECTORY) break;
@@ -270,7 +385,7 @@ int ensure_physical(uint64_t address, uint64_t len) {
     r.owned = false;
     r.offset = lo - chunk_start;
     g_regions.emplace(start, r);
-    map_pages(start, end, r.device);
+    map_pages(start, end, r.device, sh->r.memory, r.offset, sh->len);
     g_stats.regions++, g_stats.bytes += end - start;
     return address + len <= end ? 1 : -1;
 }
@@ -401,6 +516,7 @@ bool start() {
     memset(g_dir.map + GUARD_RECORD, 0, 64);
     memcpy(g_dir.map + GUARD_RECORD + 16, &g_sink.device, 8);     // shaders read the sink's address here
     memcpy(g_dir.map + GUARD_RECORD + 24, &g_scratch.device, 8);  // and a zero page's
+    if (make_flat()) memcpy(g_dir.map + GUARD_RECORD + 32, &g_slots.device, 8);  // and the flat view's slot table
     char v[4];
     g_guard = !(GetEnvironmentVariableA("KEYLIME_STORE_GUARD", v, sizeof v) && v[0] == '0');
     if (g_guard) std::thread(watch_guard).detach();
@@ -445,7 +561,7 @@ bool ensure(uint64_t address, uint64_t len) {
         return false;
     }
     g_regions.emplace(start, r);
-    map_pages(start, end, r.device);
+    map_pages(start, end, r.device, r.memory, 0, end - start);
     g_stats.regions++, g_stats.bytes += end - start;
     KL_TRACE("gpu", "imported %llx-%llx (%llu KiB)", (unsigned long long)start, (unsigned long long)end,
              (unsigned long long)((end - start) >> 10));
@@ -503,6 +619,7 @@ void remapped(uint64_t address, uint64_t len) {
 }
 
 uint64_t page_table() { return g_dir.device; }
+bool flat() { return g_flat != VK_NULL_HANDLE; }
 
 void own(uint64_t address, uint64_t len, bool allocation) {
     if (!address || !len || !g_guard) return;

@@ -119,16 +119,22 @@ static bool park_watchdog(EXCEPTION_POINTERS* ep) {
     }();
     auto* r = ep->ExceptionRecord;
     if (off || r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[1] != 0) return false;
-    static const uint8_t stop[11] = {0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D};
+    // `mov dword [0], imm32`: the title's deliberate faults. 0x4d8bd421 is the GPU watchdog; 0 is
+    // its thread-hang watchdog (a thread that checks each second that the others still beat, and
+    // ends the game when one has stalled, as ours do while pipelines compile; VIctory patches the
+    // same spot out). Either way only the faulting thread is parked.
+    static const uint8_t stop[7] = {0xC7, 0x04, 0x25, 0, 0, 0, 0};
     uint8_t code[11]{};
     SIZE_T got = 0;
     if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ep->ContextRecord->Rip), code, sizeof code, &got) || got != sizeof code ||
-        memcmp(code, stop, sizeof code) != 0)
+        memcmp(code, stop, sizeof stop) != 0)
         return false;
-    static std::atomic<bool> once{false};
-    if (!once.exchange(true))
-        KL_WARN("main", "the title's GPU watchdog fired (its GPU work did not finish for ~25 s): that thread is parked and the game goes on "
-                        "(KEYLIME_WATCHDOG=1 lets it end the game)");
+    uint32_t imm;
+    memcpy(&imm, code + 7, 4);
+    KL_WARN("main", "the title's %s fired (deliberate fault %08x at %s): that thread is parked and the game goes on "
+                    "(KEYLIME_WATCHDOG=1 lets it end the game)",
+            imm == 0x4d8bd421 ? "GPU watchdog (its GPU work did not finish for ~25 s)" : imm == 0 ? "thread-hang watchdog" : "fatal-error path", imm,
+            describe(ep->ContextRecord->Rip).c_str());
     for (;;) Sleep(INFINITE);
 }
 

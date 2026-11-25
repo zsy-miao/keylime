@@ -284,7 +284,17 @@ struct T {
     // -------------------------------------------------------- memory ----
     // title address -> device address through the 2-level page table (1 GiB, 64 KiB pages).
     // The page table's address and the sink page's (loaded once, in the entry block).
-    Id pt_base = 0, sink_base = 0, zero_base = 0;
+    Id pt_base = 0, sink_base = 0, zero_base = 0, flat_base = 0;
+    bool flat() const { return opt && opt->flat; }
+    // Flat view: title address a is at slots[a >> 30] + a (a sparse buffer the host binds page by
+    // page, one slot per title GiB; unbound pages read zeros and drop stores: no walk or guard).
+    // flat_base holds the slot table's address.
+    Id flat_addr(Id addr) {
+        addr = b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64((1ull << 47) - 1)});
+        Id at = b.op(spv::OpIAdd, t_u64, {flat_base, b.op(spv::OpShiftLeftLogical, t_u64, {b.op(spv::OpShiftRightLogical, t_u64, {addr, b.c_u32(30)}), b.c_u32(3)})});
+        Id e = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {at}), uint32_t(spv::MemoryAccessAlignedMask), 8});
+        return b.op(spv::OpIAdd, t_u64, {e, addr});
+    }
     Id page_table() { return pt_base ? pt_base : load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(1)}), t_u64); }
     void memory_bases() {
         pt_base = page_table();
@@ -292,8 +302,12 @@ struct T {
         sink_base = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {at}), uint32_t(spv::MemoryAccessAlignedMask), 8});
         Id at2 = b.op(spv::OpIAdd, t_u64, {pt_base, b.c_u64((1ull << 17) * 8 + 24)});
         zero_base = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {at2}), uint32_t(spv::MemoryAccessAlignedMask), 8});
+        if (flat()) {
+            Id at3 = b.op(spv::OpIAdd, t_u64, {pt_base, b.c_u64((1ull << 17) * 8 + 32)});
+            flat_base = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {at3}), uint32_t(spv::MemoryAccessAlignedMask), 8});
+        }
     }
-    Id translate_addr(Id addr) { return dev_of(page_entry(addr), addr); }
+    Id translate_addr(Id addr) { return flat() ? flat_addr(addr) : dev_of(page_entry(addr), addr); }
     Id dev_of(Id entry, Id addr) {
         Id page = b.op(spv::OpBitwiseAnd, t_u64, {entry, b.c_u64(~(3ull << 62))});  // bits 63 guard, 62 next-page-follows
         return b.op(spv::OpIAdd, t_u64, {page, b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64(0xffff)})});
@@ -345,6 +359,11 @@ struct T {
         auto word = [&](Id dev) {
             return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), uint32_t(spv::MemoryAccessAlignedMask), 4});
         };
+        if (flat()) {
+            Id base = flat_addr(addr64);
+            for (int k = 0; k < count; ++k) out.push_back(word(k ? b.op(spv::OpIAdd, t_u64, {base, b.c_u64(uint64_t(4 * k))}) : base));
+            return out;
+        }
         Id e0 = page_entry(addr64);
         Id dev0 = dev_of(e0, addr64);
         if (count == 1) return {word(dev0)};
@@ -365,6 +384,14 @@ struct T {
     void mem_store_n(Id addr64, Id go, const std::vector<Id>& vals) {
         int count = int(vals.size());
         go = b.op(spv::OpLogicalAnd, t_bool, {go, b.op(spv::OpINotEqual, t_bool, {addr64, b.c_u64(0)})});
+        if (flat()) {  // lanes that must not store write the sink page (still branch-free)
+            Id base = b.op(spv::OpSelect, t_u64, {go, flat_addr(addr64), sink_base});
+            for (int k = 0; k < count; ++k) {
+                Id dev = k ? b.op(spv::OpIAdd, t_u64, {base, b.c_u64(uint64_t(4 * k))}) : base;
+                b.op_void(spv::OpStore, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), vals[size_t(k)], uint32_t(spv::MemoryAccessAlignedMask), 4});
+            }
+            return;
+        }
         Id e0 = page_entry(addr64);
         Id ok = b.op(spv::OpLogicalAnd, t_bool, {go, b.op(spv::OpLogicalNot, t_bool, {guarded(e0)})});
         if (count > 1) {  // one walk, contiguous on the device (see mem_load_n); else the sink
@@ -1835,8 +1862,9 @@ struct T {
     void buffer_atomic(const Inst& i, std::string_view n, Id addr, Id in_bounds, uint16_t data) {
         Id go = b.op(spv::OpLogicalAnd, t_bool, {in_bounds, active()});
         Id a = b.op(spv::OpSelect, t_u64, {go, addr, b.c_u64(0)});
-        Id bad = guarded(page_entry(a));
-        Id dev = translate_addr(b.op(spv::OpSelect, t_u64, {bad, b.c_u64(0), a}));
+        Id dev;
+        if (flat()) dev = b.op(spv::OpSelect, t_u64, {go, flat_addr(a), sink_base});
+        else dev = translate_addr(b.op(spv::OpSelect, t_u64, {guarded(page_entry(a)), b.c_u64(0), a}));
         Id ptr = b.op(spv::OpConvertUToPtr, p_psb_u32, {dev});
         Id v_ = get_v(data);
         Id old;

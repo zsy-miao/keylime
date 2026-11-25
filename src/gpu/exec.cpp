@@ -527,6 +527,7 @@ uint64_t module_key(const shader::Program& p, const shader::Options& o, uint64_t
     auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
     mix(uint64_t(p.stage));
     mix(o.sgpr_offset);
+    mix(o.flat ? 0xf1a7 : 0);
     for (auto& [a, b] : o.ps_location) mix(uint64_t(a) << 8 | b);
     return h;
 }
@@ -609,8 +610,10 @@ VkShaderModule make_module(const shader::Translation& t) {
     return m;
 }
 
-VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64_t hash, shader::Translation& t) {
+VkShaderModule module(const shader::Program& p, const shader::Options& given, uint64_t hash, shader::Translation& t) {
     std::string err;
+    shader::Options o = given;
+    o.flat = memory::flat();
     uint64_t key = module_key(p, o, hash);
     memory::name_shader(shader::code_id(p), hash, p.stage == shader::HwStage::Ps ? 1 : p.stage == shader::HwStage::Cs ? 2 : 0);
     if (load_spirv(key, t)) {
@@ -729,16 +732,22 @@ void job(std::function<void()> f, bool urgent = false, bool front = false, bool 
         unsigned cores = std::max(4u, std::thread::hardware_concurrency());
         unsigned n = g_precompiling ? std::min(16u, cores * 2 / 3) : 2;
         const unsigned URGENT_ONLY = g_precompiling ? 8 : std::max(4u, std::min(16u, cores / 2));
+        // Kinds of worker: 4 strictly urgent (never busy with a long build when a dispatch needs
+        // one), the rest of the urgent pool urgent then warm, and n background workers urgent,
+        // warm, then optimized builds.
+        constexpr unsigned STRICT_URGENT = 4;
         for (unsigned i = 0; i < n + URGENT_ONLY; ++i)
-            std::thread([urgent_only = i >= n] {
-                SetThreadDescription(GetCurrentThread(), urgent_only ? L"keylime-compile-urgent" : L"keylime-compile");
-                SetThreadPriority(GetCurrentThread(), urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_LOWEST);
+            std::thread([urgent_only = i >= n, strict = i >= n + URGENT_ONLY - std::min(STRICT_URGENT, URGENT_ONLY)] {
+                SetThreadDescription(GetCurrentThread(), strict ? L"keylime-compile-strict" : urgent_only ? L"keylime-compile-urgent" : L"keylime-compile");
+                SetThreadPriority(GetCurrentThread(), strict ? THREAD_PRIORITY_ABOVE_NORMAL : urgent_only ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST);
                 for (;;) {
                     std::function<void()> f;
                     {
                         std::unique_lock g(g_jobs_lock);
-                        g_jobs_cv.wait(g, [urgent_only] { return !g_urgent.empty() || !g_warm.empty() || (!urgent_only && !g_jobs.empty()); });
-                        auto& from = !g_urgent.empty() ? g_urgent : !g_warm.empty() ? g_warm : g_jobs;
+                        g_jobs_cv.wait(g, [urgent_only, strict] {
+                            return !g_urgent.empty() || (!strict && !g_warm.empty()) || (!urgent_only && !g_jobs.empty());
+                        });
+                        auto& from = !g_urgent.empty() ? g_urgent : (!strict && !g_warm.empty()) ? g_warm : g_jobs;
                         f = std::move(from.front());
                         from.pop_front();
                         stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size() + g_warm.size());
@@ -762,7 +771,14 @@ void job(std::function<void()> f, bool urgent = false, bool front = false, bool 
     // notify_one could wake an urgent-only worker for normal work and lose the wakeup.
     g_jobs_cv.notify_all();
 }
-constexpr uint64_t BUDGET_US[2] = {4000, 120000000};
+// Waiting allowed per shown frame, over all threads: [0] draws, [1] dispatches. Past it, a
+// draw or dispatch whose pipeline is still compiling is skipped this frame (as VIctory does with
+// its shared 500 ms budget) instead of holding the title until hundreds of compiles finish.
+// KEYLIME_DISPATCH_WAIT_MS sets the dispatch budget (default 500).
+const uint64_t BUDGET_US[2] = {4000, [] {
+                                   char v[16]{};
+                                   return uint64_t(GetEnvironmentVariableA("KEYLIME_DISPATCH_WAIT_MS", v, 16) ? atoi(v) : 500) * 1000;
+                               }()};
 std::atomic<uint64_t> g_budget_frame[2]{~0ull, ~0ull}, g_waited_us[2]{}, g_waited_total{0};
 template <class F>
 bool wait_budget(F done, int kind) {
@@ -786,7 +802,8 @@ bool wait_budget(F done, int kind) {
 void dropped(const char* what) {
     static std::atomic<bool> told{false};
     if (!told.exchange(true))
-        KL_INFO("gpu", "draws whose pipeline is not ready within 4 ms a frame are dropped meanwhile; dispatches wait for theirs");
+        KL_INFO("gpu", "draws whose pipeline is not ready within 4 ms a frame, and dispatches past %llu ms a frame, are skipped meanwhile",
+                (unsigned long long)(BUDGET_US[1] / 1000));
     stats::add(stats::WaitingOnCompile);
     if (what[1] != 'r') stats::add(stats::DispatchesSkipped);
 }
