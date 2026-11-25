@@ -17,9 +17,28 @@ from the console's RDNA 2 machine code to **SPIR-V**.
 The real retail GTA VI exe boots natively, reaches the main menu with all
 audio working, and keylime renders its frames on Vulkan.
 
-**Current blocker:** about 48 s in, when the game world starts loading after
-the menu, the game sends thousands of new shaders at once and crashed or froze
-shortly after. What changed, waiting for a test run:
+**Current blocker:** the game freezes right after the menu and loading
+screen, where the opening cutscene should start. The last log showed the
+GPU itself hanging (the submit thread stuck in the driver). What changed for
+that, waiting for a test run:
+
+- Shader loops stop after 512 trips in pixel shaders, 1024 in vertex shaders
+  and 8192 in compute (was 262,144 for the whole program). A loop reading a
+  count the host hasn't written yet could keep the GPU busy for seconds per
+  draw; VIctory's forks found the same thing losing the card early in the
+  opening cutscene.
+- GPU memory waits use the D3D12 comparison codes (1 never .. 8 always) with
+  the 32-bit wait's mask, as the other projects read them. A queue wait on a
+  fence nobody has signalled yet opens after 3 s, a repeated fence signal
+  stays off the GPU, and a CPU fence wait gives up after 15 s.
+- `ExecuteIndirect` type 105 (the console's single-pass dispatch) runs, and
+  each `ExecuteIndirect` has a total work budget.
+- Media Foundation sees host paths for files on G: and T:.
+- With no frame for 5 s the log gets every thread's stack, what each queue
+  waits on (with the memory value), the compile backlog, pending fence
+  signals and the last queue events. A lost device ends the run with one line.
+
+Earlier, for world loading after the menu:
 
 - The NVIDIA driver could take 2 to 26 s to compile one translated compute
   shader. Done on the title's submit thread, that stalled the GPU long enough
@@ -181,6 +200,11 @@ keylime is licensed under the **GNU GPL v3.0 or later** (see `LICENSE`).
   formats) were reverse engineered by the [VIctory](https://github.com/Marvisak/VIctory)
   project (GPL-3.0); keylime reuses that knowledge and ports some of its code
   (noted in the files concerned).
+- Ideas from [ztrx](https://github.com/Zettrox/ztrx) and
+  [victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) and
+  [XCL](https://github.com/xcl-dev/xcl) (GPL-2.0) are reimplemented here, not
+  copied: per-stage shader loop caps, the wait comparison codes and mask,
+  type 105 as a dispatch, and an indirect work budget.
 - The XMA decoder follows FFmpeg's `wmaprodec.c` (LGPL-2.1-or-later) via VIctory.
 - Third-party code keeps its own licence: miniz (MIT), libopus (BSD-3-Clause),
   AMD addrlib from Mesa (MIT), Khronos Vulkan / SPIR-V headers (Apache-2.0 / MIT),
