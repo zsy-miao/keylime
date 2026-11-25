@@ -14,11 +14,18 @@ from the console's RDNA 2 machine code to **SPIR-V**.
 
 ## Progress
 
-The real retail GTA VI exe boots natively, and keylime now renders the game's
-frames on Vulkan.
+The real retail GTA VI exe boots natively, reaches the main menu with all
+audio working, and keylime renders its frames on Vulkan.
+
+**Current blocker:** after the main menu, the game crashes at what looks like
+its first indirect call. `ExecuteIndirect` is recorded but not run on the GPU
+yet, and some unimplemented interface methods return an error code where the
+game expects a pointer or a size. Both are being worked on.
 
 - [x] Retail exe boots natively: archives stream through DirectStorage
-      (thousands of requests, 260+ MB), audio starts, main loop holds 30 fps
+      (thousands of requests, 260+ MB), main loop holds 30 fps
+- [x] Gets through the intro and the main menu
+- [x] All audio works (XMA, Opus, DSP)
 - [x] All 320 sampled shaders translate GFX10 → SPIR-V directly, pass
       `spirv-val` and build as NVIDIA pipelines
 - [x] The game's command lists run on the host GPU: about 650 draws and 60
@@ -28,9 +35,11 @@ frames on Vulkan.
       Vulkan images (addrlib detiling, bindless hash table); rect/quad lists
       through a geometry shader
 - [x] The game's frames render on Vulkan and present to the window
-- [ ] BCPack-compressed textures
-- [ ] Remaining `xgameruntime` areas (networking, package, storage, display,
-      speech, game, system); without them the game exits on some runs
+- [x] BCPack-compressed textures decode in the DirectStorage path
+- [x] `xgameruntime` areas (user, store, save, async, networking, package,
+      storage, system and more) emulated well enough to reach the menu
+- [ ] Get past the crash at the first indirect call after the main menu
+- [ ] `ExecuteIndirect`, mesh shader dispatches and GPU memory waits
 
 ## Status
 
@@ -38,14 +47,15 @@ frames on Vulkan.
 |---|---|
 | Loader (PE mapping, static TLS redirect, import binding) | working |
 | Kernel / files (`G:` package, `T:` temp) / memory (`xmem`, physical pages) | working |
-| DirectStorage (worker pool, zlib) | working (BCPack textures: not yet) |
+| DirectStorage (worker pool, zlib, BCPack) | working |
 | GameInput (XInput pads + keyboard as a pad) | working |
-| Audio: AcpHal XMA decoder, Opus (`xapu`), DSP (`chad`) | working (reverb is dry) |
+| `xgameruntime` (XUser, XStore, XGameSave, XAsync, other areas) | working far enough for the menus; some methods are stubs |
+| Audio: AcpHal XMA decoder, Opus (`xapu`), DSP (`chad`) | working: all audio plays in the menus (reverb is dry) |
 | XG texture layouts (AMD addrlib) | working |
 | GPU objects: device, DXGI, queues, fences, lists, heaps, resources, views, pipelines | working; the game's main loop runs at 30 fps |
 | Shader containers + GFX10 decoder | working (320/320 sampled shaders decode) |
 | GFX10 → SPIR-V translator | working (320/320 sampled shaders pass `spirv-val`) |
-| Executing the game's command lists and rendering its frames on Vulkan | working |
+| Executing the game's command lists and rendering its frames on Vulkan | working through the main menu; `ExecuteIndirect` not run yet |
 
 ## How keylime differs from other approaches
 
@@ -82,8 +92,9 @@ What that means in practice:
   Xbox Series title. It builds on VIctory's reverse-engineered interface
   layouts (see [Credits](#credits-and-licence)) but not on its GPU path.
 
-Where it stands: keylime is behind the leading projects. The game boots and its
-frames render on Vulkan, but it isn't playable yet (see
+Where it stands: keylime is behind the leading projects. The game boots, its
+frames render on Vulkan and it reaches the main menu with audio, but it crashes
+after that and isn't playable yet (see
 [Progress](#progress)). The other
 projects' progress is their own reporting, mostly unverified.
 
@@ -124,6 +135,8 @@ arrows = D-pad, WASD / IJKL = sticks, Q / E = shoulders, Z / C = triggers.
 
     src/loader.*, src/pe.*     mapping and binding the game's images
     src/hle/                   console system libraries (kernel, files, xmem, dstorage, gameinput, xg)
+    src/hle/xgr/               xgameruntime (user, store, saves, async, other areas)
+    src/formats/               BCPack decoder
     src/audio/                 AcpHal (XMA), xapu (Opus), chad (DSP)
     src/gpu/                   D3D12.X objects on Vulkan
     src/shader/                containers, GFX10 decoder, SPIR-V builder and translator
@@ -141,5 +154,7 @@ keylime is licensed under the **GNU GPL v3.0 or later** (see `LICENSE`).
 - Third-party code keeps its own licence: miniz (MIT), libopus (BSD-3-Clause),
   AMD addrlib from Mesa (MIT), Khronos Vulkan / SPIR-V headers (Apache-2.0 / MIT),
   GFX10 opcode tables from Mesa's ACO (MIT) and register layouts from Mesa (MIT).
+
+keylime is written with the help of Claude, Anthropic's AI model.
 
 This project is not affiliated with Microsoft, Rockstar Games or Take-Two Interactive.
