@@ -206,6 +206,30 @@ int precompile(const char* dir) {
         Sleep(5000);
     }
     save_cache(true);
+    // KEYLIME_PRECOMPILE_OPTIMIZED=1: the optimized builds too (runs use them from the start
+    // instead of the quick ones; hours for the whole game, so an overnight job). Resumable.
+    char opt[4]{};
+    if (GetEnvironmentVariableA("KEYLIME_PRECOMPILE_OPTIMIZED", opt, 4) && opt[0] == '1') {
+        std::atomic<size_t> left{0};
+        for (auto* k : all) {
+            if (!k->ok || !k->csm) continue;
+            ++left;
+            job([k, &left] {
+                if (!cached_optimized(k)) optimize(k);
+                --left;
+            }, true);
+        }
+        size_t total = left.load();
+        printf("precompile: %zu optimized builds queued\n", total);
+        for (int tick = 1; left.load(); ++tick) {
+            Sleep(5000);
+            double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            printf("precompile: %zu of %zu optimized, %.0f s\n", total - left.load(), total, sec);
+            fflush(stdout);
+            if (tick % 60 == 0) save_cache(true);
+        }
+        save_cache(true);
+    }
     save_used(true);
     printf("precompile: done in %.0f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return 0;
