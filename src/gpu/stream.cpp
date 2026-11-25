@@ -74,14 +74,13 @@ void WINAPI dispatch_mesh_x(void* l, uint32_t x, uint32_t y, uint32_t z, uint32_
     if (auto* s = S(l)) s->add(Op::DispatchMesh, Dispatch{x, y, z, f});
     stats::add(stats::Draws);
 }
-struct IndirectArgs { void* signature; uint64_t args, offset, max, count_buffer, count_offset; };
 uint64_t buffer_address(void* res, uint64_t offset) {
     resource::Info r;
     return resource::info(res, r) ? r.address + offset : 0;
 }
 void WINAPI execute_indirect(void* l, void* sig, uint32_t max, void* args, uint64_t off, void* count, uint64_t coff) {
     if (auto* s = S(l))
-        s->add(Op::ExecuteIndirect, IndirectArgs{sig, buffer_address(args, off), off, max, count ? buffer_address(count, coff) : 0, coff});
+        s->add(Op::ExecuteIndirect, Indirect{sig, buffer_address(args, off), off, max, count ? buffer_address(count, coff) : 0, coff});
     stats::add(stats::Draws);
 }
 
@@ -113,9 +112,8 @@ void WINAPI write32(void* l, uint64_t address, uint32_t value, uint32_t, uint32_
 void WINAPI write64(void* l, uint64_t address, uint64_t value, uint32_t, uint32_t flags) {
     if (auto* s = S(l)) s->add(Op::Write64, Write{address, value, 8, flags});
 }
-struct WaitArgs { uint64_t address; uint64_t compare; uint64_t reference; };
 void WINAPI wait_value(void* l, uint64_t address, uint32_t cmp, uint64_t ref) {
-    if (auto* s = S(l)) s->add(Op::WaitValue, WaitArgs{address, cmp, ref});
+    if (auto* s = S(l)) s->add(Op::WaitValue, WaitValue{address, cmp, ref});
 }
 void WINAPI resolve_queries(void* l, void*, uint32_t, uint32_t, uint32_t count, void* dst, uint64_t off) {
     if (auto* s = S(l)) s->add(Op::ResolveQueries, ResolveQueries{buffer_address(dst, off), count});

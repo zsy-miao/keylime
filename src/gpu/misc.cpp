@@ -2,6 +2,8 @@
 #include <array>
 #include <vector>
 
+#include "gpu/misc.h"
+
 #include "gpu/device.h"
 #include "gpu/fence.h"
 #include "log.h"
@@ -80,4 +82,13 @@ struct Init {
 } g_init;
 
 }  // namespace
+
+bool signature(void* obj, uint32_t& stride, std::vector<std::array<uint32_t, 4>>& arguments) {
+    auto* s = static_cast<Signature*>(obj);
+    if (!s || s->object.functions != sig_table()) return false;
+    stride = s->stride;
+    arguments = s->arguments;
+    return true;
+}
+
 }  // namespace kl::gpu::misc

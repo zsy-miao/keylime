@@ -21,6 +21,7 @@
 #include "gpu/images.h"
 #include "gpu/list.h"
 #include "gpu/memory.h"
+#include "gpu/misc.h"
 #include "gpu/pipeline.h"
 #include "gpu/resource.h"
 #include "gpu/retire.h"
@@ -29,6 +30,7 @@
 #include "gpu/texture.h"
 #include "log.h"
 #include "shader/container.h"
+#include "shader/indirect.h"
 #include "shader/rectlist.h"
 #include "shader/translate.h"
 #include "stats.h"
@@ -60,10 +62,18 @@ struct HostQueue {
     std::atomic<int> recording{0};
     std::deque<Cb*> busy;
     std::vector<Cb*> idle;
+    // GPU waits on title memory: work after one waits on `gate` reaching `gate_value`, which a
+    // host thread signals once the memory compares as asked.
+    VkSemaphore gate = VK_NULL_HANDLE;
+    uint64_t gate_value = 0;
+    std::mutex gates_lock;
+    std::condition_variable gates_cv;
+    std::deque<std::pair<cmd::WaitValue, uint64_t>> gates;
 };
 HostQueue g_q[2];
 VkPipelineLayout g_layout = VK_NULL_HANDLE;
 VkPipelineCache g_cache = VK_NULL_HANDLE;
+VkPipeline g_clamp = VK_NULL_HANDLE;  // indirect dispatch arguments past the GPU-side count -> zero
 memory::Block g_zero;  // binds where a vertex stream is missing
 bool g_started = false;
 
@@ -82,6 +92,21 @@ bool safe_move(uint64_t dst, uint64_t src, uint64_t len) {
         return true;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         return false;
+    }
+}
+
+// A GPU wait on title memory (PM4 WAIT_REG_MEM order: always, <, <=, ==, !=, >=, >).
+bool met(const cmd::WaitValue& w) {
+    uint64_t v = 0;
+    if (!safe_move(uint64_t(&v), w.address, (w.reference >> 32) ? 8 : 4)) return false;
+    switch (w.compare) {
+        case 0: return true;
+        case 1: return v < w.reference;
+        case 2: return v <= w.reference;
+        case 3: return v == w.reference;
+        case 4: return v != w.reference;
+        case 6: return v > w.reference;
+        default: return v >= w.reference;
     }
 }
 
@@ -179,7 +204,9 @@ void submit(HostQueue& h, const std::vector<Cb*>& cbs, const std::vector<Semapho
     uint64_t value = h.submitted.load() + 1;
     signals.push_back({h.timeline, value});
     std::vector<VkSemaphoreSubmitInfo> w, s;
-    for (auto& x : waits) {
+    auto all_waits = waits;
+    if (h.gate_value) all_waits.push_back({h.gate, h.gate_value});
+    for (auto& x : all_waits) {
         VkSemaphoreSubmitInfo i{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
         i.semaphore = x.s, i.value = x.value, i.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         w.push_back(i);
@@ -207,6 +234,42 @@ void submit(HostQueue& h, const std::vector<Cb*>& cbs, const std::vector<Semapho
     }
     h.submitted.store(value);
     for (Cb* c : cbs) c->value = value, h.busy.push_back(c);
+}
+
+// Opens each queue's gates in order, once the memory compares as asked (or after a second).
+void gatekeeper(HostQueue& h) {
+    for (;;) {
+        std::pair<cmd::WaitValue, uint64_t> g;
+        {
+            std::unique_lock l(h.gates_lock);
+            h.gates_cv.wait(l, [&] { return !h.gates.empty(); });
+            g = h.gates.front();
+        }
+        static std::atomic<uint32_t> seen{0};
+        if (g.first.compare < 32 && !(seen.fetch_or(1u << g.first.compare) & (1u << g.first.compare)))
+            KL_INFO("gpu", "GPU waits on memory with comparison %llu run (polled on the CPU)", (unsigned long long)g.first.compare);
+        auto t0 = std::chrono::steady_clock::now();
+        while (!met(g.first)) {
+            auto dt = std::chrono::steady_clock::now() - t0;
+            if (dt > std::chrono::seconds(1)) {
+                uint64_t v = 0;
+                safe_move(uint64_t(&v), g.first.address, 8);
+                static int n = 0;
+                if (n++ < 16)
+                    KL_WARN("gpu", "a GPU wait on memory %llx (comparison %llu, value %llx, wanted %llx) gave up after 1 s",
+                            (unsigned long long)g.first.address, (unsigned long long)g.first.compare, (unsigned long long)v,
+                            (unsigned long long)g.first.reference);
+                break;
+            }
+            if (dt < std::chrono::milliseconds(2)) std::this_thread::yield();
+            else Sleep(1);
+        }
+        VkSemaphoreSignalInfo sg{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        sg.semaphore = h.gate, sg.value = g.second;
+        vk::vkSignalSemaphore(dev(), &sg);
+        std::lock_guard l(h.gates_lock);
+        h.gates.pop_front();
+    }
 }
 
 void full_barrier(VkCommandBuffer cb) {
@@ -375,6 +438,7 @@ void wait_for(F done) {
 
 void shaders(pipeline::State* st, Compiled* k);
 VkPipeline compute_pipeline(Compiled* k, bool fast);
+void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs);
 void optimize(Compiled* k);
 void prebuild(pipeline::State* st, Compiled* k);
 
@@ -780,8 +844,35 @@ struct Builder {
     VkExtent2D extent{0, 0};
     VkPipeline bound = VK_NULL_HANDLE;
     bool set_bound[2] = {false, false};
+    std::vector<Cb*>* out;  // earlier work of this submission (a memory wait sends it first)
 
-    Builder(HostQueue& h, Cb* cc) : hq(h), c(cc), cb(cc->cb) {}
+    Builder(HostQueue& h, Cb* cc, std::vector<Cb*>* o = nullptr) : hq(h), c(cc), cb(cc->cb), out(o) {}
+
+    // Work after a memory wait goes in a submission of its own, held at the queue's gate.
+    void wait_value(const cmd::WaitValue& w) {
+        if (!out || !hq.gate) {
+            once("GPU waits on memory values are ignored here");
+            return;
+        }
+        end_rendering();
+        full_barrier(cb);
+        Cb* next = get_cb(hq);
+        if (!next) {
+            once("a GPU wait on memory was ignored (no command buffer free)");
+            return;
+        }
+        out->push_back(c);
+        prepare_and_submit(hq, int(&hq - g_q), std::move(*out));
+        out->clear();
+        {
+            std::lock_guard l(hq.gates_lock);
+            hq.gates.push_back({w, ++hq.gate_value});
+        }
+        hq.gates_cv.notify_one();
+        c = next, cb = next->cb;
+        bound = VK_NULL_HANDLE;
+        set_bound[0] = set_bound[1] = false;
+    }
 
     void end_rendering() {
         if (rendering) vk::vkCmdEndRendering(cb), rendering = false;
@@ -1083,13 +1174,13 @@ struct Builder {
         return true;
     }
 
-    void dispatch(const cmd::Dispatch& d) {
+    Compiled* dispatch_setup() {
         pipeline::State* st = bind[0].pso;
-        if (!st || !st->compute) return;
+        if (!st || !st->compute) return nullptr;
         VkPipeline p = runnable(st);
         if (!p) {
             once("a dispatch whose pipeline could not be built was dropped");
-            return;
+            return nullptr;
         }
         Compiled* k = static_cast<Compiled*>(st->host);
         end_rendering();
@@ -1101,13 +1192,97 @@ struct Builder {
         }
         uint64_t rec;
         uint32_t* r = record(c, RECORD_DWORDS, rec);
-        if (!r) return;
+        if (!r) return nullptr;
         memset(r, 0, RECORD_DWORDS * 4);
         sgprs(*k->cs, bind[0], r);
         touch_images(*k->cs, bind[0]);
         push(rec);
+        return k;
+    }
+
+    void dispatch(const cmd::Dispatch& d) {
+        if (!dispatch_setup()) return;
         vk::vkCmdDispatch(cb, d.x, d.y, d.z);
         stats::add(stats::DispatchesRun);
+    }
+
+    static uint64_t device_of(VkBuffer b, VkDeviceSize off) {
+        VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        ai.buffer = b;
+        return vk::vkGetBufferDeviceAddress(dev(), &ai) + off;
+    }
+
+    // ExecuteIndirect with a single Draw, DrawIndexed or Dispatch argument per command.
+    void indirect(const cmd::Indirect& x) {
+        static const uint32_t bytes[] = {16, 20, 12};
+        uint32_t stride = 0;
+        std::vector<std::array<uint32_t, 4>> args;
+        if (!misc::signature(x.signature, stride, args) || args.size() != 1) {
+            once("ExecuteIndirect with %zu arguments per command is skipped (single-argument signatures run)", args.size());
+            return;
+        }
+        uint32_t type = args[0][0], max = uint32_t(std::min<uint64_t>(x.max, 1u << 16));
+        if (type > 2) {
+            once("ExecuteIndirect with argument type %u is skipped (not supported yet)", type);
+            return;
+        }
+        if (!max) return;
+        if (max > 1 && ((stride & 3) || stride < bytes[type])) {
+            once("ExecuteIndirect with stride %u is skipped", stride);
+            return;
+        }
+        VkBuffer ab, cbuf = VK_NULL_HANDLE;
+        VkDeviceSize aoff, coff = 0;
+        if ((x.args & 3) || !where(x.args, uint64_t(stride) * (max - 1) + bytes[type], ab, aoff)) {
+            once("ExecuteIndirect with arguments the GPU cannot see (%llx) is skipped", (unsigned long long)x.args);
+            return;
+        }
+        bool counted = x.count != 0;
+        if (counted && ((x.count & 3) || !where(x.count, 4, cbuf, coff))) {
+            once("ExecuteIndirect with a count the GPU cannot see (%llx) is skipped", (unsigned long long)x.count);
+            return;
+        }
+        if (type == 2) return indirect_dispatch(ab, aoff, counted ? device_of(cbuf, coff) : 0, stride, max);
+        if (!draw_setup(type == 1)) {
+            stats::add(stats::DrawsSkipped);
+            return;
+        }
+        if (type == 0) {
+            if (counted) vk::vkCmdDrawIndirectCount(cb, ab, aoff, cbuf, coff, max, stride);
+            else vk::vkCmdDrawIndirect(cb, ab, aoff, max, stride);
+        } else {
+            if (counted) vk::vkCmdDrawIndexedIndirectCount(cb, ab, aoff, cbuf, coff, max, stride);
+            else vk::vkCmdDrawIndexedIndirect(cb, ab, aoff, max, stride);
+        }
+        stats::add(stats::DrawsRun);
+    }
+
+    // Vulkan has no counted indirect dispatch: with a count, the arguments are first copied to
+    // a tight array with those past the count zeroed, then every one is dispatched.
+    void indirect_dispatch(VkBuffer ab, VkDeviceSize aoff, uint64_t count, uint32_t stride, uint32_t max) {
+        end_rendering();
+        VkBuffer db = ab;
+        VkDeviceSize doff = aoff;
+        uint32_t dstride = stride;
+        if (count) {
+            uint64_t tight;
+            if (!g_clamp || !record(c, max * 3, tight)) return;
+            auto& blk = c->records[c->block];
+            db = blk.buffer, doff = tight - blk.device, dstride = 12;
+            full_barrier(cb);
+            vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_clamp);
+            bound = g_clamp;
+            struct {
+                uint64_t src, dst, count;
+                uint32_t stride, max;
+            } pc{device_of(ab, aoff), tight, count, stride, max};
+            vk::vkCmdPushConstants(cb, g_layout, VK_SHADER_STAGE_ALL, 0, 32, &pc);
+            vk::vkCmdDispatch(cb, (max + 63) / 64, 1, 1);
+            full_barrier(cb);
+        }
+        if (!dispatch_setup()) return;
+        for (uint32_t i = 0; i < max; ++i) vk::vkCmdDispatchIndirect(cb, db, doff + VkDeviceSize(i) * dstride);
+        stats::add(stats::DispatchesRun, max);
     }
 
     // A title buffer range as (buffer, offset); false if the GPU cannot see it.
@@ -1490,9 +1665,19 @@ struct Builder {
                     }
                     break;
                 }
-                case Op::ExecuteIndirect: once("ExecuteIndirect is skipped (not supported yet)"); break;
+                case Op::ExecuteIndirect: {
+                    cmd::Indirect x;
+                    get(x);
+                    indirect(x);
+                    break;
+                }
                 case Op::DispatchMesh: once("mesh shader dispatches are skipped (not supported yet)"); break;
-                case Op::WaitValue: once("GPU waits on memory values are ignored"); break;
+                case Op::WaitValue: {
+                    cmd::WaitValue w;
+                    get(w);
+                    wait_value(w);
+                    break;
+                }
                 default: break;
             }
         });
@@ -1520,6 +1705,8 @@ bool start() {
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         si.pNext = &ti;
         if (!KL_VK_CHECK(vk::vkCreateSemaphore(h.device, &si, nullptr, &g_q[i].timeline))) return false;
+        if (KL_VK_CHECK(vk::vkCreateSemaphore(h.device, &si, nullptr, &g_q[i].gate)))
+            std::thread([q = &g_q[i]] { gatekeeper(*q); }).detach();
     }
     VkDescriptorSetLayout sl = images::set_layout();
     VkPushConstantRange pc{VK_SHADER_STAGE_ALL, 0, 32};
@@ -1530,6 +1717,20 @@ bool start() {
     li.pPushConstantRanges = &pc;
     if (!KL_VK_CHECK(vk::vkCreatePipelineLayout(h.device, &li, nullptr, &g_layout))) return false;
     open_cache();
+    {
+        auto code = shader::dispatch_clamp();
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = code.size() * 4;
+        mi.pCode = code.data();
+        VkShaderModule m = VK_NULL_HANDLE;
+        if (KL_VK_CHECK(vk::vkCreateShaderModule(h.device, &mi, nullptr, &m))) {
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+            ci.layout = g_layout;
+            KL_VK_CHECK(vk::vkCreateComputePipelines(h.device, g_cache, 1, &ci, nullptr, &g_clamp));
+            vk::vkDestroyShaderModule(h.device, m, nullptr);
+        }
+    }
     if (!memory::make_block(1 << 16, false, g_zero)) return false;
     memset(g_zero.map, 0, size_t(g_zero.size));
     g_started = true;
@@ -1546,6 +1747,7 @@ VkQueue vk_queue(int q) { return g_q[q & 1].q; }
 
 // Texture uploads and first-use layouts for what was just recorded go in a submission of their
 // own ahead of it; work waits for the other queue's latest uploads too (images are shared).
+namespace {
 void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs) {
     Cb* pre = get_cb(h);
     if (pre && images::prepare(pre->cb, qi, h.submitted.load() + 1)) submit(h, {pre}, {}, {});
@@ -1556,6 +1758,7 @@ void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs) {
     if (up && g_q[other].timeline && up > completed(g_q[other])) waits.push_back({g_q[other].timeline, up});
     submit(h, cbs, waits, {});
 }
+}  // namespace
 
 void execute(int qi, uint32_t count, void* const* lists) {
     t_wait_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
@@ -1569,9 +1772,9 @@ void execute(int qi, uint32_t count, void* const* lists) {
             if (!s) continue;
             Cb* c = get_cb(h);
             if (!c) continue;
-            Builder b(h, c);
+            Builder b(h, c, &cbs);
             b.run(*s);
-            cbs.push_back(c);
+            cbs.push_back(b.c);
         }
         if (!cbs.empty()) prepare_and_submit(h, qi, std::move(cbs));
         h.recording--;
