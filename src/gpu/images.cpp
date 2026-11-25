@@ -318,6 +318,9 @@ struct Image {
     uint64_t mem_hash = 0, last_used = 0, checked = ~0ull, failed = ~0ull;
     bool in_recent = false;
     std::map<uint64_t, VkImageView> targets;
+    // The image this one replaced at the same address, kept until its GPU-made contents are
+    // copied into this one (the title viewing the same memory as another format).
+    Image* carry = nullptr;
 };
 
 namespace {
@@ -604,8 +607,22 @@ bool make_resident(Image* im) {
     return true;
 }
 
+uint32_t texel_bytes(const Image* im) {
+    if (im->depth) return im->fmt.vk == VK_FORMAT_D16_UNORM || im->fmt.vk == VK_FORMAT_D16_UNORM_S8_UINT ? 2 : 4;
+    return format_size(im->fmt.vk);
+}
+bool compressed(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
+
+// Whether `to` can take the GPU-made contents of `from`: the same memory read as texels of the
+// same size and layout.
+bool can_carry(const Image* from, const Image* to) {
+    return from->width == to->width && from->height == to->height && texel_bytes(from) == texel_bytes(to) &&
+           compressed(from->fmt.vk) == compressed(to->fmt.vk) && !(from->depth && to->depth && from->fmt.vk != to->fmt.vk);
+}
+
 // The image at `address` for `d` (described and slotted when new; a different texture at the
-// same address replaces the old one, which keeps the slot).
+// same address replaces the old one, which keeps the slot and, when the GPU made the old one's
+// contents, gets them copied over).
 Image* obtain(uint64_t address, const resource::ResourceDesc& d) {
     auto it = g_images.find(address);
     if (it != g_images.end()) {
@@ -621,12 +638,23 @@ Image* obtain(uint64_t address, const resource::ResourceDesc& d) {
         Image* old = it->second;
         bool was_resident = old->image != VK_NULL_HANDLE;
         old->dead = true;  // pending lists may still name it: they skip it from now on
-        if (old->slot && old->slot_live) write_dummy_slot(old->slot);
-        release(old);  // the old image goes when the GPU is done with it
+        Image* src = old->carry ? old->carry : old->image && old->initialized && old->gpu_owned ? old : nullptr;
+        old->carry = nullptr;
+        bool carry = src && can_carry(src, im);
+        if (carry) {
+            im->carry = src;
+            im->gpu_owned = true;
+            im->dirty = false;
+            stats::add(stats::ImagesCarried);
+        } else {
+            if (src && src != old) release(src);
+            if (old->slot && old->slot_live) write_dummy_slot(old->slot);
+        }
+        if (!carry || src != old) release(old);  // the old image goes when the GPU is done with it
         it->second = im;
         im->slot = old->slot;  // the address keeps its slot
         im->last_used = old->last_used;
-        if (was_resident) make_resident(im);  // it was in use: the new one likely is too
+        if (was_resident || carry) make_resident(im);  // it was in use: the new one likely is too
     } else {
         g_images.emplace(address, im);
         if (g_next_slot >= IMAGE_SLOTS) {
@@ -1050,6 +1078,68 @@ VkDescriptorSetLayout set_layout() { return g_layout; }
 VkDescriptorSet set() { return g_set; }
 uint64_t table() { return g_table.device; }
 
+struct Carry {
+    Image* to;
+    VkImage to_image;
+    Image* from;
+    Facts f, t;
+};
+
+// Copies GPU-made contents into the images that replaced their holders (see obtain). Depth
+// takes a buffer on the way: images of a depth and a colour format cannot copy directly.
+void carry_contents(VkCommandBuffer cb, const std::vector<Carry>& carries, std::vector<std::pair<Image*, VkImage>>& shown) {
+    barrier(cb, {}, true);
+    struct Via { const Carry* c; uint32_t mip, layers, w, h; uint64_t at; };
+    std::vector<Via> via;
+    uint64_t total = 0;
+    for (const Carry& c : carries) {
+        uint32_t mips = std::min(c.f.mips, c.t.mips), layers = std::min(c.f.depth_or_layers, c.t.depth_or_layers);
+        if (!c.f.depth && !c.t.depth) {
+            std::vector<VkImageCopy> rs;
+            for (uint32_t m = 0; m < mips; ++m) {
+                VkImageCopy r{};
+                r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, layers};
+                r.dstSubresource = r.srcSubresource;
+                r.extent = {std::max(1u, c.f.width >> m), std::max(1u, c.f.height >> m), 1};
+                rs.push_back(r);
+            }
+            vk::vkCmdCopyImage(cb, c.f.image, VK_IMAGE_LAYOUT_GENERAL, c.to_image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(rs.size()), rs.data());
+            continue;
+        }
+        uint32_t bytes = texel_bytes(c.f.depth ? c.from : c.to);
+        for (uint32_t m = 0; m < mips; ++m) {
+            uint32_t w = std::max(1u, c.f.width >> m), h = std::max(1u, c.f.height >> m);
+            via.push_back({&c, m, layers, w, h, total});
+            total += (uint64_t(w) * h * layers * bytes + 15) & ~15ull;
+        }
+    }
+    memory::Block blk;
+    if (!via.empty() && memory::make_block(total, true, blk)) {
+        auto region = [](const Via& v, bool depth) {
+            VkBufferImageCopy r{};
+            r.bufferOffset = v.at;
+            r.imageSubresource = {VkImageAspectFlags(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), v.mip, 0, v.layers};
+            r.imageExtent = {v.w, v.h, 1};
+            return r;
+        };
+        for (const Via& v : via) {
+            VkBufferImageCopy r = region(v, v.c->f.depth);
+            vk::vkCmdCopyImageToBuffer(cb, v.c->f.image, VK_IMAGE_LAYOUT_GENERAL, blk.buffer, 1, &r);
+        }
+        barrier(cb, {}, true);
+        for (const Via& v : via) {
+            VkBufferImageCopy r = region(v, v.c->t.depth);
+            vk::vkCmdCopyBufferToImage(cb, blk.buffer, v.c->to_image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        }
+        memory::free_block(blk);
+    }
+    std::lock_guard g(g_lock);
+    for (const Carry& c : carries) {
+        shown.push_back({c.to, c.to_image});
+        release(c.from);
+    }
+}
+
 bool prepare(VkCommandBuffer cb, int queue, uint64_t value) {
     std::vector<Image*> work;
     {
@@ -1081,6 +1171,7 @@ bool prepare(VkCommandBuffer cb, int queue, uint64_t value) {
     }
     std::vector<VkImageMemoryBarrier2> first;
     std::vector<std::pair<Image*, VkImage>> cleared;  // initialized here and made by the GPU (handles taken under the lock)
+    std::vector<Carry> carries;
     std::vector<Upload> ups;
     uint64_t total = 0;
     {
@@ -1101,7 +1192,16 @@ bool prepare(VkCommandBuffer cb, int queue, uint64_t value) {
                 b.image = im->image;
                 b.subresourceRange = {all_aspects(im), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
                 first.push_back(b);
-                if (im->gpu_owned || !im->has_layout || !im->address) cleared.push_back({im, im->image});
+                Image* c = im->carry;
+                im->carry = nullptr;
+                if (c && c->image) {
+                    carries.push_back({im, im->image, c,
+                                       {c->image, c->fmt.vk, c->width, c->height, c->layers, c->mips, c->depth, c->stencil, c->rt},
+                                       {im->image, im->fmt.vk, im->width, im->height, im->layers, im->mips, im->depth, im->stencil, im->rt}});
+                } else {
+                    if (c) release(c);
+                    if (im->gpu_owned || !im->has_layout || !im->address) cleared.push_back({im, im->image});
+                }
             }
             if (im->dirty && !im->gpu_owned && im->has_layout && im->address) {
                 if (!readable(im->address, im->size)) {
@@ -1148,6 +1248,7 @@ bool prepare(VkCommandBuffer cb, int queue, uint64_t value) {
             vk::vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
         }
     }
+    if (!carries.empty()) carry_contents(cb, carries, shown);
     if (!ups.empty()) {
         std::vector<VkBufferImageCopy> regions;
         for (auto& u : ups) {

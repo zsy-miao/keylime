@@ -42,10 +42,10 @@ void run() {
                 (unsigned long long)d[StorageRequests], mb(d[StorageBytes]).c_str(), (unsigned long long)now[StorageFailures],
                 (unsigned long long)now[XmaVoices], (unsigned long long)d[XmaFrames], (unsigned long long)d[OpusPackets],
                 (unsigned long long)d[AudioCommands], (unsigned long long)d[InputReadings], mb(pmc.WorkingSetSize).c_str());
-        KL_INFO("status", "host GPU: %llu draws run, %llu skipped, %llu dispatches run | images %llu, %llu uploads, %llu texture writes seen | "
+        KL_INFO("status", "host GPU: %llu draws run, %llu skipped, %llu dispatches run | images %llu, %llu uploads, %llu carried over, %llu texture writes seen | "
                 "frames shown %llu | VRAM: %llu images resident, %llu / %llu MiB, %llu evicted | %llu memory imports",
                 (unsigned long long)d[DrawsRun], (unsigned long long)d[DrawsSkipped], (unsigned long long)d[DispatchesRun],
-                (unsigned long long)now[Images], (unsigned long long)d[TextureUploads], (unsigned long long)d[TextureWrites],
+                (unsigned long long)now[Images], (unsigned long long)d[TextureUploads], (unsigned long long)d[ImagesCarried], (unsigned long long)d[TextureWrites],
                 (unsigned long long)now[FramesShown], (unsigned long long)now[ImagesResident], (unsigned long long)now[ImageMiB],
                 (unsigned long long)now[VramBudgetMiB], (unsigned long long)d[Evictions], (unsigned long long)now[MemoryImports]);
         if (d[FramesShown]) {
