@@ -28,8 +28,9 @@ waiting for a test run:
 - Shader control flow is translated to structured ifs, if/elses and loops
   wherever the program allows (each shader's share of blocks still run by
   number is in the log), so the driver compiles much less.
-- A frame waits at most 4 ms in total for draw pipelines and 150 ms for
-  compute; past that, the work waits for a later frame instead of the frame.
+- A frame waits at most 4 ms in total for draw pipelines; past that, those
+  draws are left out of the frame. Dispatches always wait for their pipeline
+  (a quick unoptimized build first), because the game reads what they write.
 - Translated SPIR-V is kept in `cache\spirv` (keyed by the shader and the
   translator build), on top of the driver's `cache\pipelines.bin`. A first
   run after an update compiles as it goes; later runs start every pipeline

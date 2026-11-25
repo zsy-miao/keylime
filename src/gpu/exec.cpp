@@ -618,10 +618,10 @@ VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64
 
 // Pipelines are built by workers: one driver compile can take many seconds, and the queue
 // thread (the title's) never makes one. A first use queues the pipeline ahead of the rest and
-// waits for it within a small budget per frame over all threads (4 ms for draws, 150 ms for
-// dispatches, whose results later work may read); past it, draws and dispatches whose pipeline
-// is not ready are dropped. A compute pipeline gets a quick
-// unoptimized build first, then the optimized one. Pipelines an earlier run used (listed in
+// waits for it within a small budget per frame over all threads (4 ms for draws); past it, draws
+// whose pipeline is not ready are dropped. Dispatches always wait: later work, the title's GPU
+// waits and its CPU read results they write, and garbage there crashes the game. A compute
+// pipeline gets a quick unoptimized build first (well under a second), then the optimized one. Pipelines an earlier run used (listed in
 // cache\used-pipelines.txt) start building as soon as the title creates them.
 std::mutex g_jobs_lock, g_done_lock;
 std::condition_variable g_jobs_cv, g_done_cv;
@@ -709,7 +709,7 @@ void job(std::function<void()> f, bool urgent = false) {
     }
     g_jobs_cv.notify_one();
 }
-constexpr uint64_t BUDGET_US[2] = {4000, 150000};
+constexpr uint64_t BUDGET_US[2] = {4000, 120000000};
 std::atomic<uint64_t> g_budget_frame[2]{~0ull, ~0ull}, g_waited_us[2]{}, g_waited_total{0};
 template <class F>
 bool wait_budget(F done, int kind) {
@@ -733,7 +733,7 @@ bool wait_budget(F done, int kind) {
 void dropped(const char* what) {
     static std::atomic<bool> told{false};
     if (!told.exchange(true))
-        KL_INFO("gpu", "draws whose pipeline is not ready within 4 ms a frame, and dispatches within 150 ms a frame, are dropped meanwhile");
+        KL_INFO("gpu", "draws whose pipeline is not ready within 4 ms a frame are dropped meanwhile; dispatches wait for theirs");
     stats::add(stats::WaitingOnCompile);
     if (what[1] != 'r') stats::add(stats::DispatchesSkipped);
 }
