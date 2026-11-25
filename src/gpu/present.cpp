@@ -347,6 +347,10 @@ HRESULT present(int q, uint32_t planes, const void* plane_list, const void*) {
     if (src && show(q, src)) {
         if (!g_shown) g_shown = true, KL_INFO("gpu", "first frame shown: the title's own image is on screen now");
         stats::add(stats::FramesShown);
+        static auto last = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        stats::raise(stats::FrameWorstUs, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - last).count()));
+        last = now;
         return S_OK;
     }
     if (g_shown) return S_OK;
