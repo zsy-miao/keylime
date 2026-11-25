@@ -3,10 +3,12 @@
 // Model (v1): one GFX10 lane per invocation, subgroups of 32 (NVIDIA). Wave-
 // wide masks (EXEC, VCC, VOPC results) are subgroup ballots of the lanes in
 // the subgroup; for wave64 programs the upper 32 bits stay zero (graphics
-// lanes are fixed by the rasterizer). Control flow is a dispatcher loop over
-// the program's basic blocks. Memory goes through the title page table.
+// lanes are fixed by the rasterizer). Control flow is structured: blocks in
+// program order, loops only where the code branches backwards (see body()).
+// Memory goes through the title page table.
 #include "shader/translate.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -45,7 +47,7 @@ struct T {
     std::map<uint8_t, Id> vs_inputs, vs_outputs, ps_inputs, ps_outputs;  // by row / mrt
     Id sampled_images = 0, samplers = 0, storage_images = 0, p_uc_image = 0, p_uc_sampler = 0, t_image2d = 0, t_simage2d = 0, t_storage2d = 0;
     // registers (Function vars, made on first use)
-    Id s[SGPRS] = {}, v[VGPRS] = {}, scc = 0, pc = 0, done = 0, lane = 0;
+    Id s[SGPRS] = {}, v[VGPRS] = {}, scc = 0, pc = 0, lane = 0;
     std::vector<Inst> insts;
     std::map<uint32_t, uint32_t> block_of;
     // DPP / SDWA: source overrides and destination handling for the current instruction.
@@ -375,11 +377,16 @@ struct T {
     // Initial register state: user SGPRs from push constants, system values.
     void prologue() {
         lane = load(lane_var, t_u32);
-        // User SGPRs: s0..s31 from this draw's record (push constant 0 points at it).
+        // User SGPRs from this draw's record (push constant 0 points at it): only those root
+        // parameters arrive in, the host leaves the rest zero (as the registers start).
         {
+            uint32_t want = 0;
+            for (auto& rp : p.layout)
+                for (uint32_t k = 0; k < std::max<uint32_t>(rp.sgprs, 1) && rp.user_data + k < 32; ++k) want |= 1u << (rp.user_data + k);
             Id rec = load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(0)}), t_u64);
             uint32_t base = opt ? opt->sgpr_offset : 0;
             for (uint32_t i = 0; i < 32; ++i) {
+                if (!(want & (1u << i))) continue;
                 Id a = b.op(spv::OpIAdd, t_u64, {rec, b.c_u64(4ull * (base + i))});
                 set_s(uint16_t(i), b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {a}), uint32_t(spv::MemoryAccessAlignedMask), 4}));
             }
@@ -1015,7 +1022,7 @@ struct T {
             return;
         }
         if (n == "v_readfirstlane_b32") {
-            // The first lane in EXEC (every invocation runs the dispatcher loop, so the subgroup's
+            // The first lane in EXEC (every invocation runs every block, so the subgroup's
             // first invocation is not the first active lane).
             Id e = get_s(EXEC_LO);
             Id first = sel(t_u32, ne0(e), tou(ext(GLSLstd450FindILsb, t_i32, {e})), u(0));
@@ -1500,88 +1507,155 @@ struct T {
     }
 
     // ------------------------------------------------------------ body ----
+    // Control flow: `pc` holds the next block's number. Blocks are emitted in program order,
+    // each run when pc names it, so forward branches need no loop. Backward branches make
+    // loop regions (overlapping ones merged), each a structured loop that runs again while pc
+    // stays inside it. Ending the program sets pc past the last block.
+    struct Region {
+        uint32_t lo, hi;
+        bool active = false;
+    };
+    std::vector<Region> regions;
+    std::vector<size_t> first_inst;
+    Id trips = 0;
+    uint32_t end_block = 0;
+
+    void find_regions() {
+        std::vector<std::pair<uint32_t, uint32_t>> r;
+        for (auto& i : insts) {
+            uint32_t target;
+            if (!gfx10::branch_target(i, target)) continue;
+            auto tb = block_of.find(target);
+            if (tb == block_of.end()) continue;
+            uint32_t src = std::prev(block_of.upper_bound(i.offset))->second;
+            if (tb->second <= src) r.push_back({tb->second, src});
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t x = 0; x < r.size() && !changed; ++x)
+                for (size_t y = 0; y < r.size() && !changed; ++y) {
+                    if (x == y) continue;
+                    auto& a = r[x];
+                    auto& z = r[y];
+                    bool same = a == z;
+                    bool crossing = a.first < z.first && z.first <= a.second && a.second < z.second;
+                    if (!same && !crossing) continue;
+                    a = {std::min(a.first, z.first), std::max(a.second, z.second)};
+                    r.erase(r.begin() + y);
+                    changed = true;
+                }
+        }
+        for (auto& [lo, hi] : r) regions.push_back({lo, hi});
+    }
+
+    Id pc_in(uint32_t lo, uint32_t hi) {
+        return b.op(spv::OpULessThanEqual, t_bool, {isub(load(pc, t_u32), u(lo)), u(hi - lo)});
+    }
+
+    void block(uint32_t bi, uint32_t start) {
+        size_t ii = first_inst[bi];
+        for (; ii < insts.size(); ++ii) {
+            const Inst& i = insts[ii];
+            auto next_block = block_of.find(i.offset);
+            if (i.offset != start && next_block != block_of.end()) {
+                store(pc, u(next_block->second));
+                return;
+            }
+            uint32_t target;
+            if (gfx10::ends_program(i)) {
+                store(pc, u(end_block));
+                return;
+            }
+            if (gfx10::branch_target(i, target)) {
+                auto tb = block_of.find(target);
+                auto fb = block_of.find(i.offset + i.size);
+                uint32_t tn = tb != block_of.end() ? tb->second : end_block, fn_ = fb != block_of.end() ? fb->second : end_block;
+                std::string_view n = i.name;
+                if (n == "s_branch") return store(pc, u(tn));
+                Id c = 0;
+                if (n == "s_cbranch_scc0") c = b.op(spv::OpLogicalNot, t_bool, {get_scc()});
+                else if (n == "s_cbranch_scc1") c = get_scc();
+                else if (n == "s_cbranch_vccz") c = b.op(spv::OpIEqual, t_bool, {get_s(VCC_LO), u(0)});
+                else if (n == "s_cbranch_vccnz") c = ne0(get_s(VCC_LO));
+                else if (n == "s_cbranch_execz") c = b.op(spv::OpIEqual, t_bool, {get_s(EXEC_LO), u(0)});
+                else if (n == "s_cbranch_execnz") c = ne0(get_s(EXEC_LO));
+                else {
+                    unsupported(i);
+                    c = b.c_bool(false);
+                }
+                return store(pc, sel(t_u32, c, u(tn), u(fn_)));
+            }
+            emit(i);
+        }
+        store(pc, u(end_block));
+    }
+
+    void if_then(Id cond, const std::function<void()>& f) {
+        Id yes = b.id(), after = b.id();
+        b.op_void(spv::OpSelectionMerge, {after, 0});
+        b.op_void(spv::OpBranchConditional, {cond, yes, after});
+        b.label(yes);
+        f();
+        b.op_void(spv::OpBranch, {after});
+        b.label(after);
+    }
+
+    void loop(Region& r, const std::vector<uint32_t>& starts) {
+        r.active = true;
+        if_then(pc_in(r.lo, r.hi), [&] {
+            Id header = b.id(), body_ = b.id(), cont = b.id(), merge = b.id();
+            b.op_void(spv::OpBranch, {header});
+            b.label(header);
+            b.op_void(spv::OpLoopMerge, {merge, cont, 0});
+            b.op_void(spv::OpBranch, {body_});
+            b.label(body_);
+            range(r.lo, r.hi, starts, false);
+            b.op_void(spv::OpBranch, {cont});
+            b.label(cont);
+            Id t = iadd(load(trips, t_u32), u(1));
+            store(trips, t);
+            Id again = b.op(spv::OpLogicalAnd, t_bool, {pc_in(r.lo, r.hi), b.op(spv::OpULessThan, t_bool, {t, u(1u << 20)})});
+            b.op_void(spv::OpBranchConditional, {again, header, merge});
+            b.label(merge);
+        });
+        r.active = false;
+    }
+
+    void range(uint32_t lo, uint32_t hi, const std::vector<uint32_t>& starts, bool top) {
+        for (uint32_t k = lo; k <= hi;) {
+            Region* outer = nullptr;
+            for (auto& r : regions)
+                if (!r.active && r.lo == k && r.hi <= hi && (!outer || r.hi > outer->hi)) outer = &r;
+            if (outer) {
+                uint32_t next = outer->hi + 1;
+                loop(*outer, starts);
+                k = next;
+                continue;
+            }
+            if (top && k == 0) block(0, starts[0]);
+            else if_then(b.op(spv::OpIEqual, t_bool, {load(pc, t_u32), u(k)}), [&] { block(k, starts[k]); });
+            ++k;
+        }
+    }
+
     bool body() {
         Id fn = b.id();
         b.begin_function(fn, t_void, t_fn);
         b.label();
         scc = b.local(p_fn_bool, b.c_bool(false));
         pc = b.local(p_fn_u32, u(0));
-        done = b.local(p_fn_bool, b.c_bool(false));
-        Id trips = b.local(p_fn_u32, u(0));
+        trips = b.local(p_fn_u32, u(0));
         prologue();
-        Id header = b.id(), dispatch = b.id(), sw_merge = b.id(), cont = b.id(), merge = b.id();
-        b.op_void(spv::OpBranch, {header});
-        b.label(header);
-        b.op_void(spv::OpLoopMerge, {merge, cont, 0});
-        b.op_void(spv::OpBranch, {dispatch});
-        b.label(dispatch);
-        // Case labels per block.
-        std::vector<std::pair<uint32_t, Id>> cases;
-        for (auto& [off, n] : block_of) cases.push_back({n, b.id()});
-        std::vector<uint32_t> sw = {load(pc, t_u32), sw_merge};
-        b.op_void(spv::OpSelectionMerge, {sw_merge, 0});
-        for (auto& [n, l] : cases) sw.push_back(n), sw.push_back(l);
-        b.op_void(spv::OpSwitch, sw);
-        // Emit blocks.
-        size_t ii = 0;
-        for (size_t bi = 0; bi < cases.size(); ++bi) {
-            b.label(cases[bi].second);
-            uint32_t start = 0;
-            for (auto& [off, n] : block_of)
-                if (n == cases[bi].first) start = off;
-            while (ii < insts.size() && insts[ii].offset < start) ++ii;
-            bool terminated = false;
-            for (; ii < insts.size(); ++ii) {
-                const Inst& i = insts[ii];
-                auto next_block = block_of.find(i.offset);
-                if (i.offset != start && next_block != block_of.end()) {
-                    // Fall through into the next block.
-                    store(pc, u(next_block->second));
-                    break;
-                }
-                uint32_t target;
-                if (gfx10::ends_program(i)) {
-                    store(done, b.c_bool(true));
-                    terminated = true;
-                    ++ii;
-                    break;
-                }
-                if (gfx10::branch_target(i, target)) {
-                    auto tb = block_of.find(target);
-                    auto fb = block_of.find(i.offset + i.size);
-                    uint32_t tn = tb != block_of.end() ? tb->second : 0, fn_ = fb != block_of.end() ? fb->second : 0;
-                    std::string_view n = i.name;
-                    Id c = 0;
-                    if (n == "s_branch") c = b.c_bool(true);
-                    else if (n == "s_cbranch_scc0") c = b.op(spv::OpLogicalNot, t_bool, {get_scc()});
-                    else if (n == "s_cbranch_scc1") c = get_scc();
-                    else if (n == "s_cbranch_vccz") c = b.op(spv::OpIEqual, t_bool, {get_s(VCC_LO), u(0)});
-                    else if (n == "s_cbranch_vccnz") c = ne0(get_s(VCC_LO));
-                    else if (n == "s_cbranch_execz") c = b.op(spv::OpIEqual, t_bool, {get_s(EXEC_LO), u(0)});
-                    else if (n == "s_cbranch_execnz") c = ne0(get_s(EXEC_LO));
-                    else {
-                        unsupported(i);
-                        c = b.c_bool(false);
-                    }
-                    if (tb == block_of.end()) store(done, b.c_bool(true));  // a branch out of the code ends it
-                    store(pc, sel(t_u32, c, u(tn), u(fn_)));
-                    terminated = true;
-                    ++ii;
-                    break;
-                }
-                emit(i);
-            }
-            if (ii >= insts.size() && !terminated) store(done, b.c_bool(true));
-            b.op_void(spv::OpBranch, {sw_merge});
+        std::vector<uint32_t> starts;
+        for (auto& [off, n] : block_of) {
+            starts.push_back(off);
+            size_t ii = 0;
+            while (ii < insts.size() && insts[ii].offset < off) ++ii;
+            first_inst.push_back(ii);
         }
-        b.label(sw_merge);
-        b.op_void(spv::OpBranch, {cont});
-        b.label(cont);
-        Id t = iadd(load(trips, t_u32), u(1));
-        store(trips, t);
-        Id stop = b.op(spv::OpLogicalOr, t_bool, {load(done, t_bool), b.op(spv::OpUGreaterThan, t_bool, {t, u(1u << 20)})});
-        b.op_void(spv::OpBranchConditional, {stop, merge, header});
-        b.label(merge);
+        end_block = uint32_t(starts.size());
+        find_regions();
+        range(0, end_block - 1, starts, true);
         b.op_void(spv::OpReturn, {});
         b.end_function();
         // Entry point.

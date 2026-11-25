@@ -16,9 +16,11 @@ machine code, like VIctory, but differently:
 2. `shader/gfx10` — decoder for every RDNA 2 encoding (Mesa opcode tables).
 3. `shader/translate` — GFX10 → SPIR-V:
    - SGPRs / VGPRs / VCC / EXEC / SCC / M0 are Function-storage variables.
-   - Control flow: first version is a dispatcher loop
-     (`loop { switch (pc) { case block: ... } }`), always structured and
-     correct; a real structurizer replaces it for hot shaders later.
+   - Control flow: blocks in program order, each guarded by `pc == block`, so
+     forward branches cost a compare and no loop; backward branches form loop
+     regions (crossing ones merged) emitted as structured loops that repeat
+     while `pc` stays inside. Only the user SGPRs the root layout fills are
+     loaded from the draw record.
    - Wave-wide masks (VCC, EXEC, SGPR results of VOPC) come from subgroup ballots;
      VALU ops are predicated on the lane's EXEC bit.
    - Graphics stages run one lane per invocation (the rasterizer fixes them);
