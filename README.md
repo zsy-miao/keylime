@@ -18,21 +18,30 @@ The real retail GTA VI exe boots natively, reaches the main menu with all
 audio working, and keylime renders its frames on Vulkan.
 
 **Current blocker:** about 48 s in, when the game world starts loading after
-the menu, the game sends thousands of new shaders at once and crashes or
-freezes shortly after. What we know:
+the menu, the game sends thousands of new shaders at once and crashed or froze
+shortly after. What changed, waiting for a test run:
 
-- The NVIDIA driver can take 2–26 s to compile one translated compute shader.
-  Done on the title's submit thread, that stalls the GPU long enough for the
-  game's own GPU watchdog to abort ("GPU Loc Sig", a deliberate write to
-  address 0 with code `0x4D8BD421`).
-- Pipelines now build on background workers. Draws whose pipeline is still
-  compiling are skipped, with a 20 ms wait budget per submission. Skipping
-  *compute dispatches* is unsafe: the game then read a bogus address and hit
-  an `int3` (`game_scarlett_master.exe+0x4da6315`). Next step: compute
-  dispatches must wait for their pipeline, and compiles should start when the
-  pipeline is created, not at first use.
-- `ExecuteIndirect`, mesh shader dispatches and GPU memory waits are still
-  skipped.
+- The NVIDIA driver could take 2 to 26 s to compile one translated compute
+  shader. Done on the title's submit thread, that stalled the GPU long enough
+  for the game's own GPU watchdog to abort ("GPU Loc Sig", a deliberate write
+  to address 0 with code `0x4D8BD421`). Skipping compute dispatches instead
+  made the game read a bogus address and hit an `int3`
+  (`game_scarlett_master.exe+0x4da6315`).
+- Compute dispatches are never skipped now: while the optimized pipeline is
+  compiling, a quick unoptimized build runs them. Only draws are still skipped
+  while their pipeline compiles.
+- Translating and compiling start when the game creates the pipeline, not at
+  first use, and graphics pipelines prebuild the variant they declare.
+- Translated shaders are cheaper for the driver: structured loops and
+  branches instead of a dispatcher loop, and only the user SGPRs in use are
+  loaded. Driver compiles are kept across runs in `cache\pipelines.bin`.
+- `ExecuteIndirect` runs for Draw, DrawIndexed and Dispatch signatures
+  (counted too), and GPU waits on memory hold later work until the value
+  matches (polled on the CPU, 1 s timeout).
+- The bindless texture table has 1M entries and a better hash (it ran out of
+  room at about 42k images), and up to 262144 image slots.
+- Mesh shader dispatches and multi-argument `ExecuteIndirect` signatures are
+  still skipped.
 
 - [x] Retail exe boots natively: archives stream through DirectStorage
       (thousands of requests, 260+ MB), main loop holds 30 fps
@@ -51,7 +60,8 @@ freezes shortly after. What we know:
 - [x] `xgameruntime` areas (user, store, save, async, networking, package,
       storage, system and more) emulated well enough to reach the menu
 - [ ] Get through world loading after the menu (pipeline compile stalls, see above)
-- [ ] `ExecuteIndirect`, mesh shader dispatches and GPU memory waits
+- [x] `ExecuteIndirect` (single-argument signatures) and GPU memory waits
+- [ ] Mesh shader dispatches, multi-argument `ExecuteIndirect`
 
 ## Status
 
