@@ -6,6 +6,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <functional>
 #include <vector>
 
 #include "spirv.hpp"
@@ -64,6 +65,8 @@ public:
     // Function body.
     void begin_function(Id fn, Id ret, Id type);
     void end_function();
+    uint32_t labels = 0;
+    std::function<void()> before_end;  // called before each block's merge/terminator instruction  // OpLabels emitted so far: values made in an older block may not dominate
     Id label();          // emits OpLabel with a new id
     void label(Id l);    // emits OpLabel with id l
     Id local(Id ptr_type, Id init = 0);  // Function-storage variable (hoisted to the entry block)

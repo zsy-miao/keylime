@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <unordered_set>
 #include <set>
 #include <string_view>
 #include <unordered_map>
@@ -69,8 +70,26 @@ struct T {
     // ---------------------------------------------------------- helpers ----
     Id u(uint32_t x) { return b.c_u32(x); }
     Id f(float x) { return b.c_f32(x); }
-    Id load(Id var, Id type) { return b.op(spv::OpLoad, type, {var}); }
-    void store(Id var, Id val) { b.op_void(spv::OpStore, {var, val}); }
+    // Register variables keep their last value per basic block: a load after a store or load of
+    // the same register in the same block reuses the value (far less SPIR-V for the driver).
+    struct Known { Id value; uint32_t block; };
+    std::unordered_map<Id, Known> known;
+    std::unordered_set<Id> registers;
+    bool cache_loads = false;  // measured: reusing loaded values made driver compiles slightly slower
+    Id load(Id var, Id type) {
+        if (cache_loads && registers.count(var)) {
+            auto it = known.find(var);
+            if (it != known.end() && it->second.block == b.labels) return it->second.value;
+            Id x = b.op(spv::OpLoad, type, {var});
+            known[var] = {x, b.labels};
+            return x;
+        }
+        return b.op(spv::OpLoad, type, {var});
+    }
+    void store(Id var, Id val) {
+        b.op_void(spv::OpStore, {var, val});
+        if (registers.count(var)) known[var] = {val, b.labels};
+    }
     Id bc(Id type, Id x) { return b.op(spv::OpBitcast, type, {x}); }
     Id ext(uint32_t inst, Id type, std::initializer_list<Id> args) {
         std::vector<uint32_t> w = {glsl, inst};
@@ -94,11 +113,11 @@ struct T {
 
     Id sreg(uint16_t i) {
         if (i >= SGPRS) i = SNULL;
-        if (!s[i]) s[i] = b.local(p_fn_u32, u(0));
+        if (!s[i]) s[i] = b.local(p_fn_u32, u(0)), registers.insert(s[i]);
         return s[i];
     }
     Id vreg(uint16_t i) {
-        if (!v[i & 0xff]) v[i & 0xff] = b.local(p_fn_u32, u(0));
+        if (!v[i & 0xff]) v[i & 0xff] = b.local(p_fn_u32, u(0)), registers.insert(v[i & 0xff]);
         return v[i & 0xff];
     }
     Id get_s(uint16_t i) { return i == SNULL ? u(0) : load(sreg(i), t_u32); }
@@ -177,7 +196,14 @@ struct T {
     Id pack_half(Id lo, Id hi) { return ext(GLSLstd450PackHalf2x16, t_u32, {b.op(spv::OpCompositeConstruct, t_v2f, {lo, hi})}); }
 
     // Lane state.
-    Id active() { return ne0(band(shr(get_s(EXEC_LO), lane), u(1))); }
+    Id act_exec = 0, act_value = 0;
+    uint32_t act_block = ~0u;
+    Id active() {
+        Id e = get_s(EXEC_LO);
+        if (e == act_exec && act_block == b.labels) return act_value;
+        act_exec = e, act_block = b.labels;
+        return act_value = ne0(band(shr(e, lane), u(1)));
+    }
     void set_v(uint16_t i, Id x) {
         Id old = get_v(i);
         Id act = active();
@@ -226,6 +252,27 @@ struct T {
         Id a2 = b.op(spv::OpIAdd, t_u64, {l2, b.op(spv::OpShiftLeftLogical, t_u64, {i2, b.c_u32(3)})});
         Id page = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {a2}), uint32_t(spv::MemoryAccessAlignedMask), 8});
         return b.op(spv::OpIAdd, t_u64, {page, b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64(0xffff)})});
+    }
+    // `count` consecutive dwords from `addr64`: one instruction touches at most two 64 KiB pages,
+    // so two page-table walks serve all of them (the walks are half of a shader's driver
+    // compile time when done per dword).
+    std::vector<Id> mem_load_n(Id addr64, int count) {
+        std::vector<Id> out;
+        auto word = [&](Id dev) {
+            return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), uint32_t(spv::MemoryAccessAlignedMask), 4});
+        };
+        Id dev0 = translate_addr(addr64);
+        if (count == 1) return {word(dev0)};
+        Id last = b.op(spv::OpIAdd, t_u64, {addr64, b.c_u64(uint64_t(4 * (count - 1)))});
+        Id devl = translate_addr(last);
+        Id in_page = b.op(spv::OpBitwiseAnd, t_u64, {addr64, b.c_u64(0xffff)});
+        for (int k = 0; k < count; ++k) {
+            Id first = b.op(spv::OpULessThan, t_bool, {b.op(spv::OpIAdd, t_u64, {in_page, b.c_u64(uint64_t(4 * k))}), b.c_u64(0x10000)});
+            Id a = b.op(spv::OpIAdd, t_u64, {dev0, b.c_u64(uint64_t(4 * k))});
+            Id z = b.op(spv::OpISub, t_u64, {devl, b.c_u64(uint64_t(4 * (count - 1 - k)))});
+            out.push_back(word(b.op(spv::OpSelect, t_u64, {first, a, z})));
+        }
+        return out;
     }
     Id mem_load(Id addr64) {
         Id dev = translate_addr(addr64);
@@ -823,7 +870,8 @@ struct T {
                 Id off = u(uint32_t(i.smem_offset));
                 if (i.soffset != SNULL) off = iadd(off, get_s(i.soffset));
                 addr = add64(addr, off);
-                for (int k = 0; k < count; ++k) set_s(uint16_t(i.sdata + k), mem_load(add64(addr, u(uint32_t(4 * k)))));
+                auto words = mem_load_n(addr, count);
+                for (int k = 0; k < count; ++k) set_s(uint16_t(i.sdata + k), words[k]);
                 return;
             }
             if (n.rfind("s_dcache", 0) == 0 || n == "s_gl1_inv") return;
@@ -1176,14 +1224,15 @@ struct T {
                 }
                 return;
             }
+            if (load_op) {
+                // Out of bounds reads zero: guard by an address of our zero page (page table entry 0).
+                auto words = mem_load_n(b.op(spv::OpSelect, t_u64, {in_bounds, addr, b.c_u64(0)}), count);
+                for (int k = 0; k < count; ++k) set_v(uint16_t(i.vdata + k), sel(t_u32, in_bounds, words[k], u(0)));
+                return;
+            }
             for (int k = 0; k < count; ++k) {
                 Id a = add64(addr, u(uint32_t(4 * k)));
-                if (load_op) {
-                    // Out of bounds reads zero: guard by an address of our zero page (page table entry 0).
-                    Id safe = b.op(spv::OpSelect, t_u64, {in_bounds, a, b.c_u64(0)});
-                    Id val = mem_load(safe);
-                    set_v(uint16_t(i.vdata + k), sel(t_u32, in_bounds, val, u(0)));
-                } else {
+                {
                     Id safe = b.op(spv::OpSelect, t_u64, {b.op(spv::OpLogicalAnd, t_bool, {in_bounds, active()}), a, b.c_u64(0)});
                     mem_store(safe, sel(t_u32, active(), get_v(uint16_t(i.vdata + k)), load_back(safe)));
                 }
@@ -1207,6 +1256,11 @@ struct T {
             addr = add64s(addr, u(uint32_t(i.mem_offset)));
             if (atomic) return buffer_atomic(i, n, addr, b.c_bool(true), i.vdata);
             uint16_t data = load_op ? i.dst.vgpr_index() : i.vdata;
+            if (load_op) {
+                auto words = mem_load_n(addr, count);
+                for (int k = 0; k < count; ++k) set_v(uint16_t(data + k), words[k]);
+                return;
+            }
             for (int k = 0; k < count; ++k) {
                 Id a = add64(addr, u(uint32_t(4 * k)));
                 if (load_op) set_v(uint16_t(data + k), mem_load(a));
@@ -1349,26 +1403,46 @@ struct T {
 
     // Images: T# (8 SGPRs) / S# (4 SGPRs) -> bindless slots through the texture table.
     //   table: u32 mask, then entries of {u32 key_lo, u32 key_hi, u32 slot, u32 pad}
+    // A loop that stops at the first hit (usually the first probe): the unrolled form cost the
+    // driver seconds per shader.
+    struct SlotMemo { Id lo, hi, slot; uint32_t block; };
+    std::vector<SlotMemo> slot_memo;
     Id slot_of(Id key_lo, Id key_hi) {
+        for (auto& m : slot_memo)
+            if (m.lo == key_lo && m.hi == key_hi && m.block == b.labels) return m.slot;
         Id tt = load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(2)}), t_u64);
         Id mask = b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {tt}), uint32_t(spv::MemoryAccessAlignedMask), 4});
         // texture_hash, in SPIR-V.
         Id hx = bxor(b.op(spv::OpIMul, t_u32, {key_lo, u(0x9e3779b1u)}), b.op(spv::OpIMul, t_u32, {key_hi, u(0x85ebca6bu)}));
         hx = b.op(spv::OpIMul, t_u32, {bxor(hx, shr(hx, u(16))), u(0x7feb352du)});
         Id h = band(bxor(hx, shr(hx, u(15))), mask);
-        Id result = u(0);
-        // Every probe, unrolled (the host keeps the load factor low).
-        for (int probe = int(TEXTURE_TABLE_PROBES) - 1; probe >= 0; --probe) {
-            Id idx = band(iadd(h, u(uint32_t(probe))), mask);
-            Id e = b.op(spv::OpIAdd, t_u64, {tt, b.op(spv::OpUConvert, t_u64, {iadd(u(16), shl(idx, u(4)))})});
-            auto word = [&](uint32_t k) {
-                return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {b.op(spv::OpIAdd, t_u64, {e, b.c_u64(4 * k)})}),
-                                                 uint32_t(spv::MemoryAccessAlignedMask), 4});
-            };
-            Id hit = b.op(spv::OpLogicalAnd, t_bool, {b.op(spv::OpIEqual, t_bool, {word(0), key_lo}), b.op(spv::OpIEqual, t_bool, {word(1), key_hi})});
-            result = sel(t_u32, hit, word(2), result);
-        }
-        return result;
+        Id probe = b.local(p_fn_u32, u(0)), result = b.local(p_fn_u32, u(0));
+        b.op_void(spv::OpStore, {probe, u(0)});
+        b.op_void(spv::OpStore, {result, u(0)});
+        Id header = b.id(), body = b.id(), cont = b.id(), merge = b.id();
+        b.op_void(spv::OpBranch, {header});
+        b.label(header);
+        b.op_void(spv::OpLoopMerge, {merge, cont, 0});
+        b.op_void(spv::OpBranch, {body});
+        b.label(body);
+        Id pv = b.op(spv::OpLoad, t_u32, {probe});
+        Id idx = band(iadd(h, pv), mask);
+        Id e = b.op(spv::OpIAdd, t_u64, {tt, b.op(spv::OpUConvert, t_u64, {iadd(u(16), shl(idx, u(4)))})});
+        auto word = [&](uint32_t k) {
+            return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {b.op(spv::OpIAdd, t_u64, {e, b.c_u64(4 * k)})}),
+                                             uint32_t(spv::MemoryAccessAlignedMask), 4});
+        };
+        Id hit = b.op(spv::OpLogicalAnd, t_bool, {b.op(spv::OpIEqual, t_bool, {word(0), key_lo}), b.op(spv::OpIEqual, t_bool, {word(1), key_hi})});
+        b.op_void(spv::OpStore, {result, sel(t_u32, hit, word(2), u(0))});
+        Id last = b.op(spv::OpUGreaterThanEqual, t_bool, {pv, u(TEXTURE_TABLE_PROBES - 1)});
+        b.op_void(spv::OpBranchConditional, {b.op(spv::OpLogicalOr, t_bool, {hit, last}), merge, cont});
+        b.label(cont);
+        b.op_void(spv::OpStore, {probe, iadd(pv, u(1))});
+        b.op_void(spv::OpBranch, {header});
+        b.label(merge);
+        Id slot = b.op(spv::OpLoad, t_u32, {result});
+        slot_memo.push_back({key_lo, key_hi, slot, b.labels});
+        return slot;
     }
     void image(const Inst& i) {
         std::string_view n = i.name;
@@ -1644,6 +1718,7 @@ struct T {
         b.begin_function(fn, t_void, t_fn);
         b.label();
         scc = b.local(p_fn_bool, b.c_bool(false));
+        registers.insert(scc);
         pc = b.local(p_fn_u32, u(0));
         trips = b.local(p_fn_u32, u(0));
         prologue();

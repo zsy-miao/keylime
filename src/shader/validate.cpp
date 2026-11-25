@@ -197,6 +197,7 @@ int validate(const fs::path& dir, bool driver) {
             fprintf(stderr, "%ls %s\n", f.filename().c_str(), stage_name(p.stage));
             fflush(stderr);
             VkResult r;
+            if (getenv("KEYLIME_NO_DRIVER_CACHE") && t.spirv.size() > 3) t.spirv[2] = uint32_t(GetTickCount64() ^ total);  // generator word: misses the driver's cache
             VkShaderModule m = module(d, t.spirv, r);
             if (r != VK_SUCCESS) {
                 ++failures[std::string("module: ") + vk::result_text(r)];

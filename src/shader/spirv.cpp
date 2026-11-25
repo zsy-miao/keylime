@@ -233,11 +233,15 @@ void Builder::end_function() {
     fn_vars_.clear();
 }
 Id Builder::label() {
+    ++labels;
     Id l = id();
     emit(fn_body_, spv::OpLabel, {l});
     return l;
 }
-void Builder::label(Id l) { emit(fn_body_, spv::OpLabel, {l}); }
+void Builder::label(Id l) {
+    ++labels;
+    emit(fn_body_, spv::OpLabel, {l});
+}
 Id Builder::local(Id ptr_type, Id init) {
     Id r = id();
     if (init) emit(fn_vars_, spv::OpVariable, {ptr_type, r, uint32_t(spv::StorageClassFunction), init});
@@ -254,8 +258,18 @@ Id Builder::op(spv::Op o, Id type, const std::vector<uint32_t>& operands) {
     emit(fn_body_, o, w);
     return r;
 }
-void Builder::op_void(spv::Op o, std::initializer_list<uint32_t> operands) { emit(fn_body_, o, std::vector<uint32_t>(operands)); }
-void Builder::op_void(spv::Op o, const std::vector<uint32_t>& operands) { emit(fn_body_, o, operands); }
+void Builder::op_void(spv::Op o, std::initializer_list<uint32_t> operands) { op_void(o, std::vector<uint32_t>(operands)); }
+void Builder::op_void(spv::Op o, const std::vector<uint32_t>& operands) {
+    switch (o) {
+        case spv::OpBranch: case spv::OpBranchConditional: case spv::OpSwitch: case spv::OpReturn:
+        case spv::OpReturnValue: case spv::OpKill: case spv::OpUnreachable: case spv::OpTerminateInvocation:
+        case spv::OpSelectionMerge: case spv::OpLoopMerge:
+            if (before_end) before_end();
+            break;
+        default: break;
+    }
+    emit(fn_body_, o, operands);
+}
 
 std::vector<uint32_t> Builder::finish() {
     std::vector<uint32_t> m = {0x07230203u, 0x00010500u /* SPIR-V 1.5 */, 0x4b4c0001u /* "KL" generator */, next_, 0};
