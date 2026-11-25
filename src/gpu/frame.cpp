@@ -47,7 +47,7 @@ void sleep_for(std::chrono::nanoseconds d) {
     WaitForSingleObject(timer, INFINITE);
 }
 
-void next_tick(uint32_t kind, uint64_t& tick, std::chrono::nanoseconds& wait) {
+bool next_tick(uint32_t kind, std::chrono::nanoseconds limit, uint64_t& tick, std::chrono::nanoseconds& wait) {
     std::lock_guard g(g_lock);
     if (!g_started) g_started = true, g_start = clk::now();
     auto elapsed = clk::now() - g_start;
@@ -56,6 +56,9 @@ void next_tick(uint32_t kind, uint64_t& tick, std::chrono::nanoseconds& wait) {
     if (tick < last(kind).load() + 1) tick = last(kind).load() + 1;
     auto at = std::chrono::nanoseconds(int64_t(tick - g_first) * iv);
     wait = at - std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed);
+    if (wait > limit) return false;
+    last(kind).store(tick);
+    return true;
 }
 
 HRESULT WINAPI set_interval(void*, void*, uint32_t length_us, uint32_t period, uint32_t) {
@@ -75,16 +78,13 @@ HRESULT WINAPI schedule(void*, uint32_t, uint32_t, const void*, uint32_t) { retu
 HRESULT WINAPI wait(void*, uint32_t kind, uint32_t timeout_ms, const void*, uint32_t flags, uint64_t* token) {
     uint64_t tick;
     std::chrono::nanoseconds w;
-    next_tick(kind, tick, w);
     auto limit = std::chrono::milliseconds(timeout_ms);
     HRESULT hr;
-    if (w > limit) {
+    if (!next_tick(kind, limit, tick, w)) {
         sleep_for(limit);
         hr = TIMEOUT;
     } else {
         sleep_for(w);
-        uint64_t prev = last(kind).load();
-        while (prev < tick && !last(kind).compare_exchange_weak(prev, tick)) {}
         hr = S_OK;
     }
     if (kind == ORIGIN && (hr == S_OK || (flags & TOKEN_ON_TIMEOUT))) {

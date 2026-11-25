@@ -17,6 +17,7 @@ const Iid PAGEABLE_IIDS[3] = {
     guid(0xc4fec28f, 0x7966, 0x4e95, {0x9f, 0x94, 0xf4, 0x31, 0xcb, 0x56, 0xc3, 0xb8}),
 };
 const Iid FENCE_IID = guid(0x0a753dcf, 0xc4d8, 0x4b91, {0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76});
+const Iid FENCE1_IID = guid(0x433685fe, 0xe22b, 0x4ca0, {0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a});
 
 struct Fence {
     Object object;
@@ -33,7 +34,7 @@ namespace {
 void** table();
 
 bool is_fence(const Iid* iid) {
-    if (same(iid, FENCE_IID)) return true;
+    if (same(iid, FENCE_IID) || same(iid, FENCE1_IID)) return true;
     for (auto& p : PAGEABLE_IIDS)
         if (same(iid, p)) return true;
     return false;

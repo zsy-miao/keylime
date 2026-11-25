@@ -1599,6 +1599,8 @@ struct T {
     Id trips = 0;
     uint32_t end_block = 0;
 
+    uint32_t trip_limit() const { return p.stage == HwStage::Ps ? 512 : p.stage == HwStage::Vs ? 1024 : 8192; }
+
     void find_regions() {
         std::vector<std::pair<uint32_t, uint32_t>> r;
         for (auto& i : insts) {
@@ -1683,6 +1685,7 @@ struct T {
         r.active = true;
         if_then(pc_in(r.lo, r.hi), [&] {
             Id header = b.id(), body_ = b.id(), cont = b.id(), merge = b.id();
+            store(trips, u(0));
             b.op_void(spv::OpBranch, {header});
             b.label(header);
             b.op_void(spv::OpLoopMerge, {merge, cont, 0});
@@ -1693,7 +1696,7 @@ struct T {
             b.label(cont);
             Id t = iadd(load(trips, t_u32), u(1));
             store(trips, t);
-            Id again = b.op(spv::OpLogicalAnd, t_bool, {pc_in(r.lo, r.hi), b.op(spv::OpULessThan, t_bool, {t, u(1u << 18)})});
+            Id again = b.op(spv::OpLogicalAnd, t_bool, {pc_in(r.lo, r.hi), b.op(spv::OpULessThan, t_bool, {t, u(trip_limit())})});
             b.op_void(spv::OpBranchConditional, {again, header, merge});
             b.label(merge);
         });
