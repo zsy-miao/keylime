@@ -25,7 +25,7 @@ target_include_directories(addrlib PUBLIC third_party/addrlib/inc third_party/ad
 target_compile_definitions(addrlib PUBLIC ADDR_FASTCALL= LITTLEENDIAN_CPU DEBUG=0)
 target_compile_options(addrlib PRIVATE /w)
 add_executable(keylime ${KEYLIME_SOURCES})
-target_include_directories(keylime PRIVATE src third_party/vulkan)
+target_include_directories(keylime PRIVATE src third_party/vulkan third_party/spirv)
 target_compile_definitions(keylime PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(keylime PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /Zi /utf-8 /wd4100>)
 target_link_options(keylime PRIVATE /DEBUG /LARGEADDRESSAWARE /DYNAMICBASE)
