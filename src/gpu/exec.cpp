@@ -1821,7 +1821,8 @@ bool start() {
     if (!memory::make_block(1 << 16, false, g_zero)) return false;
     memset(g_zero.map, 0, size_t(g_zero.size));
     g_started = true;
-    KL_INFO("gpu", "executor ready: title command lists run on %s", h.name.c_str());
+    KL_INFO("gpu", "executor ready: title command lists run on %s (executor built %s %s; pipelines compile only on workers)",
+            h.name.c_str(), __DATE__, __TIME__);
     return true;
 }
 
