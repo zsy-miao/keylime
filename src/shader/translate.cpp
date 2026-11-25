@@ -282,17 +282,32 @@ struct T {
         Id dev = translate_addr(addr64);
         return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), uint32_t(spv::MemoryAccessAlignedMask), 4});
     }
-    void mem_store(Id addr64, Id val) {
+    void mem_store_n(Id addr64, Id go, const std::vector<Id>& vals) {
+        int count = int(vals.size());
         Id yes = b.id(), after = b.id();
-        Id go = b.op(spv::OpINotEqual, t_bool, {addr64, b.c_u64(0)});
+        go = b.op(spv::OpLogicalAnd, t_bool, {go, b.op(spv::OpINotEqual, t_bool, {addr64, b.c_u64(0)})});
         b.op_void(spv::OpSelectionMerge, {after, 0});
         b.op_void(spv::OpBranchConditional, {go, yes, after});
         b.label(yes);
-        Id dev = translate_addr(addr64);
-        b.op_void(spv::OpStore, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), val, uint32_t(spv::MemoryAccessAlignedMask), 4});
+        Id dev0 = translate_addr(addr64), devl = dev0, in_page = 0;
+        if (count > 1) {
+            devl = translate_addr(b.op(spv::OpIAdd, t_u64, {addr64, b.c_u64(uint64_t(4 * (count - 1)))}));
+            in_page = b.op(spv::OpBitwiseAnd, t_u64, {addr64, b.c_u64(0xffff)});
+        }
+        for (int k = 0; k < count; ++k) {
+            Id dev = dev0;
+            if (count > 1) {
+                Id first = b.op(spv::OpULessThan, t_bool, {b.op(spv::OpIAdd, t_u64, {in_page, b.c_u64(uint64_t(4 * k))}), b.c_u64(0x10000)});
+                Id a = b.op(spv::OpIAdd, t_u64, {dev0, b.c_u64(uint64_t(4 * k))});
+                Id z = b.op(spv::OpISub, t_u64, {devl, b.c_u64(uint64_t(4 * (count - 1 - k)))});
+                dev = b.op(spv::OpSelect, t_u64, {first, a, z});
+            }
+            b.op_void(spv::OpStore, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), vals[size_t(k)], uint32_t(spv::MemoryAccessAlignedMask), 4});
+        }
         b.op_void(spv::OpBranch, {after});
         b.label(after);
     }
+    void mem_store(Id addr64, Id val) { mem_store_n(addr64, b.c_bool(true), {val}); }
     Id add64(Id a64, Id off32) { return b.op(spv::OpIAdd, t_u64, {a64, b.op(spv::OpUConvert, t_u64, {off32})}); }
     Id add64s(Id a64, Id off32) { return b.op(spv::OpIAdd, t_u64, {a64, b.op(spv::OpSConvert, t_u64, {bc(t_i32, off32)})}); }
     // V# base (48 bits) from four SGPRs.
@@ -1349,13 +1364,9 @@ struct T {
                 for (int k = 0; k < count; ++k) set_v(uint16_t(i.vdata + k), sel(t_u32, in_bounds, words[k], u(0)));
                 return;
             }
-            for (int k = 0; k < count; ++k) {
-                Id a = add64(addr, u(uint32_t(4 * k)));
-                {
-                    Id safe = b.op(spv::OpSelect, t_u64, {b.op(spv::OpLogicalAnd, t_bool, {in_bounds, active()}), a, b.c_u64(0)});
-                    mem_store(safe, sel(t_u32, active(), get_v(uint16_t(i.vdata + k)), load_back(safe)));
-                }
-            }
+            std::vector<Id> vals;
+            for (int k = 0; k < count; ++k) vals.push_back(get_v(uint16_t(i.vdata + k)));
+            mem_store_n(addr, b.op(spv::OpLogicalAnd, t_bool, {in_bounds, active()}), vals);
             return;
         }
         if (i.enc == Enc::GLOBAL || i.enc == Enc::FLAT) {
@@ -1380,14 +1391,9 @@ struct T {
                 for (int k = 0; k < count; ++k) set_v(uint16_t(data + k), words[k]);
                 return;
             }
-            for (int k = 0; k < count; ++k) {
-                Id a = add64(addr, u(uint32_t(4 * k)));
-                if (load_op) set_v(uint16_t(data + k), mem_load(a));
-                else {
-                    Id safe = b.op(spv::OpSelect, t_u64, {active(), a, b.c_u64(0)});
-                    mem_store(safe, get_v(uint16_t(data + k)));
-                }
-            }
+            std::vector<Id> vals;
+            for (int k = 0; k < count; ++k) vals.push_back(get_v(uint16_t(data + k)));
+            mem_store_n(addr, active(), vals);
             return;
         }
         if (i.enc == Enc::DS && lds) {
@@ -1465,7 +1471,6 @@ struct T {
         if (i.enc == Enc::MIMG) return image(i);
         return unsupported(i);
     }
-    Id load_back(Id addr64) { return mem_load(addr64); }
 
     // Atomics on title memory (buffer_atomic_* / global_atomic_*). Inactive lanes and
     // out-of-bounds ones operate on the zero page with a neutral value.

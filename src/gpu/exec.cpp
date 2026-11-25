@@ -483,6 +483,7 @@ struct Compiled {
     std::unordered_map<uint64_t, VkPipeline> variants;  // under the state's lock
     std::unordered_set<uint64_t> pending;                // variants a worker is building
     bool writes_color = false, mesh = false;
+    uint32_t code_kb = 0, spirv_kb = 0, blocks = 0, guarded = 0;
     std::vector<uint8_t> vs_rows;                          // VS output locations
     VkShaderModule gs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // rectangle / quad expansion
 };
@@ -855,7 +856,9 @@ void optimize(Compiled* k) {
     auto t0 = std::chrono::steady_clock::now();
     VkPipeline p = compute_pipeline(k, false);
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    if (sec > 2) KL_WARN("gpu", "a compute pipeline took %.1f s to compile", sec);
+    if (sec > 2)
+        KL_WARN("gpu", "compute pipeline %016llx took %.1f s to compile (%u KB of console code, %u KB SPIR-V, %u blocks, %u run by number)",
+                (unsigned long long)k->key, sec, k->code_kb, k->spirv_kb, k->blocks, k->guarded);
     stats::add(stats::PipelinesBuilt);
     stats::add(stats::OptimizedBuilt);
     stats::add(stats::OptimizedUs, uint64_t(sec * 1e6));
@@ -936,6 +939,8 @@ void shaders(pipeline::State* st, Compiled* k) {
         shader::Translation t;
         k->csm = module(*k->cs, {}, cs->hash, t);
         k->ok = k->csm != VK_NULL_HANDLE;
+        k->code_kb = uint32_t(k->cs->code.size() >> 10), k->spirv_kb = uint32_t((t.spirv.size() * 4) >> 10);
+        k->blocks = t.blocks, k->guarded = t.guarded_blocks;
         return;
     }
     if (as) {

@@ -175,6 +175,7 @@ int validate(const fs::path& dir, bool driver) {
     fs::create_directories(dir / "spv");
     std::map<std::string, size_t> unsupported, failures;
     size_t translated = 0, pipelines = 0, clean = 0, total = 0;
+    double cs_seconds = 0;
     for (auto& f : files) {
         std::ifstream in(f, std::ios::binary);
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
@@ -211,7 +212,13 @@ int validate(const fs::path& dir, bool driver) {
                 if (getenv("KEYLIME_FAST_PIPELINES")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                 auto t0 = std::chrono::steady_clock::now();
                 r = vk::vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
-                printf("  %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                cs_seconds += sec;
+                printf("  %.2f s (%zu KB code, %zu KB SPIR-V, %u blocks, %u by number)\n", sec, p.code.size() >> 10, (t.spirv.size() * 4) >> 10,
+                       t.blocks, t.guarded_blocks);
+            } else if (p.stage == HwStage::Ms) {
+                vk::vkDestroyShaderModule(d, m, nullptr);
+                continue;
             } else if (p.stage == HwStage::Vs) {
                 r = graphics(d, L.layout, m, VK_NULL_HANDLE, t, 0, pipe);
             } else {
@@ -231,8 +238,8 @@ int validate(const fs::path& dir, bool driver) {
             vk::vkDestroyShaderModule(d, m, nullptr);
         }
     }
-    printf("\n%zu programs: %zu translated (%zu with no unsupported instruction), %zu pipelines built by the driver\n", total,
-           translated, clean, pipelines);
+    printf("\n%zu programs: %zu translated (%zu with no unsupported instruction), %zu pipelines built by the driver, %.1f s in compute builds\n",
+           total, translated, clean, pipelines, cs_seconds);
     for (auto& [k, v] : failures) printf("  failure x%zu: %s\n", v, k.c_str());
     std::vector<std::pair<size_t, std::string>> u;
     for (auto& [k, v] : unsupported) u.push_back({v, k});
