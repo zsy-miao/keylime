@@ -87,7 +87,7 @@ constexpr uint32_t STAMPS = 1024;
 HostQueue g_q[2];
 VkPipelineLayout g_layout = VK_NULL_HANDLE;
 VkPipelineCache g_cache = VK_NULL_HANDLE;
-VkPipeline g_clamp[3] = {};  // ExecuteIndirect arguments, checked on the GPU (draw, indexed draw, dispatch)
+VkPipeline g_clamp[4] = {};  // ExecuteIndirect arguments, checked on the GPU (draw, indexed draw, dispatch, mesh dispatch)
 memory::Block g_zero;  // binds where a vertex stream is missing
 bool g_started = false;
 
@@ -482,7 +482,7 @@ struct Compiled {
     std::atomic<bool> early{false}, counted{false};
     std::unordered_map<uint64_t, VkPipeline> variants;  // under the state's lock
     std::unordered_set<uint64_t> pending;                // variants a worker is building
-    bool writes_color = false;
+    bool writes_color = false, mesh = false;
     std::vector<uint8_t> vs_rows;                          // VS output locations
     VkShaderModule gs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // rectangle / quad expansion
 };
@@ -919,11 +919,13 @@ VkPipeline compute_pipeline(Compiled* k, bool fast) {
 }
 
 void shaders(pipeline::State* st, Compiled* k) {
-    const pipeline::Shader *vs = nullptr, *ps = nullptr, *cs = nullptr;
+    const pipeline::Shader *vs = nullptr, *ps = nullptr, *cs = nullptr, *as = nullptr, *ms = nullptr;
     for (auto& s : st->shaders) {
         if (s.stage == 0) vs = &s;
         if (s.stage == 1) ps = &s;
         if (s.stage == 5) cs = &s;
+        if (s.stage == 6) as = &s;
+        if (s.stage == 7) ms = &s;
     }
     std::string err;
     if (st->compute) {
@@ -936,9 +938,22 @@ void shaders(pipeline::State* st, Compiled* k) {
         k->ok = k->csm != VK_NULL_HANDLE;
         return;
     }
-    if (!vs || !shader::parse(vs->code.data(), vs->code.size(), k->vsc, err) || !(k->vs = find(k->vsc, shader::HwStage::Vs))) {
+    if (as) {
         static int n = 0;
-        if (n++ < 16) KL_WARN("gpu", "graphics pipeline without a usable VS (%s)", err.empty() ? "no VS program" : err.c_str());
+        if (n++ < 4) KL_WARN("gpu", "mesh pipelines with an amplification shader are skipped (not supported yet)");
+        return;
+    }
+    if (ms && !host::get().caps.mesh_shader) {
+        static int n = 0;
+        if (n++ < 4) KL_WARN("gpu", "the driver has no VK_EXT_mesh_shader, so mesh pipelines are skipped");
+        return;
+    }
+    k->mesh = ms != nullptr;
+    if (ms) vs = ms;
+    shader::HwStage front = k->mesh ? shader::HwStage::Ms : shader::HwStage::Vs;
+    if (!vs || !shader::parse(vs->code.data(), vs->code.size(), k->vsc, err) || !(k->vs = find(k->vsc, front))) {
+        static int n = 0;
+        if (n++ < 16) KL_WARN("gpu", "graphics pipeline without a usable %s (%s)", k->mesh ? "MS" : "VS", err.empty() ? "no program" : err.c_str());
         return;
     }
     shader::Translation vt;
@@ -967,7 +982,7 @@ void shaders(pipeline::State* st, Compiled* k) {
     // Vertex input: each VS input row from the input layout element with its semantic.
     uint32_t slots_used = 0;
     for (auto& sig : k->vsc.inputs) {
-        if (sig.system_value) continue;
+        if (sig.system_value || k->mesh) continue;
         for (auto& e : st->input) {
             if (e.index != sig.index || !icase_equal(e.semantic, sig.name)) continue;
             VkFormat f = images::vk_format(e.format);
@@ -1083,7 +1098,9 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
     };
     VkPipelineShaderStageCreateInfo stages[3];
     uint32_t nstages = 0;
-    stages[nstages++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, k->vsm, "main", nullptr};
+    stages[nstages++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                         k->mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT, k->vsm, "main", nullptr};
+    if (k->mesh) expand = -1;
     if (expand >= 0) {
         std::lock_guard g(st->lock);
         if (!k->gs[expand]) {
@@ -1150,7 +1167,7 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
                             VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
                             VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dy.dynamicStateCount = sizeof dyn / sizeof dyn[0];
+    dy.dynamicStateCount = k->mesh ? 4 : sizeof dyn / sizeof dyn[0];
     dy.pDynamicStates = dyn;
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ri.colorAttachmentCount = a.count;
@@ -1161,8 +1178,8 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
     ci.pNext = &ri;
     ci.stageCount = nstages;
     ci.pStages = stages;
-    ci.pVertexInputState = &vi;
-    ci.pInputAssemblyState = &ia;
+    ci.pVertexInputState = k->mesh ? nullptr : &vi;
+    ci.pInputAssemblyState = k->mesh ? nullptr : &ia;
     ci.pViewportState = &vp;
     ci.pRasterizationState = &rs;
     ci.pMultisampleState = &ms;
@@ -1197,7 +1214,7 @@ bool prebuild(pipeline::State* st, Compiled* k) {
         a.depth = images::vk_format(st->dsv_format);
         a.stencil = a.depth == VK_FORMAT_D16_UNORM_S8_UINT || a.depth == VK_FORMAT_D24_UNORM_S8_UINT || a.depth == VK_FORMAT_D32_SFLOAT_S8_UINT;
     }
-    request_variant(k, st, a, topo_of[st->topology_type], false);
+    request_variant(k, st, a, k->mesh ? 4 : topo_of[st->topology_type], false);
     return true;
 }
 
@@ -1489,7 +1506,7 @@ struct Builder {
         }
     }
 
-    bool draw_setup(bool indexed) {
+    bool draw_setup(bool indexed, bool mesh = false) {
         pipeline::State* st = bind[1].pso;
         if (!st || st->compute) return false;
         Compiled* k = obtain(st, true);
@@ -1501,12 +1518,16 @@ struct Builder {
             trace_draw("skipped (pipeline not translated)", st, nullptr, nullptr);
             return false;
         }
-        if (topology_class(topology) == ~0u || topology_class(topology) == 3) {
+        if (k->mesh != mesh) {
+            once(mesh ? "a mesh dispatch with a vertex shader pipeline was skipped" : "a draw with a mesh shader pipeline was skipped");
+            return false;
+        }
+        if (!mesh && (topology_class(topology) == ~0u || topology_class(topology) == 3)) {
             once("draws with topology %u are skipped (not supported yet)", topology);
             return false;
         }
         if (!rendering && !begin_rendering()) return false;
-        VkPipeline p = variant(k, st, att, topology);
+        VkPipeline p = variant(k, st, att, mesh ? 4 : topology);
         if (!p) return false;
         if (p != bound) vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p), bound = p;
         if (!set_bound[1]) {
@@ -1538,11 +1559,12 @@ struct Builder {
             sc = {{l, t}, {uint32_t(std::max(0, s[2] - l)), uint32_t(std::max(0, s[3] - t))}};
         }
         vk::vkCmdSetScissor(cb, 0, 1, &sc);
+        vk::vkCmdSetBlendConstants(cb, blend);
+        vk::vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_ref);
+        if (mesh) return true;
         vk::vkCmdSetPrimitiveTopology(cb, vk_topology(topology));
         bool strip = topology == 3 || topology == 5 || topology == 11 || topology == 13;
         vk::vkCmdSetPrimitiveRestartEnable(cb, indexed && strip && st->strip_cut ? VK_TRUE : VK_FALSE);
-        vk::vkCmdSetBlendConstants(cb, blend);
-        vk::vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_ref);
         // Vertex streams.
         for (auto& bd : k->binds) {
             const auto& view = vb[bd.binding];
@@ -1606,9 +1628,25 @@ struct Builder {
         return vk::vkGetBufferDeviceAddress(dev(), &ai) + off;
     }
 
-    // ExecuteIndirect with a single Draw, DrawIndexed or Dispatch argument per command.
+    void dispatch_mesh(const cmd::Dispatch& d) {
+        uint32_t x = std::min(d.x, 65535u), y = std::min(d.y, 65535u), z = std::min(d.z, 65535u);
+        if (!x || !y || !z) return;
+        if (uint64_t(x) * y * z > (1u << 22)) {
+            once("a mesh dispatch of %ux%ux%u groups was skipped (over the GPU's limit)", d.x, d.y, d.z);
+            stats::add(stats::DrawsSkipped);
+            return;
+        }
+        if (!draw_setup(false, true)) {
+            stats::add(stats::DrawsSkipped);
+            return;
+        }
+        vk::vkCmdDrawMeshTasksEXT(cb, x, y, z);
+        stats::add(stats::DrawsRun);
+    }
+
+    // ExecuteIndirect with a single Draw, DrawIndexed, Dispatch or DispatchMesh argument per command.
     void indirect(const cmd::Indirect& x) {
-        static const uint32_t bytes[] = {16, 20, 12};
+        static const uint32_t bytes[] = {16, 20, 12, 12};
         uint32_t stride = 0;
         std::vector<std::array<uint32_t, 4>> args;
         if (!misc::signature(x.signature, stride, args) || args.size() != 1) {
@@ -1617,7 +1655,8 @@ struct Builder {
         }
         uint32_t type = args[0][0], max = uint32_t(std::min<uint64_t>(x.max, 1u << 16));
         if (type == 105) type = 2;
-        if (type > 2) {
+        if (type == 10 && host::get().caps.mesh_shader) type = 3;
+        if (type > 3) {
             once("ExecuteIndirect with argument type %u is skipped (not supported yet)", type);
             return;
         }
@@ -1665,11 +1704,12 @@ struct Builder {
             stats::add(stats::DispatchesRun, max);
             return;
         }
-        if (!draw_setup(type == 1)) {
+        if (!draw_setup(type == 1, type == 3)) {
             stats::add(stats::DrawsSkipped);
             return;
         }
-        if (type == 0) vk::vkCmdDrawIndirect(cb, db, doff, max, 16);
+        if (type == 3) vk::vkCmdDrawMeshTasksIndirectEXT(cb, db, doff, max, 12);
+        else if (type == 0) vk::vkCmdDrawIndirect(cb, db, doff, max, 16);
         else vk::vkCmdDrawIndexedIndirect(cb, db, doff, max, 20);
         stats::add(stats::DrawsRun);
     }
@@ -2060,7 +2100,12 @@ struct Builder {
                     indirect(x);
                     break;
                 }
-                case Op::DispatchMesh: once("mesh shader dispatches are skipped (not supported yet)"); break;
+                case Op::DispatchMesh: {
+                    cmd::Dispatch d;
+                    get(d);
+                    dispatch_mesh(d);
+                    break;
+                }
                 case Op::WaitValue: {
                     cmd::WaitValue w;
                     get(w);
@@ -2131,7 +2176,7 @@ bool start() {
     if (!KL_VK_CHECK(vk::vkCreatePipelineLayout(h.device, &li, nullptr, &g_layout))) return false;
     open_cache();
     open_used();
-    for (uint32_t t = 0; t < 3; ++t) {
+    for (uint32_t t = 0; t < 4; ++t) {
         auto code = shader::indirect_clamp(t);
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = code.size() * 4;

@@ -48,10 +48,10 @@ std::vector<uint32_t> indirect_clamp(uint32_t type) {
     auto both = [&](Id a, Id c) { return b.op(spv::OpLogicalAnd, t_bool, {a, c}); };
     auto wide = [&](Id x) { return b.op(spv::OpUConvert, t_u64, {x}); };
     Id ok, units;
-    if (type == 2) {
+    if (type >= 2) {
         Id groups = b.op(spv::OpIMul, t_u64, {b.op(spv::OpIMul, t_u64, {wide(v[0]), wide(v[1])}), wide(v[2])});
         ok = both(both(le(v[0], 65535), le(v[1], 65535)), le(v[2], 65535));
-        ok = both(ok, b.op(spv::OpULessThanEqual, t_bool, {groups, b.c_u64(1ull << 24)}));
+        ok = both(ok, b.op(spv::OpULessThanEqual, t_bool, {groups, b.c_u64(type == 3 ? 1ull << 22 : 1ull << 24)}));
         units = b.op(spv::OpShiftRightLogical, t_u64, {b.op(spv::OpIAdd, t_u64, {groups, b.c_u64(511)}), b.c_u64(9)});
     } else {
         Id work = b.op(spv::OpIMul, t_u64, {wide(v[0]), wide(v[1])});

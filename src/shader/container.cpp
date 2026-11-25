@@ -17,7 +17,7 @@ constexpr uint32_t FLAG_WAVE32 = 1 << 5;
 constexpr size_t PS_INPUTS = 0x24, PS_INPUT_COUNT = 0x124, PS_INPUT_ADDR = 0x134, PS_DB = 0x138, PS_PATCH_SIZE = 0x148,
                  PS_PATCHES = 0x14c, PATCH_SLOT_DWORDS = 10, PATCH_FULL = 9, PATCH_BYTES = 4 + 10 * PATCH_SLOT_DWORDS * 4, MRTS = 8;
 constexpr size_t VS_INPUTS = 0x24, VS_INPUT_COUNT = 0xc4, VS_OUTPUTS = 0xc8, VS_OUTPUT_COUNT = 0x188;
-constexpr size_t CS_RSRC2 = 0x24, CS_THREADS = 0x28;
+constexpr size_t CS_RSRC2 = 0x24, CS_THREADS = 0x28, MS_INFO = 0x448;
 constexpr uint32_t MAX_SEMANTICS = 32;
 constexpr uint64_t MAX_UNPACKED = 16 << 20;
 
@@ -139,6 +139,12 @@ bool programs(const std::vector<uint8_t>& fssm, Container& out, std::string& err
             for (uint32_t i = 0; i < c; ++i) {
                 const uint8_t* e = sd.p + VS_OUTPUTS + 6 * i;
                 p.vs_outputs.push_back({e[0], e[1], e[2], (e[5] & 1) != 0, (e[5] & 2) != 0});
+            }
+            if (stage == HwStage::Ms) {
+                uint32_t a, b;
+                if (!sd.u32(MS_INFO, a) || !sd.u32(MS_INFO + 4, b)) return err = "MS stage data", false;
+                p.ms_threads = uint16_t(a), p.ms_max_vertices = uint16_t(a >> 16), p.ms_max_primitives = uint16_t(b);
+                p.ms_topology = uint8_t(b >> 24);
             }
         } else if (stage == HwStage::Cs) {
             sd.u32(CS_RSRC2, p.cs_rsrc2);

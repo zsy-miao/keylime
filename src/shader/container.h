@@ -63,6 +63,8 @@ struct Program {
     std::vector<VsInput> vs_inputs;
     std::vector<VsOutput> vs_outputs;
     uint32_t cs_rsrc2 = 0, cs_threads[3] = {1, 1, 1};
+    uint16_t ms_threads = 0, ms_max_vertices = 0, ms_max_primitives = 0;
+    uint8_t ms_topology = 2;
     uint32_t lds_bytes = 0;
     // The code with each render target's export patched for its full 32-bit format.
     std::vector<uint8_t> patched_code() const;

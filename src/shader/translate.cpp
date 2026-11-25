@@ -44,6 +44,9 @@ struct T {
     // globals
     Id push = 0, lane_var = 0, frag_coord = 0, front_face = 0, vertex_index = 0, instance_index = 0, position_out = 0;
     Id local_id = 0, group_id = 0, depth_out = 0;
+    Id local_index = 0, num_groups = 0, ms_count = 0, ms_pos_out = 0, ms_prim_out = 0, ms_cull_out = 0;
+    Id ms_pos = 0, ms_prim = 0, ms_flags = 0, ms_half = 0, p_fn_v4f = 0;
+    std::map<uint8_t, Id> ms_outs, ms_vals;
     Id lds = 0, lds_ptr = 0;
     std::vector<Id> interface;
     std::map<uint8_t, Id> vs_inputs, vs_outputs, ps_inputs, ps_outputs;  // by row / mrt
@@ -399,6 +402,8 @@ struct T {
                 interface.push_back(var);
                 out.ps_input_rows.push_back(in.row);
             }
+        } else if (p.stage == HwStage::Ms) {
+            mesh_globals();
         } else if (p.stage == HwStage::Cs) {
             b.capability(spv::CapabilityGroupNonUniform);
             local_id = input(b.t_vec(t_u32, 3), spv::BuiltInLocalInvocationId);
@@ -410,6 +415,117 @@ struct T {
                 interface.push_back(lds);
             }
         }
+    }
+
+    uint32_t ms_vertices() const { return std::max<uint32_t>(p.ms_max_vertices, 1); }
+    uint32_t ms_primitives() const { return std::max<uint32_t>(p.ms_max_primitives, 1); }
+    bool ms_lines() const { return p.ms_topology == 1; }
+
+    Id output_array(Id type, uint32_t n) {
+        Id var = b.variable(b.t_ptr(spv::StorageClassOutput, b.t_array(type, n)), spv::StorageClassOutput);
+        interface.push_back(var);
+        return var;
+    }
+
+    void mesh_globals() {
+        b.extension("SPV_EXT_mesh_shader");
+        b.capability(spv::CapabilityMeshShadingEXT);
+        local_index = input(t_u32, spv::BuiltInLocalInvocationIndex);
+        group_id = input(b.t_vec(t_u32, 3), spv::BuiltInWorkgroupId);
+        num_groups = input(b.t_vec(t_u32, 3), spv::BuiltInNumWorkgroups);
+        if (p.lds_bytes) {
+            Id arr = b.t_array(t_u32, (p.lds_bytes + 3) / 4);
+            lds = b.variable(b.t_ptr(spv::StorageClassWorkgroup, arr), spv::StorageClassWorkgroup);
+            lds_ptr = b.t_ptr(spv::StorageClassWorkgroup, t_u32);
+            interface.push_back(lds);
+        }
+        ms_count = b.variable(b.t_ptr(spv::StorageClassWorkgroup, t_u32), spv::StorageClassWorkgroup);
+        interface.push_back(ms_count);
+        ms_pos_out = output_array(t_v4f, ms_vertices());
+        b.decorate(ms_pos_out, spv::DecorationBuiltIn, {uint32_t(spv::BuiltInPosition)});
+        ms_prim_out = output_array(b.t_vec(t_u32, ms_lines() ? 2 : 3), ms_primitives());
+        b.decorate(ms_prim_out, spv::DecorationBuiltIn,
+                   {uint32_t(ms_lines() ? spv::BuiltInPrimitiveLineIndicesEXT : spv::BuiltInPrimitiveTriangleIndicesEXT)});
+        Id per_prim = b.t_struct({t_bool});
+        b.decorate(per_prim, spv::DecorationBlock);
+        b.member_decorate(per_prim, 0, spv::DecorationBuiltIn, {uint32_t(spv::BuiltInCullPrimitiveEXT)});
+        b.member_decorate(per_prim, 0, spv::DecorationPerPrimitiveEXT);
+        ms_cull_out = output_array(per_prim, ms_primitives());
+        for (auto& o : p.vs_outputs) {
+            if ((o.param & 0x80) || ms_outs.count(o.param)) continue;
+            Id var = output_array(t_v4f, ms_vertices());
+            b.decorate(var, spv::DecorationLocation, {o.row});
+            ms_outs[o.param] = var;
+            out.vs_output_rows.push_back(o.row);
+        }
+    }
+
+    void mesh_prologue() {
+        p_fn_v4f = b.t_ptr(spv::StorageClassFunction, t_v4f);
+        Id zero4 = b.op(spv::OpCompositeConstruct, t_v4f, {f(0), f(0), f(0), f(1)});
+        ms_pos = b.local(p_fn_v4f);
+        store(ms_pos, zero4);
+        ms_prim = b.local(p_fn_u32, u(0));
+        ms_flags = b.local(p_fn_u32, u(0));
+        for (auto& [param, var] : ms_outs) {
+            ms_vals[param] = b.local(p_fn_v4f);
+            store(ms_vals[param], zero4);
+        }
+        Id idx = load(local_index, t_u32);
+        Id sg = shr(idx, u(5));
+        set_s(3, shl(p.wave64 ? shr(sg, u(1)) : sg, u(24)));
+        ms_half = p.wave64 ? band(sg, u(1)) : u(0);
+        Id gid = load(group_id, b.t_vec(t_u32, 3)), ng = load(num_groups, b.t_vec(t_u32, 3));
+        auto c = [&](Id v, uint32_t k) { return b.op(spv::OpCompositeExtract, t_u32, {v, k}); };
+        Id nx = c(ng, 0), nxy = b.op(spv::OpIMul, t_u32, {nx, c(ng, 1)});
+        Id linear = iadd(iadd(c(gid, 0), b.op(spv::OpIMul, t_u32, {c(gid, 1), nx})), b.op(spv::OpIMul, t_u32, {c(gid, 2), nxy}));
+        store(vreg(5), b.op(spv::OpIMul, t_u32, {linear, u(p.ms_threads)}));
+        if_then(b.op(spv::OpIEqual, t_bool, {idx, u(0)}), [&] { store(ms_count, u(0)); });
+        barrier();
+    }
+
+    void barrier() {
+        b.op_void(spv::OpControlBarrier, {u(spv::ScopeWorkgroup), u(spv::ScopeWorkgroup),
+                                          u(spv::MemorySemanticsWorkgroupMemoryMask | spv::MemorySemanticsAcquireReleaseMask)});
+    }
+
+    void mesh_export(uint8_t t, Id vec, Id raw) {
+        Id act = active();
+        if (t == 12) {
+            store(ms_pos, sel(t_v4f, act, vec, load(ms_pos, t_v4f)));
+            store(ms_flags, bor(load(ms_flags, t_u32), sel(t_u32, act, u(1), u(0))));
+        } else if (t == 20) {
+            store(ms_prim, sel(t_u32, act, raw, load(ms_prim, t_u32)));
+            store(ms_flags, bor(load(ms_flags, t_u32), sel(t_u32, act, u(2), u(0))));
+        } else if (t >= 32 && t < 64) {
+            auto it = ms_vals.find(uint8_t(t - 32));
+            if (it != ms_vals.end()) store(it->second, sel(t_v4f, act, vec, load(it->second, t_v4f)));
+        }
+    }
+
+    void mesh_epilogue() {
+        barrier();
+        Id c = load(ms_count, t_u32);
+        Id nv = ext(GLSLstd450UMin, t_u32, {band(c, u(0xfff)), u(ms_vertices())});
+        Id np = ext(GLSLstd450UMin, t_u32, {band(shr(c, u(12)), u(0xfff)), u(ms_primitives())});
+        b.op_void(spv::OpSetMeshOutputsEXT, {nv, np});
+        Id idx = load(local_index, t_u32), flags = load(ms_flags, t_u32);
+        Id p_out_v4f = b.t_ptr(spv::StorageClassOutput, t_v4f);
+        Id has_v = b.op(spv::OpLogicalAnd, t_bool, {b.op(spv::OpULessThan, t_bool, {idx, nv}), ne0(band(flags, u(1)))});
+        if_then(has_v, [&] {
+            store(b.op(spv::OpAccessChain, p_out_v4f, {ms_pos_out, idx}), load(ms_pos, t_v4f));
+            for (auto& [param, var] : ms_outs) store(b.op(spv::OpAccessChain, p_out_v4f, {var, idx}), load(ms_vals[param], t_v4f));
+        });
+        if_then(b.op(spv::OpULessThan, t_bool, {idx, np}), [&] {
+            Id prim = load(ms_prim, t_u32);
+            Id cull = b.op(spv::OpLogicalOr, t_bool, {b.op(spv::OpIEqual, t_bool, {band(flags, u(2)), u(0)}), ne0(shr(prim, u(31)))});
+            store(b.op(spv::OpAccessChain, b.t_ptr(spv::StorageClassOutput, t_bool), {ms_cull_out, idx, u(0)}), cull);
+            Id last = u(ms_vertices() - 1);
+            auto vtx = [&](uint32_t k) { return ext(GLSLstd450UMin, t_u32, {band(shr(prim, u(10 * k)), u(0x3ff)), last}); };
+            Id t3 = ms_lines() ? b.t_vec(t_u32, 2) : b.t_vec(t_u32, 3);
+            Id v = ms_lines() ? b.op(spv::OpCompositeConstruct, t3, {vtx(0), vtx(1)}) : b.op(spv::OpCompositeConstruct, t3, {vtx(0), vtx(1), vtx(2)});
+            store(b.op(spv::OpAccessChain, b.t_ptr(spv::StorageClassOutput, t3), {ms_prim_out, idx}), v);
+        });
     }
 
     Id ps_output(uint8_t mrt) {
@@ -432,16 +548,17 @@ struct T {
             for (auto& rp : p.layout)
                 for (uint32_t k = 0; k < std::max<uint32_t>(rp.sgprs, 1) && rp.user_data + k < 32; ++k) want |= 1u << (rp.user_data + k);
             Id rec = load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(0)}), t_u64);
-            uint32_t base = opt ? opt->sgpr_offset : 0;
+            uint32_t base = opt ? opt->sgpr_offset : 0, first = p.stage == HwStage::Ms ? 8 : 0;
             for (uint32_t i = 0; i < 32; ++i) {
                 if (!(want & (1u << i))) continue;
                 Id a = b.op(spv::OpIAdd, t_u64, {rec, b.c_u64(4ull * (base + i))});
-                set_s(uint16_t(i), b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {a}), uint32_t(spv::MemoryAccessAlignedMask), 4}));
+                set_s(uint16_t(first + i), b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {a}), uint32_t(spv::MemoryAccessAlignedMask), 4}));
             }
         }
         // EXEC = every lane that runs (helpers included).
         set_s(EXEC_LO, ballot(b.c_bool(true)));
         set_s(EXEC_HI, u(0));
+        if (p.stage == HwStage::Ms) mesh_prologue();
         if (p.stage == HwStage::Vs) {
             set_v(0, bc(t_u32, load(vertex_index, t_i32)));
             set_v(3, bc(t_u32, load(instance_index, t_i32)));
@@ -848,8 +965,9 @@ struct T {
                 n == "s_denorm_mode" || n == "s_waitcnt_depctr" || n == "s_waitcnt_vscnt" || n == "s_waitcnt_vmcnt" ||
                 n == "s_waitcnt_lgkmcnt" || n == "s_waitcnt_expcnt" || n == "s_code_end" || n == "s_sethalt" || n == "s_trap")
                 return;
+            if (n == "s_sendmsg" && p.stage == HwStage::Ms && (i.simm16 & 0xf) == 9) return store(ms_count, get_s(M0));
             if (n == "s_barrier") {
-                if (p.stage == HwStage::Cs)
+                if (p.stage == HwStage::Cs || p.stage == HwStage::Ms)
                     b.op_void(spv::OpControlBarrier, {u(spv::ScopeWorkgroup), u(spv::ScopeWorkgroup),
                                                       u(spv::MemorySemanticsWorkgroupMemoryMask | spv::MemorySemanticsAcquireReleaseMask)});
                 return;
@@ -1093,7 +1211,7 @@ struct T {
             Id below = isub(shl(u(1), lane), u(1));
             return vres_u(i, iadd(b.op(spv::OpBitCount, t_u32, {band(S0(), below)}), S1()));
         }
-        if (n == "v_mbcnt_hi_u32_b32") return vres_u(i, iadd(u(0), S1()));  // lanes 32-63 absent in this model
+        if (n == "v_mbcnt_hi_u32_b32") return vres_u(i, ms_half ? iadd(shl(ms_half, u(5)), S1()) : S1());
         if (n == "v_permlanex16_b32" || n == "v_permlane16_b32") {
             // Lane select from two 32-bit selectors (4 bits per lane of the 16-lane row).
             Id sel_lo = S1(), sel_hi = S2();
@@ -1563,6 +1681,7 @@ struct T {
             for (int k = 0; k < 4; ++k) comps[k] = value(k);
         }
         Id vec = b.op(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
+        if (p.stage == HwStage::Ms) return mesh_export(t, vec, get_v(i.exp_src[0]));
         if (p.stage == HwStage::Vs) {
             if (t == 12) store(position_out, vec);
             else if (t >= 32 && t < 64) {
@@ -1600,7 +1719,7 @@ struct T {
     Id trips = 0;
     uint32_t end_block = 0;
 
-    uint32_t trip_limit() const { return p.stage == HwStage::Ps ? 512 : p.stage == HwStage::Vs ? 1024 : 8192; }
+    uint32_t trip_limit() const { return p.stage == HwStage::Ps ? 512 : p.stage == HwStage::Vs || p.stage == HwStage::Ms ? 1024 : 8192; }
 
     void find_regions() {
         std::vector<std::pair<uint32_t, uint32_t>> r;
@@ -1812,14 +1931,23 @@ struct T {
         auto nodes = cfg::plan(terms(), cr);
         count_plan(nodes);
         run(nodes, starts);
+        if (p.stage == HwStage::Ms) mesh_epilogue();
         b.op_void(spv::OpReturn, {});
         b.end_function();
         // Entry point.
         spv::ExecutionModel model = p.stage == HwStage::Vs ? spv::ExecutionModelVertex
                                   : p.stage == HwStage::Ps ? spv::ExecutionModelFragment
+                                  : p.stage == HwStage::Ms ? spv::ExecutionModelMeshEXT
                                                            : spv::ExecutionModelGLCompute;
         b.entry(model, fn, "main", interface);
         if (p.stage == HwStage::Ps) b.mode(fn, spv::ExecutionModeOriginUpperLeft);
+        if (p.stage == HwStage::Ms) {
+            out.local_size[0] = p.ms_threads;
+            b.mode(fn, spv::ExecutionModeLocalSize, {p.ms_threads, 1, 1});
+            b.mode(fn, spv::ExecutionModeOutputVertices, {ms_vertices()});
+            b.mode(fn, spv::ExecutionModeOutputPrimitivesEXT, {ms_primitives()});
+            b.mode(fn, ms_lines() ? spv::ExecutionModeOutputLinesEXT : spv::ExecutionModeOutputTrianglesEXT);
+        }
         if (p.stage == HwStage::Cs) {
             for (int k = 0; k < 3; ++k) out.local_size[k] = p.cs_threads[k] ? p.cs_threads[k] : 1;
             b.mode(fn, spv::ExecutionModeLocalSize, {out.local_size[0], out.local_size[1], out.local_size[2]});
@@ -1847,7 +1975,12 @@ uint64_t translator_build() {
 }
 
 bool translate(const Program& p, Translation& out, std::string& error, const Options* opt) {
-    if (p.stage != HwStage::Vs && p.stage != HwStage::Ps && p.stage != HwStage::Cs) {
+    if (p.stage == HwStage::Ms && (!p.ms_threads || p.ms_threads > 128 || p.ms_max_vertices > 256 || p.ms_max_primitives > 256)) {
+        error = "mesh program with " + std::to_string(p.ms_threads) + " threads, " + std::to_string(p.ms_max_vertices) + " vertices, " +
+                std::to_string(p.ms_max_primitives) + " primitives (128 threads and 256 of each run here)";
+        return false;
+    }
+    if (p.stage != HwStage::Vs && p.stage != HwStage::Ps && p.stage != HwStage::Cs && p.stage != HwStage::Ms) {
         error = std::string("stage ") + stage_name(p.stage) + " not translated yet";
         return false;
     }

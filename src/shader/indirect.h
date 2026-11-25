@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace kl::shader {
-// type: 0 draw (4 dwords), 1 indexed draw (5), 2 dispatch (3).
+// type: 0 draw (4 dwords), 1 indexed draw (5), 2 dispatch (3), 3 mesh dispatch (3).
 // Push constants: u64 source, u64 destination, u64 count address, u32 source stride, u32 max.
 std::vector<uint32_t> indirect_clamp(uint32_t type);
 }  // namespace kl::shader
