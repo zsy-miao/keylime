@@ -18,10 +18,20 @@ The real retail GTA VI exe boots natively, reaches the main menu with all
 audio working, and keylime renders its frames on Vulkan.
 
 **Current blocker:** the game freezes right after the menu and loading
-screen, where the opening cutscene should start. The last log showed the
-GPU itself hanging (the submit thread stuck in the driver). What changed for
-that, waiting for a test run:
+screen, where the opening cutscene should start. The latest log showed why:
+the driver deadlocked. A submission waited on a semaphore that only the host
+signals later (a GPU wait on memory), NVIDIA's Windows driver blocked inside
+vkQueueSubmit2 on it, and from then on the host signal that would have freed
+it, the fence reads and the pipeline compiles all blocked in the driver too.
+What changed for that, waiting for a test run:
 
+- A submission goes to the driver only once everything it waits on has been
+  signalled or handed to the driver; until then keylime holds it, in queue
+  order, and sends it the moment the gate opens or the fence is signalled.
+- Fences the game reads are polled (every quarter millisecond) instead of
+  waited on in the driver.
+- cache\used-pipelines.txt is written every second as new pipelines are used,
+  and again on a hang report or a crash. Up to 16 compile workers (was 8).
 - Shader loops stop after 512 trips in pixel shaders, 1024 in vertex shaders
   and 8192 in compute (was 262,144 for the whole program). A loop reading a
   count the host hasn't written yet could keep the GPU busy for seconds per
