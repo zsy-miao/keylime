@@ -351,7 +351,20 @@ void gpu_free(void* p) {
     if (p) VirtualFree(p, 0, MEM_RELEASE);
 }
 
+WriteHook g_write_hook = nullptr;
+thread_local std::vector<std::pair<uint64_t, uint64_t>> g_notes;
+
+void set_write_hook(WriteHook h) { g_write_hook = h; }
+
 bool write_physical(const uint64_t* pages, size_t page_count, size_t offset, const void* data, size_t len) {
+    g_notes.clear();
+    bool ok = write_physical_locked(pages, page_count, offset, data, len);
+    if (g_write_hook)
+        for (auto [va, n] : g_notes) g_write_hook(va, n);  // outside our lock
+    return ok;
+}
+
+bool write_physical_locked(const uint64_t* pages, size_t page_count, size_t offset, const void* data, size_t len) {
     const auto* src = static_cast<const uint8_t*>(data);
     std::lock_guard g(g_lock);
     size_t done = 0;
@@ -378,6 +391,13 @@ bool write_physical(const uint64_t* pages, size_t page_count, size_t offset, con
         if (k > len - done) k = len - done;
         std::memcpy(static_cast<uint8_t*>(v) + within, src + done, k);
         UnmapViewOfFile(v);
+        // Tell whoever keeps copies of this memory (the GPU's textures) which title addresses changed.
+        if (g_write_hook)
+            for (size_t r = 0; r < run; ++r) {
+                auto sh = g_phys.shown.find(first.key(r));
+                if (sh != g_phys.shown.end())
+                    for (uintptr_t va : sh->second) g_notes.push_back({va, kPage});
+            }
         done += k;
     }
     return true;

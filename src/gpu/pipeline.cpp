@@ -8,8 +8,11 @@
 #include <mutex>
 #include <vector>
 
+#include "gpu/pipeline.h"
+
 #include "gpu/device.h"
 #include "gpu/fence.h"
+#include "gpu/texture.h"
 #include "log.h"
 #include "stats.h"
 
@@ -23,18 +26,10 @@ struct Bytecode {
     size_t size;
 };
 
-struct Shader {
-    uint32_t stage;  // 0 VS 1 PS 2 DS 3 HS 4 GS 5 CS 6 AS 7 MS
-    std::vector<uint8_t> code;
-};
-
 struct Pipeline {
     Object object;
-    bool compute;
-    void* root;
-    std::vector<Shader> shaders;
+    State state;
 };
-
 std::atomic<uint64_t> g_count{0}, g_bytes{0};
 
 HRESULT WINAPI query(Pipeline* p, const Iid* iid, void** out) {
@@ -80,8 +75,63 @@ void keep(Pipeline* p, uint32_t stage, const Bytecode& b) {
     if (!b.code || !b.size) return;
     auto* c = static_cast<const uint8_t*>(b.code);
     dump(stage, c, b.size);
-    p->shaders.push_back({stage, std::vector<uint8_t>(c, c + b.size)});
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < b.size; ++i) h = (h ^ c[i]) * 0x100000001b3ull;
+    p->state.shaders.push_back({stage, std::vector<uint8_t>(c, c + b.size), h});
     g_bytes += b.size;
+}
+
+// D3D12 defaults for subobjects a stream leaves out.
+void defaults(State& s) {
+    for (auto& b : s.blend) b = {0, 0, 2, 1, 1, 2, 1, 1, 4, 0xf};
+    s.raster = {3, 3, 0, 0, 0.0f, 0.0f, 1, 0, 0, 0, 0};
+    s.depth = {1, 1, 2, 0, 0xff, 0xff, {1, 1, 1, 8}, {1, 1, 1, 8}, 0};
+}
+// Fixed-function pieces, as laid out in D3D12 descriptions.
+void read_blend(State& s, const uint8_t* p) {
+    memcpy(&s.alpha_to_coverage, p, 4);
+    memcpy(&s.independent_blend, p + 4, 4);
+    for (int i = 0; i < 8; ++i) {
+        uint32_t w[10];
+        memcpy(w, p + 8 + 40 * i, 40);
+        s.blend[i] = {w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9] & 0xff};
+    }
+    if (!s.independent_blend)
+        for (int i = 1; i < 8; ++i) s.blend[i] = s.blend[0];
+}
+void read_raster(State& s, const uint8_t* p) { memcpy(&s.raster, p, 44); }
+void read_depth(State& s, const uint8_t* p, bool bounds) {
+    uint32_t w[4];
+    memcpy(w, p, 16);
+    s.depth.depth_enable = w[0], s.depth.depth_write = w[1], s.depth.depth_func = w[2], s.depth.stencil_enable = w[3];
+    s.depth.read_mask = p[16], s.depth.write_mask = p[17];
+    memcpy(&s.depth.front, p + 20, 16);
+    memcpy(&s.depth.back, p + 36, 16);
+    if (bounds) memcpy(&s.depth.bounds, p + 52, 4);
+}
+void read_input(State& s, const uint8_t* p) {
+    const uint8_t* elems;
+    uint32_t n;
+    memcpy(&elems, p, 8);
+    memcpy(&n, p + 8, 4);
+    if (!elems) return;
+    uint32_t append = 0;
+    std::vector<uint32_t> next(32, 0);
+    for (uint32_t i = 0; i < n && i < 64; ++i) {
+        const uint8_t* e = elems + 32 * i;
+        const char* name;
+        uint32_t w[6];
+        memcpy(&name, e, 8);
+        memcpy(w, e + 8, 24);
+        InputElement x{name ? name : "", w[0], w[1], w[2], w[3], w[4], w[5]};
+        uint32_t slot = x.slot & 31;
+        if (x.offset == 0xffffffffu) x.offset = next[slot];
+        uint32_t bytes = 0, block = 1;
+        texture::element(x.format, bytes, block);
+        next[slot] = x.offset + bytes;
+        (void)append;
+        s.input.push_back(std::move(x));
+    }
 }
 
 HRESULT finish(Pipeline* p, const Iid* iid, void** out) {
@@ -101,15 +151,39 @@ struct ComputeHead {
     Bytecode cs;
 };
 
+Pipeline* make() {
+    auto* p = new Pipeline();
+    p->object.functions = table();
+    defaults(p->state);
+    return p;
+}
+
+// The PC D3D12_GRAPHICS_PIPELINE_STATE_DESC.
 HRESULT WINAPI create_graphics(void*, const GraphicsHead* d, const Iid* iid, void** out) {
     if (!d) return E_INVALIDARG;
-    auto* p = new Pipeline{{table(), 0, {0}}, false, d->root, {}};
+    auto* p = make();
+    auto& s = p->state;
+    s.root = d->root;
     for (uint32_t i = 0; i < 5; ++i) keep(p, i, d->stages[i]);
+    auto* b = reinterpret_cast<const uint8_t*>(d);
+    read_blend(s, b + 120);
+    memcpy(&s.sample_mask, b + 448, 4);
+    read_raster(s, b + 452);
+    read_depth(s, b + 496, false);
+    read_input(s, b + 552);
+    memcpy(&s.strip_cut, b + 568, 4);
+    memcpy(&s.topology_type, b + 572, 4);
+    memcpy(&s.rt_count, b + 576, 4);
+    memcpy(s.rt_formats, b + 580, 32);
+    memcpy(&s.dsv_format, b + 612, 4);
+    memcpy(&s.samples, b + 616, 4);
     return finish(p, iid, out);
 }
 HRESULT WINAPI create_compute(void*, const ComputeHead* d, const Iid* iid, void** out) {
     if (!d) return E_INVALIDARG;
-    auto* p = new Pipeline{{table(), 0, {0}}, true, d->root, {}};
+    auto* p = make();
+    p->state.compute = true;
+    p->state.root = d->root;
     keep(p, 5, d->cs);
     return finish(p, iid, out);
 }
@@ -145,7 +219,8 @@ bool subobject(uint32_t kind, size_t& size, int& stage) {
 
 HRESULT WINAPI create_stream(void*, const StreamDesc* d, const Iid* iid, void** out) {
     if (!d || !d->stream) return E_INVALIDARG;
-    auto* p = new Pipeline{{table(), 0, {0}}, false, nullptr, {}};
+    auto* p = make();
+    auto& st = p->state;
     for (size_t at = 0; at + 8 <= d->size;) {
         uint32_t kind;
         memcpy(&kind, d->stream + at, 4);
@@ -156,12 +231,27 @@ HRESULT WINAPI create_stream(void*, const StreamDesc* d, const Iid* iid, void** 
             break;
         }
         if (at + size > d->size) break;
-        if (kind == 0) memcpy(&p->root, d->stream + at + 8, 8);
+        const uint8_t* q = d->stream + at;
+        switch (kind) {
+            case 0: memcpy(&st.root, q + 8, 8); break;
+            case 8: read_blend(st, q + 4); break;
+            case 9: memcpy(&st.sample_mask, q + 4, 4); break;
+            case 10: read_raster(st, q + 4); break;
+            case 11: read_depth(st, q + 4, false); break;
+            case 21: read_depth(st, q + 4, true); break;
+            case 12: read_input(st, q + 8); break;
+            case 13: memcpy(&st.strip_cut, q + 4, 4); break;
+            case 14: memcpy(&st.topology_type, q + 4, 4); break;
+            case 15: memcpy(st.rt_formats, q + 4, 32), memcpy(&st.rt_count, q + 36, 4); break;
+            case 16: memcpy(&st.dsv_format, q + 4, 4); break;
+            case 17: memcpy(&st.samples, q + 4, 4); break;
+            default: break;
+        }
         if (stage >= 0) {
             Bytecode b;
-            memcpy(&b, d->stream + at + 8, sizeof b);
+            memcpy(&b, q + 8, sizeof b);
             keep(p, uint32_t(stage), b);
-            if (stage == 5) p->compute = true;
+            if (stage == 5) st.compute = true;
         }
         at += size;
     }
@@ -178,4 +268,11 @@ struct Init {
 } g_init;
 
 }  // namespace
+
+State* state(void* obj) {
+    auto* p = static_cast<Pipeline*>(obj);
+    if (!p || p->object.functions != table()) return nullptr;
+    return &p->state;
+}
+
 }  // namespace kl::gpu::pipeline

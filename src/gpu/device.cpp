@@ -12,7 +12,11 @@
 
 #include <mutex>
 
+#include "gpu/exec.h"
 #include "gpu/host.h"
+#include "gpu/images.h"
+#include "gpu/memory.h"
+#include "hle/xmem.h"
 #include "hle/hle.h"
 #include "log.h"
 #include "runtime.h"
@@ -129,7 +133,10 @@ HRESULT WINAPI D3D12XboxCreateDevice(void*, const uint32_t* parameters, const Ii
     g_newer = same(iid, LEVEL_IIDS[8]);
     static std::once_flag once;
     bool ok = true;
-    std::call_once(once, [&] { ok = host::start(); });
+    std::call_once(once, [&] {
+        ok = host::start() && memory::start() && images::start() && exec::start();
+        if (ok) xmem::set_write_hook([](uint64_t a, uint64_t n) { images::written(a, n); });
+    });
     if (!ok || !host::ready()) {
         KL_ERROR("gpu", "no host GPU: the title cannot draw");
         return E_FAIL;

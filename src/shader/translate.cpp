@@ -54,7 +54,15 @@ struct T {
     const Inst* sdwa = nullptr;  // destination byte/word select  // byte offset -> block number
     std::string error;
 
-    T(const Program& prog, Translation& o) : p(prog), out(o) {}
+    const Options* opt = nullptr;
+    T(const Program& prog, Translation& o, const Options* op) : p(prog), out(o), opt(op) {}
+    uint32_t ps_location(uint8_t row) const {
+        if (opt) {
+            auto it = opt->ps_location.find(row);
+            if (it != opt->ps_location.end()) return it->second;
+        }
+        return row;
+    }
 
     // ---------------------------------------------------------- helpers ----
     Id u(uint32_t x) { return b.c_u32(x); }
@@ -269,16 +277,15 @@ struct T {
         b.capability(spv::CapabilityStorageImageWriteWithoutFormat);
         b.capability(spv::CapabilityImageQuery);
         types();
-        // Push constants.
-        Id a32 = b.t_array_fresh(t_u32, 32), a4 = b.t_array_fresh(t_u32, 4);
-        b.decorate(a32, spv::DecorationArrayStride, {4});
-        b.decorate(a4, spv::DecorationArrayStride, {4});
-        Id st = b.t_struct({a32, t_u64, t_u64, a4});
+        // Push constants: {u64 draw data, u64 page table, u64 texture table, u32 misc[2]}.
+        Id a2 = b.t_array_fresh(t_u32, 2);
+        b.decorate(a2, spv::DecorationArrayStride, {4});
+        Id st = b.t_struct({t_u64, t_u64, t_u64, a2});
         b.decorate(st, spv::DecorationBlock);
         b.member_decorate(st, 0, spv::DecorationOffset, {0});
-        b.member_decorate(st, 1, spv::DecorationOffset, {128});
-        b.member_decorate(st, 2, spv::DecorationOffset, {136});
-        b.member_decorate(st, 3, spv::DecorationOffset, {144});
+        b.member_decorate(st, 1, spv::DecorationOffset, {8});
+        b.member_decorate(st, 2, spv::DecorationOffset, {16});
+        b.member_decorate(st, 3, spv::DecorationOffset, {24});
         push = b.variable(b.t_ptr(spv::StorageClassPushConstant, st), spv::StorageClassPushConstant);
         interface.push_back(push);
         // Bindless resources.
@@ -328,7 +335,7 @@ struct T {
             for (auto& in : p.ps_inputs) {
                 if (ps_inputs.count(in.attr)) continue;
                 Id var = b.variable(b.t_ptr(spv::StorageClassInput, t_v4f), spv::StorageClassInput);
-                b.decorate(var, spv::DecorationLocation, {in.row});
+                b.decorate(var, spv::DecorationLocation, {ps_location(in.row)});
                 if (in.flat) b.decorate(var, spv::DecorationFlat);
                 ps_inputs[in.attr] = var;
                 interface.push_back(var);
@@ -360,8 +367,15 @@ struct T {
     // Initial register state: user SGPRs from push constants, system values.
     void prologue() {
         lane = load(lane_var, t_u32);
-        // User SGPRs: s0..s31 from the push constant block.
-        for (uint32_t i = 0; i < 32; ++i) set_s(uint16_t(i), load(b.op(spv::OpAccessChain, p_pc_u32, {push, u(0), u(i)}), t_u32));
+        // User SGPRs: s0..s31 from this draw's record (push constant 0 points at it).
+        {
+            Id rec = load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(0)}), t_u64);
+            uint32_t base = opt ? opt->sgpr_offset : 0;
+            for (uint32_t i = 0; i < 32; ++i) {
+                Id a = b.op(spv::OpIAdd, t_u64, {rec, b.c_u64(4ull * (base + i))});
+                set_s(uint16_t(i), b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {a}), uint32_t(spv::MemoryAccessAlignedMask), 4}));
+            }
+        }
         // EXEC = every lane that runs (helpers included).
         set_s(EXEC_LO, ballot(b.c_bool(true)));
         set_s(EXEC_HI, u(0));
@@ -1335,7 +1349,10 @@ struct T {
             return get_v(uint16_t(i.vaddr + k));
         };
         if (sample) {
-            Id sslot = slot_of(get_s(i.ssamp), get_s(uint16_t(i.ssamp + 1)));
+            // S# key (all four words; must match images.cpp sampler_key): {w0 ^ w2 * K, (w1 ^ w3) | 1 << 31}.
+            Id skey_lo = bxor(get_s(i.ssamp), b.op(spv::OpIMul, t_u32, {get_s(uint16_t(i.ssamp + 2)), u(0x85ebca6bu)}));
+            Id skey_hi = bor(bxor(get_s(uint16_t(i.ssamp + 1)), get_s(uint16_t(i.ssamp + 3))), u(0x80000000u));
+            Id sslot = slot_of(skey_lo, skey_hi);
             Id img = load(b.op(spv::OpAccessChain, p_uc_image, {sampled_images, tslot}), t_image2d);
             Id smp = load(b.op(spv::OpAccessChain, p_uc_sampler, {samplers, sslot}), b.t_sampler());
             Id si = b.op(spv::OpSampledImage, t_simage2d, {img, smp});
@@ -1565,12 +1582,12 @@ struct T {
 
 }  // namespace
 
-bool translate(const Program& p, Translation& out, std::string& error) {
+bool translate(const Program& p, Translation& out, std::string& error, const Options* opt) {
     if (p.stage != HwStage::Vs && p.stage != HwStage::Ps && p.stage != HwStage::Cs) {
         error = std::string("stage ") + stage_name(p.stage) + " not translated yet";
         return false;
     }
-    T t(p, out);
+    T t(p, out, opt);
     if (!t.decode_all()) {
         error = t.error;
         return false;

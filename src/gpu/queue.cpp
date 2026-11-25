@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "gpu/device.h"
+#include "gpu/exec.h"
 #include "gpu/fence.h"
 #include "gpu/host.h"
 #include "gpu/list.h"
@@ -34,18 +35,11 @@ struct QueueDescX {
     uint32_t kind, flags, engine_or_pipe, queue;
 };
 
-// One lock per host VkQueue (several title queues may share one).
-struct HostQueue {
-    VkQueue q;
-    std::mutex lock;
-};
-HostQueue g_host_queues[3];
-
 struct Queue {
     Object object;
     uint32_t kind;  // the title reads the list type right after the header
     QueueDesc desc;
-    HostQueue* host;
+    int host;       // exec queue
 };
 static_assert(offsetof(Queue, kind) == 0x10);
 
@@ -54,43 +48,11 @@ bool is_queue(const Iid* iid) { return same(iid, QUEUE_IID) || same(iid, fence::
 
 HRESULT WINAPI query(Queue* q, const Iid* iid, void** out) { return answer(Kind::Queue, iid, is_queue(iid) ? q : nullptr, out); }
 
-void submit(Queue* q, const std::vector<VkCommandBuffer>& cbs, VkSemaphore wait, uint64_t wait_value,
-            VkSemaphore signal, uint64_t signal_value) {
-    std::vector<VkCommandBufferSubmitInfo> ci;
-    for (auto cb : cbs) {
-        VkCommandBufferSubmitInfo c{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-        c.commandBuffer = cb;
-        ci.push_back(c);
-    }
-    VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}, s{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
-    w.semaphore = wait;
-    w.value = wait_value;
-    w.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    s.semaphore = signal;
-    s.value = signal_value;
-    s.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.commandBufferInfoCount = uint32_t(ci.size());
-    si.pCommandBufferInfos = ci.data();
-    si.waitSemaphoreInfoCount = wait ? 1 : 0;
-    si.pWaitSemaphoreInfos = &w;
-    si.signalSemaphoreInfoCount = signal ? 1 : 0;
-    si.pSignalSemaphoreInfos = &s;
-    std::lock_guard g(q->host->lock);
-    KL_VK_CHECK(vk::vkQueueSubmit2(q->host->q, 1, &si, VK_NULL_HANDLE));
-}
-
 void WINAPI execute(Queue* q, uint32_t count, void* const* lists) {
     if (!lists) return;
-    std::vector<VkCommandBuffer> cbs;
     stats::add(stats::Submits);
     stats::add(stats::Lists, count);
-    for (uint32_t i = 0; i < count; ++i) {
-        if (Stream* s = list::stream_of(lists[i])) stream::run_cpu_side(*s);
-        if (VkCommandBuffer cb = list::close_for_submit(lists[i])) cbs.push_back(cb);
-    }
-    if (!cbs.empty()) submit(q, cbs, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, 0);
-    for (uint32_t i = 0; i < count; ++i) list::submitted(lists[i], q->host->q);
+    exec::execute(q->host, count, lists);
 }
 void WINAPI execute_x(Queue* q, uint32_t count, void* const* lists, uint64_t, uint32_t) { execute(q, count, lists); }
 void WINAPI marker(Queue*) {}
@@ -98,7 +60,7 @@ void WINAPI marker(Queue*) {}
 HRESULT WINAPI signal(Queue* q, void* fobj, uint64_t value) {
     auto* f = fence::from(fobj);
     if (!f) return E_INVALIDARG;
-    submit(q, {}, VK_NULL_HANDLE, 0, fence::semaphore(f), value);
+    exec::signal(q->host, fence::semaphore(f), value);
     fence::watch(f, value);
     return S_OK;
 }
@@ -107,7 +69,7 @@ HRESULT WINAPI wait(Queue* q, void* fobj, uint64_t value) {
     auto* f = fence::from(fobj);
     if (!f) return E_INVALIDARG;
     if (fence::completed(f) >= value) return S_OK;
-    submit(q, {}, fence::semaphore(f), value, VK_NULL_HANDLE, 0);
+    exec::wait(q->host, fence::semaphore(f), value);
     return S_OK;
 }
 HRESULT WINAPI timestamp_frequency(Queue*, uint64_t* out) {
@@ -121,7 +83,7 @@ QueueDesc* WINAPI get_desc(Queue* q, QueueDesc* out) {
     return out;
 }
 HRESULT WINAPI present_x(Queue* q, uint32_t planes, const void* plane_list, const void* params) {
-    return present::present(q->host->q, &q->host->lock, planes, plane_list, params);
+    return present::present(q->host, planes, plane_list, params);
 }
 
 void** make(bool newer) {
@@ -143,18 +105,6 @@ void** make(bool newer) {
     return t;
 }
 
-HostQueue* host_for(uint32_t kind) {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        auto& h = host::get();
-        g_host_queues[0].q = h.queues.graphics;
-        g_host_queues[1].q = h.queues.compute;
-        g_host_queues[2].q = h.queues.transfer;
-    });
-    // Copy queues go to the graphics queue for now: images there need no ownership transfers.
-    return kind == 2 ? &g_host_queues[1] : &g_host_queues[0];
-}
-
 HRESULT WINAPI create(void*, const QueueDesc* d, const Iid* iid, void** out) {
     if (!d) return E_INVALIDARG;
     static void** older = make(false);
@@ -163,7 +113,7 @@ HRESULT WINAPI create(void*, const QueueDesc* d, const Iid* iid, void** out) {
     q->object.functions = newer_layouts() ? newer : older;
     q->kind = d->kind;
     q->desc = *d;
-    q->host = host_for(d->kind);
+    q->host = exec::queue_for(d->kind);
     KL_INFO("gpu", "command queue: type %u, priority %d", d->kind, d->priority);
     if (!is_queue(iid)) return answer(Kind::Queue, iid, nullptr, out);
     return answer(Kind::Queue, iid, q, out);

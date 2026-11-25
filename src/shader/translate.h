@@ -1,11 +1,12 @@
 // keylime shaders: GFX10 program -> SPIR-V (see docs/translator.md).
 //
 // Runtime contract (what the GPU side provides):
-//   push constants (std430 block, 256 bytes):
-//     uint user_sgpr[32]       the user SGPRs (root signature values)
+//   push constants (32 bytes, every stage):
+//     uint64 draw_data         this draw's record: user SGPRs of each stage (32 dwords at
+//                              Options::sgpr_offset)
 //     uint64 page_table        title address -> device address (2 levels, 1 GiB / 64 KiB)
 //     uint64 texture_table     T#/S# hash -> bindless slot
-//     uint misc[4]             (reserved)
+//     uint misc[2]             (reserved)
 //   set 0: binding 0 sampled images[], binding 1 samplers[], binding 2 storage images[]
 //   VS: inputs at location = signature row; outputs at location = param row.
 //   PS: inputs at location = signature row; colour outputs at location = MRT index.
@@ -28,6 +29,12 @@ struct Translation {
     bool writes_depth = false, discards = false;
 };
 
-bool translate(const Program& p, Translation& out, std::string& error);
+// Host choices for one translation.
+struct Options {
+    std::map<uint8_t, uint8_t> ps_location;  // PS input row -> location (the linked VS output row)
+    uint32_t sgpr_offset = 0;                // dwords into the draw record where this stage's SGPRs start
+};
+
+bool translate(const Program& p, Translation& out, std::string& error, const Options* opt = nullptr);
 
 }  // namespace kl::shader

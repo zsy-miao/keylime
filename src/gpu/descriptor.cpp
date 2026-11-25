@@ -14,6 +14,8 @@
 #include "gpu/device.h"
 #include "gpu/descriptor.h"
 #include "gpu/fence.h"
+#include "gpu/images.h"
+#include "gpu/memory.h"
 #include "gpu/resource.h"
 #include "gpu/texture.h"
 #include "log.h"
@@ -73,11 +75,23 @@ HRESULT WINAPI create_heap(void*, const HeapDesc* d, const Iid* iid, void** out)
     if (placed) {
         h->start = p.address;
     } else {
-        // Below 2^40 like all GPU-visible title memory.
-        void* m = VirtualAlloc(nullptr, size_t(size), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        // Below 4 GiB: shaders form table addresses from 32 bits (the high dword is zero).
+        MEM_ADDRESS_REQUIREMENTS req{};
+        req.HighestEndingAddress = reinterpret_cast<void*>(uintptr_t(0xffffffffull));
+        MEM_EXTENDED_PARAMETER param{};
+        param.Type = MemExtendedParameterAddressRequirements;
+        param.Pointer = &req;
+        void* m = VirtualAlloc2(GetCurrentProcess(), nullptr, size_t((size + 0xffff) & ~0xffffull), MEM_COMMIT | MEM_RESERVE,
+                                PAGE_READWRITE, &param, 1);
+        if (!m) {
+            KL_WARN("gpu", "no room below 4 GiB for a descriptor heap of %llu bytes", (unsigned long long)size);
+            m = VirtualAlloc(nullptr, size_t(size), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
         if (!m) return E_OUTOFMEMORY;
         h->start = uint64_t(m);
     }
+    if (h->start >> 32) KL_WARN("gpu", "descriptor heap at %llx is above 4 GiB: shaders cannot reach it", (unsigned long long)h->start);
+    memory::ensure(h->start, size);
     KL_TRACE("gpu", "descriptor heap: type %u, %u descriptors, flags %u, %s at %llx", d->kind, d->count, d->flags,
              placed ? "title memory" : "ours", (unsigned long long)h->start);
     return query(h, iid, out);
@@ -148,6 +162,7 @@ void WINAPI create_cbv(void*, const CbvDesc* d, uint64_t handle) {
     auto* w = reinterpret_cast<uint32_t*>(handle);
     memset(w, 0, 32);
     buffer_words(w, d->location, 0, d->size, 0);
+    memory::ensure(d->location, d->size ? d->size : 1);
 }
 
 struct SrvDesc {
@@ -172,9 +187,11 @@ void WINAPI create_srv(void*, void* res, const SrvDesc* d, uint64_t handle) {
         uint32_t count = d ? d->buffer.count : uint32_t(r.desc.width);
         uint32_t esize = stride ? stride : 4;
         buffer_words(w, r.address + first * esize, stride, stride ? count : count * 4, 0);
+        memory::ensure(r.address + first * esize, 1);
         return;
     }
     uint32_t format = d && d->format ? d->format : r.desc.format;
+    images::viewed(res, format);
     uint32_t mapping = d ? d->mapping : 0x1688;
     uint32_t type = T2D, bl = 0, lv = ~0u, ba = 0, as = 0;
     if (d) {
@@ -218,9 +235,11 @@ void WINAPI create_uav(void*, void* res, void*, const UavDesc* d, uint64_t handl
         uint32_t count = d ? d->buffer.count : uint32_t(r.desc.width / 4);
         uint32_t esize = stride ? stride : 4;
         buffer_words(w, r.address + first * esize, stride, stride ? count : count * 4, 0);
+        memory::ensure(r.address + first * esize, 1);
         return;
     }
     uint32_t format = d && d->format ? d->format : r.desc.format;
+    images::viewed(res, format);
     uint32_t type = T2D, mip = 0, ba = 0, as = 0;
     if (d) {
         mip = d->tex.mip;
@@ -236,22 +255,47 @@ void WINAPI create_uav(void*, void* res, void*, const UavDesc* d, uint64_t handl
 }
 
 // Views of memory the title placed itself (no resource object): (resource desc, view desc, handle).
+// The view description is the D3D12 SRV / UAV description (10 words) followed by the address
+// (words 10-11), as VIctory found.
 void WINAPI create_placed_view(void*, const resource::ResourceDesc* rd, const void* vd, uint64_t handle, bool uav) {
-    if (!handle || !rd) return;
-    // The address is in the view description's trailing words (as VIctory found: 16 words).
+    if (!handle || !rd || !vd) return;
     const uint32_t* v = static_cast<const uint32_t*>(vd);
     resource::Info r{};
     r.desc = *rd;
-    memcpy(&r.address, v + 14, 8);
+    r.address = uint64_t(v[10]) | uint64_t(v[11]) << 32;
     auto* w = reinterpret_cast<uint32_t*>(handle);
+    memset(w, 0, 32);
+    if (!r.address) return;
     if (rd->dimension == resource::BUFFER) {
-        memset(w, 0, 32);
-        buffer_words(w, r.address, 0, uint32_t(rd->width), 0);
+        if (uav) {
+            const auto* d = static_cast<const UavDesc*>(vd);
+            uint32_t stride = d->buffer.stride, esize = stride ? stride : 4;
+            buffer_words(w, r.address + d->buffer.first * esize, stride, stride ? d->buffer.count : d->buffer.count * 4, 0);
+            memory::ensure(r.address + d->buffer.first * esize, 1);
+        } else {
+            const auto* d = static_cast<const SrvDesc*>(vd);
+            uint32_t stride = d->buffer.stride, esize = stride ? stride : 4;
+            buffer_words(w, r.address + d->buffer.first * esize, stride, stride ? d->buffer.count : d->buffer.count * 4, 0);
+            memory::ensure(r.address + d->buffer.first * esize, 1);
+        }
         return;
     }
+    uint32_t format = v[0] ? v[0] : rd->format;
+    images::viewed_placed(r.address, rd, format);
     uint32_t type = rd->dimension == resource::TEX1D ? T1D : rd->dimension == resource::TEX3D ? T3D
                   : rd->depth_or_array > 1 ? T2DA : T2D;
-    image_words(w, r, v[0] ? v[0] : rd->format, type, 0, uav ? 1 : ~0u, 0, 0, 0x1688);
+    uint32_t bl = 0, lv = uav ? 1 : ~0u, ba = 0, as = 0, mapping = 0x1688;
+    if (!uav) {
+        const auto* d = static_cast<const SrvDesc*>(vd);
+        mapping = d->mapping ? d->mapping : 0x1688;
+        switch (d->dim) {
+            case 4: case 8: case 9: bl = d->tex.most_detailed, lv = d->tex.levels; break;
+            case 5: case 10: bl = d->tex.most_detailed, lv = d->tex.levels, ba = d->tex.first_array, as = d->tex.array_size; break;
+            default: break;
+        }
+        if (d->dim == 9 || d->dim == 10) type = TCUBE;
+    }
+    image_words(w, r, format, type, bl, lv, ba, as, mapping);
 }
 void WINAPI create_placed_srv(void* d, const resource::ResourceDesc* rd, const void* vd, uint64_t h) { create_placed_view(d, rd, vd, h, false); }
 void WINAPI create_placed_uav(void* d, const resource::ResourceDesc* rd, const void* vd, uint64_t h) { create_placed_view(d, rd, vd, h, true); }
@@ -287,7 +331,10 @@ void sampler_words(uint32_t* w, const SamplerDesc& d) {
     w[3] = (white ? 2u : opaque ? 1u : 0u) << 30;
 }
 void WINAPI create_sampler(void*, const SamplerDesc* d, uint64_t handle) {
-    if (handle && d) sampler_words(reinterpret_cast<uint32_t*>(handle), *d);
+    if (handle && d) {
+        sampler_words(reinterpret_cast<uint32_t*>(handle), *d);
+        images::sampler(reinterpret_cast<uint32_t*>(handle));
+    }
 }
 // The console's own sampler description (27 words): leading words as the PC layout for now.
 void WINAPI create_sampler_x(void* dev, const SamplerDesc* d, uint64_t handle) {
@@ -309,8 +356,14 @@ void target(void* res, const uint32_t* d, uint64_t handle, uint32_t tag) {
     if (d) memcpy(t.desc, d, sizeof t.desc);
     memcpy(reinterpret_cast<void*>(handle), &t, sizeof t);
 }
-void WINAPI create_rtv(void*, void* res, const uint32_t* d, uint64_t handle) { target(res, d, handle, RTV_TAG); }
-void WINAPI create_dsv(void*, void* res, const uint32_t* d, uint64_t handle) { target(res, d, handle, DSV_TAG); }
+void WINAPI create_rtv(void*, void* res, const uint32_t* d, uint64_t handle) {
+    target(res, d, handle, RTV_TAG);
+    images::of_resource(res);
+}
+void WINAPI create_dsv(void*, void* res, const uint32_t* d, uint64_t handle) {
+    target(res, d, handle, DSV_TAG);
+    images::of_resource(res);
+}
 
 // Copies: descriptors are bytes, as on the console.
 void WINAPI copy_simple(void*, uint32_t count, uint64_t dst, uint64_t src, uint32_t kind) {
@@ -351,6 +404,49 @@ struct Init {
 } g_init;
 
 }  // namespace
+
+bool heap_info(void* obj, uint32_t& kind, uint64_t& start) {
+    auto* h = static_cast<Heap*>(obj);
+    if (!h || h->object.functions != heap_table()) return false;
+    kind = h->desc.kind, start = h->start;
+    return true;
+}
+
+bool target_info(uint64_t handle, Target& out) {
+    if (!handle) return false;
+    TargetRecord t;
+    memcpy(&t, reinterpret_cast<const void*>(handle), sizeof t);
+    if (t.tag != RTV_TAG && t.tag != DSV_TAG) return false;
+    out = {};
+    out.resource = t.resource;
+    out.depth = t.tag == DSV_TAG;
+    if (!t.described) return true;
+    out.format = t.desc[0];
+    uint32_t dim = t.desc[1];
+    if (!out.depth) {
+        // RTV: 2 1D, 3 1D array, 4 2D, 5 2D array, 6 MS, 7 MS array, 8 3D.
+        out.mip = (dim == 6 || dim == 7) ? 0 : t.desc[2];
+        if (dim == 3 || dim == 5 || dim == 8) out.layer = t.desc[3];
+        if (dim == 7) out.layer = t.desc[2];
+    } else {
+        // DSV: {format, dim, flags, ...}: 1 1D, 2 1D array, 3 2D, 4 2D array, 5 MS, 6 MS array.
+        out.mip = (dim == 5 || dim == 6) ? 0 : t.desc[3];
+        if (dim == 2 || dim == 4) out.layer = t.desc[4];
+        if (dim == 6) out.layer = t.desc[3];
+    }
+    return true;
+}
+
+void sampler_from_static(const uint32_t* desc13, uint32_t* words) {
+    // D3D12_STATIC_SAMPLER_DESC: filter, u, v, w, bias, aniso, compare, border colour (enum), min, max lod, ...
+    SamplerDesc d{};
+    memcpy(&d.filter, desc13, 4 * 7);
+    uint32_t border = desc13[7];
+    d.border[3] = border == 0 ? 0.0f : 1.0f;
+    d.border[0] = d.border[1] = d.border[2] = border == 2 ? 1.0f : 0.0f;
+    memcpy(&d.min_lod, desc13 + 8, 8);
+    sampler_words(words, d);
+}
 
 uint32_t increment(uint32_t kind) {
     static const uint32_t sizes[] = {32, 16, 128, 128};

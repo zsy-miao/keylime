@@ -11,6 +11,7 @@
 
 #include "gpu/device.h"
 #include "gpu/fence.h"
+#include "gpu/memory.h"
 #include "hle/xmem.h"
 #include "log.h"
 #include "stats.h"
@@ -133,6 +134,9 @@ HRESULT hand_out(const ResourceDesc& d, const HeapProperties& heap, uint32_t hea
         std::lock_guard g(g_lock);
         g_by_address.try_emplace(uint64_t(data), r);
     }
+    // The GPU sees the memory as it is (imported, no copy).
+    AllocationInfo f;
+    if (data && footprint(d, f)) memory::ensure(uint64_t(data), f.size);
     KL_TRACE("gpu", "resource %s dim %u %llux%u fmt %u at %p", b == Backing::Committed ? "committed" : b == Backing::Placed ? "placed" : "at address",
              d.dimension, (unsigned long long)d.width, d.height, d.format, (void*)data);
     return resource_query(r, iid, out);
@@ -193,6 +197,7 @@ HRESULT WINAPI create_heap(void*, const HeapDesc* d, const Iid* iid, void** out)
         return E_OUTOFMEMORY;
     }
     KL_TRACE("gpu", "heap %llu bytes, type %u, flags %x at %p", (unsigned long long)d->size, d->properties.kind, d->flags, (void*)mem);
+    memory::ensure(uint64_t(mem), d->size);
     auto* h = new Heap{{heap_table(), 0, {0}}, *d, mem};
     return heap_query(h, iid, out);
 }

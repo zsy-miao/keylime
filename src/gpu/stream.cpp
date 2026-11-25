@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 
+#include "gpu/memory.h"
 #include "gpu/resource.h"
 #include "log.h"
 #include "stats.h"
@@ -26,94 +27,105 @@ void Stream::add(Op op, const void* payload, uint32_t size) {
 void* Stream::upload(uint64_t size, uint64_t alignment) {
     if (alignment < 16) alignment = 16;
     if (alignment & (alignment - 1)) return nullptr;
-    auto block = std::make_unique<uint8_t[]>(size_t(size + alignment));
-    auto p = reinterpret_cast<uintptr_t>(block.get());
-    p = (p + alignment - 1) & ~(alignment - 1);
-    uploads_.push_back(std::move(block));
-    return reinterpret_cast<void*>(p);
+    for (auto& c : chunks_) {
+        uint64_t at = (c.used + alignment - 1) & ~(alignment - 1);
+        if (at + size <= c.size) {
+            c.used = at + size;
+            return c.p + at;
+        }
+    }
+    uint64_t n = size + alignment > (1u << 20) ? ((size + alignment + 0xffff) & ~0xffffull) : (1u << 20);
+    auto* p = static_cast<uint8_t*>(VirtualAlloc(nullptr, size_t(n), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!p) return nullptr;
+    memory::ensure(uint64_t(p), n);
+    chunks_.push_back({p, n, 0});
+    auto& c = chunks_.back();
+    c.used = size;  // VirtualAlloc memory is 64 KiB aligned
+    return c.p;
 }
 
 namespace stream {
 namespace {
 
 Stream* S(void* list) { return list::stream_of(list); }
-
-struct DrawArgs { uint32_t count, instances, first, first_instance; };
-struct DrawIndexedArgs { uint32_t count, instances, first; int32_t base; uint32_t first_instance; };
-struct DispatchArgs { uint32_t x, y, z, flags; };
-struct CopyBufferArgs { uint64_t dst, src, len; };
-struct WriteArgs { uint64_t address, value; uint32_t bytes, flags; };
-struct ResolveQueriesArgs { uint64_t dst; uint32_t count; };
-struct U32x4 { uint32_t a, b, c, d; };
-struct U64x4 { uint64_t a, b, c, d; };
+using namespace cmd;
 
 void WINAPI draw(void* l, uint32_t c, uint32_t i, uint32_t f, uint32_t fi) {
-    if (auto* s = S(l)) s->add(Op::Draw, DrawArgs{c, i, f, fi});
+    if (auto* s = S(l)) s->add(Op::Draw, Draw{c, i, f, fi});
     stats::add(stats::Draws);
 }
 void WINAPI draw_indexed(void* l, uint32_t c, uint32_t i, uint32_t f, int32_t b, uint32_t fi) {
-    if (auto* s = S(l)) s->add(Op::DrawIndexed, DrawIndexedArgs{c, i, f, b, fi});
+    if (auto* s = S(l)) s->add(Op::DrawIndexed, DrawIndexed{c, i, f, b, fi});
     stats::add(stats::Draws);
 }
 void WINAPI dispatch(void* l, uint32_t x, uint32_t y, uint32_t z) {
-    if (auto* s = S(l)) s->add(Op::Dispatch, DispatchArgs{x, y, z, 0});
+    if (auto* s = S(l)) s->add(Op::Dispatch, Dispatch{x, y, z, 0});
     stats::add(stats::Dispatches);
 }
 void WINAPI dispatch_x(void* l, uint32_t x, uint32_t y, uint32_t z, uint32_t f) {
-    if (auto* s = S(l)) s->add(Op::Dispatch, DispatchArgs{x, y, z, f});
+    if (auto* s = S(l)) s->add(Op::Dispatch, Dispatch{x, y, z, f});
     stats::add(stats::Dispatches);
 }
 void WINAPI dispatch_mesh(void* l, uint32_t x, uint32_t y, uint32_t z) {
-    if (auto* s = S(l)) s->add(Op::DispatchMesh, DispatchArgs{x, y, z, 0});
+    if (auto* s = S(l)) s->add(Op::DispatchMesh, Dispatch{x, y, z, 0});
     stats::add(stats::Draws);
 }
 void WINAPI dispatch_mesh_x(void* l, uint32_t x, uint32_t y, uint32_t z, uint32_t f) {
-    if (auto* s = S(l)) s->add(Op::DispatchMesh, DispatchArgs{x, y, z, f});
+    if (auto* s = S(l)) s->add(Op::DispatchMesh, Dispatch{x, y, z, f});
     stats::add(stats::Draws);
 }
-void WINAPI execute_indirect(void* l, void* sig, uint32_t max, void* args, uint64_t off, void*, uint64_t) {
-    if (auto* s = S(l)) s->add(Op::ExecuteIndirect, U64x4{uint64_t(sig), uint64_t(args), off, max});
-    stats::add(stats::Draws);
-}
-
+struct IndirectArgs { void* signature; uint64_t args, offset, max, count_buffer, count_offset; };
 uint64_t buffer_address(void* res, uint64_t offset) {
     resource::Info r;
     return resource::info(res, r) ? r.address + offset : 0;
 }
+void WINAPI execute_indirect(void* l, void* sig, uint32_t max, void* args, uint64_t off, void* count, uint64_t coff) {
+    if (auto* s = S(l))
+        s->add(Op::ExecuteIndirect, IndirectArgs{sig, buffer_address(args, off), off, max, count ? buffer_address(count, coff) : 0, coff});
+    stats::add(stats::Draws);
+}
+
 void WINAPI copy_buffer_region(void* l, void* dst, uint64_t doff, void* src, uint64_t soff, uint64_t len) {
-    if (auto* s = S(l)) s->add(Op::CopyBuffer, CopyBufferArgs{buffer_address(dst, doff), buffer_address(src, soff), len});
+    if (auto* s = S(l)) s->add(Op::CopyBuffer, CopyBuffer{buffer_address(dst, doff), buffer_address(src, soff), len});
     stats::add(stats::Copies);
 }
 void WINAPI copy_memory(void* l, uint64_t dst, uint64_t src, uint64_t len, uint32_t) {
-    if (auto* s = S(l)) s->add(Op::CopyMem, CopyBufferArgs{dst, src, len});
+    if (auto* s = S(l)) s->add(Op::CopyMem, CopyBuffer{dst, src, len});
     stats::add(stats::Copies);
 }
-void WINAPI copy_texture_region(void* l, const void* dst, uint32_t x, uint32_t y, uint32_t z, const void* src, const void*) {
-    if (auto* s = S(l)) s->add(Op::CopyTexture, U64x4{uint64_t(dst), uint64_t(src), uint64_t(x) | uint64_t(y) << 32, z});
+void WINAPI copy_texture_region(void* l, const CopyLocation* dst, uint32_t x, uint32_t y, uint32_t z, const CopyLocation* src,
+                                const uint32_t* box) {
+    auto* s = S(l);
+    if (s && dst && src) {
+        CopyTexture c{*dst, *src, x, y, z, box ? 1u : 0u, {}};
+        if (box) memcpy(c.box, box, sizeof c.box);
+        s->add(Op::CopyTexture, c);
+    }
     stats::add(stats::Copies);
 }
 void WINAPI copy_resource(void* l, void* dst, void* src) {
-    if (auto* s = S(l)) s->add(Op::CopyResource, U64x4{uint64_t(dst), uint64_t(src), 0, 0});
+    if (auto* s = S(l)) s->add(Op::CopyResource, CopyResource{dst, src});
     stats::add(stats::Copies);
 }
 void WINAPI write32(void* l, uint64_t address, uint32_t value, uint32_t, uint32_t flags) {
-    if (auto* s = S(l)) s->add(Op::Write32, WriteArgs{address, value, 4, flags});
+    if (auto* s = S(l)) s->add(Op::Write32, Write{address, value, 4, flags});
 }
 void WINAPI write64(void* l, uint64_t address, uint64_t value, uint32_t, uint32_t flags) {
-    if (auto* s = S(l)) s->add(Op::Write64, WriteArgs{address, value, 8, flags});
+    if (auto* s = S(l)) s->add(Op::Write64, Write{address, value, 8, flags});
 }
+struct WaitArgs { uint64_t address; uint64_t compare; uint64_t reference; };
 void WINAPI wait_value(void* l, uint64_t address, uint32_t cmp, uint64_t ref) {
-    if (auto* s = S(l)) s->add(Op::WaitValue, U64x4{address, cmp, ref, 0});
+    if (auto* s = S(l)) s->add(Op::WaitValue, WaitArgs{address, cmp, ref});
 }
 void WINAPI resolve_queries(void* l, void*, uint32_t, uint32_t, uint32_t count, void* dst, uint64_t off) {
-    if (auto* s = S(l)) s->add(Op::ResolveQueries, ResolveQueriesArgs{buffer_address(dst, off), count});
+    if (auto* s = S(l)) s->add(Op::ResolveQueries, ResolveQueries{buffer_address(dst, off), count});
 }
 void WINAPI barrier(void* l, uint32_t n, const void*) {
-    if (auto* s = S(l)) s->add(Op::Barrier, U32x4{n, 0, 0, 0});
+    if (auto* s = S(l)) s->add(Op::Barrier, n);
     stats::add(stats::Barriers);
 }
 void WINAPI barrier_groups(void* l, uint32_t n, const void*) {
-    if (auto* s = S(l)) s->add(Op::Barrier, U32x4{n, 1, 0, 0});
+    if (auto* s = S(l)) s->add(Op::Barrier, n);
     stats::add(stats::Barriers);
 }
 void* WINAPI allocate_upload(void* l, uint64_t size, uint64_t alignment) {
@@ -124,55 +136,93 @@ uint64_t WINAPI driver_hint(void*, uint64_t, uint64_t) { return 0; }
 
 template <Op OP>
 void WINAPI state1(void* l, uint64_t a) {
-    if (auto* s = S(l)) s->add(OP, U64x4{a, 0, 0, 0});
+    if (auto* s = S(l)) s->add(OP, a);
     stats::add(stats::OtherCommands);
 }
-template <Op OP>
-void WINAPI state3(void* l, uint64_t a, uint64_t b, uint64_t c) {
-    if (auto* s = S(l)) s->add(OP, U64x4{a, b, c, 0});
-    stats::add(stats::OtherCommands);
+// Root arguments: G = 1 graphics, 0 compute.
+template <uint32_t G>
+void WINAPI root_signature(void* l, void* r) {
+    if (auto* s = S(l)) s->add(Op::RootSignature, Root{G, 0, uint64_t(r)});
 }
-template <Op OP, size_t ELEM>
-void WINAPI array_state(void* l, uint32_t n, const void* items) {
-    auto* s = S(l);
-    if (s && items && n <= 64) {
-        static thread_local uint8_t buf[8 + 64 * 48];
-        memcpy(buf, &n, 4);
-        memcpy(buf + 8, items, n * ELEM);
-        s->add(OP, buf, uint32_t(8 + n * ELEM));
+template <uint32_t G>
+void WINAPI root_table(void* l, uint32_t slot, uint64_t handle) {
+    if (auto* s = S(l)) s->add(Op::RootTable, Root{G, slot, handle});
+}
+template <uint32_t G>
+void WINAPI root_view(void* l, uint32_t slot, uint64_t address) {
+    if (auto* s = S(l)) s->add(Op::RootView, Root{G, slot, address});
+}
+template <uint32_t G>
+void WINAPI root_constant(void* l, uint32_t slot, uint32_t value, uint32_t offset) {
+    if (auto* s = S(l)) {
+        RootConstants c{G, slot, offset, 1, {value}};
+        s->add(Op::RootConstants, &c, uint32_t(offsetof(RootConstants, values) + 4));
     }
-    stats::add(stats::OtherCommands);
+}
+template <uint32_t G>
+void WINAPI root_constants(void* l, uint32_t slot, uint32_t n, const uint32_t* data, uint32_t first) {
+    auto* s = S(l);
+    if (!s || !data) return;
+    RootConstants c{G, slot, first, n > 64 ? 64 : n, {}};
+    memcpy(c.values, data, c.count * 4);
+    s->add(Op::RootConstants, &c, uint32_t(offsetof(RootConstants, values) + 4 * c.count));
+}
+void WINAPI index_buffer(void* l, const IndexBuffer* v) {
+    if (auto* s = S(l)) s->add(Op::IndexBuffer, v ? *v : IndexBuffer{});
+}
+void WINAPI vertex_buffers(void* l, uint32_t start, uint32_t n, const VertexView* views) {
+    auto* s = S(l);
+    if (!s) return;
+    VertexBuffers v{start, n > 32 ? 32 : n, {}};
+    if (views) memcpy(v.views, views, v.count * sizeof(VertexView));
+    s->add(Op::VertexBuffers, &v, uint32_t(offsetof(VertexBuffers, views) + v.count * sizeof(VertexView)));
+}
+void WINAPI viewports(void* l, uint32_t n, const float* items) {
+    auto* s = S(l);
+    if (!s || !items) return;
+    Viewports v{n > 16 ? 16 : n, 0, {}};
+    memcpy(v.v, items, v.count * 24);
+    s->add(Op::Viewports, v);
+}
+void WINAPI scissors(void* l, uint32_t n, const int32_t* items) {
+    auto* s = S(l);
+    if (!s || !items) return;
+    Scissors v{n > 16 ? 16 : n, 0, {}};
+    memcpy(v.r, items, v.count * 16);
+    s->add(Op::Scissors, v);
+}
+void WINAPI heaps(void* l, uint32_t n, void* const* items) {
+    auto* s = S(l);
+    if (!s || !items) return;
+    Heaps h{n > 8 ? 8 : n, 0, {}};
+    memcpy(h.heaps, items, h.count * 8);
+    s->add(Op::Heaps, h);
 }
 void WINAPI blend_factor(void* l, const float* f) {
     float v[4] = {};
     if (f) memcpy(v, f, sizeof v);
     if (auto* s = S(l)) s->add(Op::BlendFactor, v);
 }
-void WINAPI set_constants(void* l, uint32_t param, uint32_t n, const void* data, uint32_t first) {
-    auto* s = S(l);
-    if (s && data && n <= 64) {
-        uint32_t buf[3 + 64] = {param, n, first};
-        memcpy(buf + 3, data, n * 4);
-        s->add(Op::RootConstants, buf, (3 + n) * 4);
-    }
-}
-struct ClearRtvArgs { uint64_t h; float c[4]; };
 void WINAPI clear_rtv(void* l, uint64_t handle, const float* color, uint32_t, const void*) {
-    ClearRtvArgs p{handle, {}};
-    if (color) memcpy(p.c, color, sizeof p.c);
+    ClearRtv p{handle, {}};
+    if (color) memcpy(p.color, color, sizeof p.color);
     if (auto* s = S(l)) s->add(Op::ClearRtv, p);
 }
-struct ClearDsvArgs { uint64_t h; uint32_t f; float d; uint32_t s; };
 void WINAPI clear_dsv(void* l, uint64_t handle, uint32_t flags, float depth, uint8_t stencil, uint32_t, const void*) {
-    if (auto* s = S(l)) s->add(Op::ClearDsv, ClearDsvArgs{handle, flags, depth, stencil});
+    if (auto* s = S(l)) s->add(Op::ClearDsv, ClearDsv{handle, flags, depth, stencil});
+}
+template <Op OP>
+void WINAPI clear_uav(void* l, uint64_t gpu, uint64_t cpu, void* res, const uint32_t* values, uint32_t, const void*) {
+    ClearUav c{gpu, cpu, uint64_t(res), {}};
+    if (values) memcpy(c.values, values, 16);
+    if (auto* s = S(l)) s->add(OP, c);
 }
 void WINAPI targets(void* l, uint32_t n, const uint64_t* rtvs, BOOL single, const uint64_t* dsv) {
     auto* s = S(l);
     if (!s) return;
-    uint64_t buf[11] = {n, uint64_t(single)};
-    for (uint32_t i = 0; i < n && i < 8; ++i) buf[2 + i] = rtvs ? (single ? rtvs[0] + uint64_t(i) * 128 : rtvs[i]) : 0;
-    buf[10] = dsv ? *dsv : 0;
-    s->add(Op::Targets, buf, sizeof buf);
+    Targets t{n > 8 ? 8 : n, uint32_t(single), {}, dsv ? *dsv : 0};
+    for (uint32_t i = 0; i < t.count; ++i) t.rtv[i] = rtvs ? (single ? rtvs[0] + uint64_t(i) * 128 : rtvs[i]) : 0;
+    s->add(Op::Targets, t);
 }
 void WINAPI ignored(void*) {}
 
@@ -188,8 +238,8 @@ void fill_list_methods(void** t, bool newer) {
     at(17, (void*)&copy_resource);
     at(19, (void*)&state1<Op::Resolve>);
     at(20, (void*)&state1<Op::Topology>);
-    at(21, (void*)&array_state<Op::Viewports, 24>);
-    at(22, (void*)&array_state<Op::Scissors, 16>);
+    at(21, (void*)&viewports);
+    at(22, (void*)&scissors);
     at(23, (void*)&blend_factor);
     at(24, (void*)&state1<Op::StencilRef>);
     at(25, (void*)&state1<Op::SetPipeline>);
@@ -197,23 +247,23 @@ void fill_list_methods(void** t, bool newer) {
     at(28, (void*)&ignored);
     at(29, (void*)&ignored);
     at(30, (void*)&resolve_queries);
-    at(32, (void*)&array_state<Op::Heaps, 8>);
-    at(33, (void*)&state1<Op::RootSignature>);
-    at(34, (void*)&state1<Op::RootSignature>);
-    at(35, (void*)&state3<Op::RootTable>);
-    at(36, (void*)&state3<Op::RootTable>);
-    at(37, (void*)&state3<Op::RootConstant>);
-    at(38, (void*)&state3<Op::RootConstant>);
-    at(39, (void*)&set_constants);
-    at(40, (void*)&set_constants);
-    for (size_t s = 41; s <= 46; ++s) at(s, (void*)&state3<Op::RootView>);
-    at(47, (void*)&state1<Op::IndexBuffer>);
-    at(48, (void*)&state3<Op::VertexBuffers>);
+    at(32, (void*)&heaps);
+    at(33, (void*)&root_signature<0>);
+    at(34, (void*)&root_signature<1>);
+    at(35, (void*)&root_table<0>);
+    at(36, (void*)&root_table<1>);
+    at(37, (void*)&root_constant<0>);
+    at(38, (void*)&root_constant<1>);
+    at(39, (void*)&root_constants<0>);
+    at(40, (void*)&root_constants<1>);
+    for (size_t s = 41; s <= 46; s += 2) at(s, (void*)&root_view<0>), at(s + 1, (void*)&root_view<1>);
+    at(47, (void*)&index_buffer);
+    at(48, (void*)&vertex_buffers);
     at(50, (void*)&targets);
     at(51, (void*)&clear_dsv);
     at(52, (void*)&clear_rtv);
-    at(53, (void*)&state3<Op::ClearUavUint>);
-    at(54, (void*)&state3<Op::ClearUavFloat>);
+    at(53, (void*)&clear_uav<Op::ClearUavUint>);
+    at(54, (void*)&clear_uav<Op::ClearUavFloat>);
     at(55, (void*)&state1<Op::Discard>);
     at(59, (void*)&execute_indirect);
     at(60, (void*)&copy_memory);
@@ -236,11 +286,12 @@ void fill_list_methods(void** t, bool newer) {
 }
 
 void run_cpu_side(const Stream& s) {
+    using namespace cmd;
     s.each([](Op op, const uint8_t* p, uint32_t) {
         switch (op) {
             case Op::Write32:
             case Op::Write64: {
-                WriteArgs w;
+                Write w;
                 memcpy(&w, p, sizeof w);
                 if (!w.address) break;
                 uint64_t v = w.value;
@@ -258,13 +309,13 @@ void run_cpu_side(const Stream& s) {
             }
             case Op::CopyBuffer:
             case Op::CopyMem: {
-                CopyBufferArgs c;
+                CopyBuffer c;
                 memcpy(&c, p, sizeof c);
                 if (c.dst && c.src && c.len) memmove(reinterpret_cast<void*>(c.dst), reinterpret_cast<void*>(c.src), size_t(c.len));
                 break;
             }
             case Op::ResolveQueries: {
-                ResolveQueriesArgs r;
+                ResolveQueries r;
                 memcpy(&r, p, sizeof r);
                 if (r.dst) memset(reinterpret_cast<void*>(r.dst), 0, size_t(r.count) * 8);
                 break;

@@ -1,13 +1,23 @@
-// keylime GPU: PresentX. Until the shader translator draws the title's
-// frames, each present paints keylime's live status into the title's window
-// (GDI), so the window shows the game is running instead of staying white.
+// keylime GPU: PresentX. The presented plane's first resource (the title's
+// back buffer, a Vulkan image here) is scaled into a swap chain on the
+// title's window (aspect kept, MAILBOX/IMMEDIATE so presenting never stalls
+// the title's own pacing). Until a frame can be shown, each present paints
+// keylime's live status into the window (GDI) instead.
 #include "gpu/present.h"
 
 #include <windows.h>
 
 #include <chrono>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <string>
+#include <vector>
 
+#include "gpu/exec.h"
+#include "gpu/host.h"
+#include "gpu/images.h"
+#include "gpu/memory.h"
 #include "log.h"
 #include "stats.h"
 
@@ -96,10 +106,234 @@ void paint() {
 
 }  // namespace
 
-HRESULT present(VkQueue, std::mutex*, uint32_t planes, const void*, const void*) {
+namespace {
+struct Plane {
+    uint64_t token;
+    uint32_t count;
+    void* const* resources;
+};
+
+struct Swap {
+    HWND window = nullptr;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkSwapchainKHR chain = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D extent{};
+    std::vector<VkImage> images;
+    std::vector<VkSemaphore> done;
+    VkSemaphore acquire[8]{};
+    uint32_t next = 0;
+    bool broken = false;
+} g_swap;
+bool g_shown = false;
+
+VkSemaphore binary() {
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkSemaphore s = VK_NULL_HANDLE;
+    vk::vkCreateSemaphore(host::get().device, &si, nullptr, &s);
+    return s;
+}
+
+bool make_chain() {
+    auto& h = host::get();
+    Swap& w = g_swap;
+    if (!w.window) {
+        EnumWindows(find_window, LPARAM(&w.window));
+        if (!w.window) return false;
+    }
+    if (!w.surface) {
+        VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+        si.hinstance = GetModuleHandleW(nullptr);
+        si.hwnd = w.window;
+        if (!KL_VK_CHECK(vk::vkCreateWin32SurfaceKHR(h.instance, &si, nullptr, &w.surface))) return w.broken = true, false;
+        VkBool32 ok = VK_FALSE;
+        vk::vkGetPhysicalDeviceSurfaceSupportKHR(h.physical, h.queues.graphics_family, w.surface, &ok);
+        if (!ok) {
+            KL_ERROR("gpu", "the graphics queue cannot present to the title's window");
+            return w.broken = true, false;
+        }
+        for (auto& s : w.acquire) s = binary();
+    }
+    VkSurfaceCapabilitiesKHR caps;
+    vk::vkGetPhysicalDeviceSurfaceCapabilitiesKHR(h.physical, w.surface, &caps);
+    if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) return false;  // minimised
+    uint32_t n = 0;
+    vk::vkGetPhysicalDeviceSurfaceFormatsKHR(h.physical, w.surface, &n, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(n);
+    vk::vkGetPhysicalDeviceSurfaceFormatsKHR(h.physical, w.surface, &n, formats.data());
+    VkSurfaceFormatKHR pick = formats.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR} : formats[0];
+    for (auto& f : formats)
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) pick = f;
+    vk::vkGetPhysicalDeviceSurfacePresentModesKHR(h.physical, w.surface, &n, nullptr);
+    std::vector<VkPresentModeKHR> modes(n);
+    vk::vkGetPhysicalDeviceSurfacePresentModesKHR(h.physical, w.surface, &n, modes.data());
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    for (auto m : modes)
+        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+    for (auto m : modes)
+        if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
+    VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    ci.surface = w.surface;
+    ci.minImageCount = std::max(caps.minImageCount, 3u);
+    if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+    ci.imageFormat = pick.format;
+    ci.imageColorSpace = pick.colorSpace;
+    ci.imageExtent = caps.currentExtent;
+    ci.imageArrayLayers = 1;
+    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.preTransform = caps.currentTransform;
+    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    ci.presentMode = mode;
+    ci.clipped = VK_TRUE;
+    ci.oldSwapchain = w.chain;
+    VkSwapchainKHR chain;
+    if (!KL_VK_CHECK(vk::vkCreateSwapchainKHR(h.device, &ci, nullptr, &chain))) return false;
+    if (w.chain) {
+        vk::vkDeviceWaitIdle(h.device);
+        vk::vkDestroySwapchainKHR(h.device, w.chain, nullptr);
+    }
+    w.chain = chain;
+    w.format = pick.format;
+    w.extent = caps.currentExtent;
+    vk::vkGetSwapchainImagesKHR(h.device, chain, &n, nullptr);
+    w.images.resize(n);
+    vk::vkGetSwapchainImagesKHR(h.device, chain, &n, w.images.data());
+    while (w.done.size() < n) w.done.push_back(binary());
+    KL_INFO("gpu", "swap chain %ux%u, %u images, %s", w.extent.width, w.extent.height, n,
+            mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    return true;
+}
+
+void layout(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.oldLayout = from, b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+    di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
+    vk::vkCmdPipelineBarrier2(cb, &di);
+}
+
+// KEYLIME_SNAPSHOTS=<dir>: writes what is shown at some frames as BMP files (for checking frames without a person).
+const char* snapshot_dir() {
+    static char dir[MAX_PATH] = {};
+    static bool on = GetEnvironmentVariableA("KEYLIME_SNAPSHOTS", dir, MAX_PATH) > 0;
+    return on ? dir : nullptr;
+}
+bool snapshot_due(uint64_t frame) {
+    static const uint64_t at[] = {10, 60, 150, 300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000};
+    for (uint64_t a : at)
+        if (a == frame) return true;
+    return false;
+}
+void write_bmp(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    uint32_t row = w * 4, size = row * h;
+    uint8_t hdr[54] = {'B', 'M'};
+    auto put = [&](int at, uint32_t v) { memcpy(hdr + at, &v, 4); };
+    put(2, 54 + size), put(10, 54), put(14, 40), put(18, w), put(22, uint32_t(-int32_t(h)));
+    hdr[26] = 1, hdr[28] = 32;
+    put(34, size);
+    fwrite(hdr, 1, 54, f);
+    fwrite(bgra, 1, size, f);
+    fclose(f);
+}
+
+// Shows `src` in the window; false if it could not.
+bool show(int q, images::Image* src) {
+    auto& h = host::get();
+    Swap& w = g_swap;
+    if (w.broken) return false;
+    if (!w.chain && !make_chain()) return false;
+    VkSemaphore acq = w.acquire[w.next++ % 8];
+    uint32_t idx = 0;
+    VkResult r = vk::vkAcquireNextImageKHR(h.device, w.chain, 100'000'000ull, acq, VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        make_chain();
+        return false;
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return false;
+    auto f = images::facts(src);
+    VkImage dst = w.images[idx];
+    // Fit the frame to the window, keeping its aspect.
+    double sx = double(w.extent.width) / f.width, sy = double(w.extent.height) / f.height, s = std::min(sx, sy);
+    int32_t dw = int32_t(f.width * s), dh = int32_t(f.height * s);
+    int32_t ox = (int32_t(w.extent.width) - dw) / 2, oy = (int32_t(w.extent.height) - dh) / 2;
+    static uint64_t frame = 0;
+    ++frame;
+    memory::Block grab;
+    if (snapshot_dir() && snapshot_due(frame)) memory::make_block(uint64_t(w.extent.width) * w.extent.height * 4, false, grab);
+    bool ok = exec::run(q, [&](VkCommandBuffer cb) {
+        layout(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue black{};
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vk::vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        layout(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageBlit b{};
+        b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(f.width), int32_t(f.height), 1};
+        b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.dstOffsets[0] = {ox, oy, 0};
+        b.dstOffsets[1] = {ox + dw, oy + dh, 1};
+        vk::vkCmdBlitImage(cb, f.image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        if (grab.buffer) {
+            layout(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.imageExtent = {w.extent.width, w.extent.height, 1};
+            vk::vkCmdCopyImageToBuffer(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, grab.buffer, 1, &c);
+            layout(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        } else {
+            layout(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        }
+    }, acq, w.done[idx]);
+    if (!ok) return false;
+    if (grab.buffer) {
+        exec::with_queue(q, [](VkQueue vq) { vk::vkQueueWaitIdle(vq); });
+        char path[MAX_PATH + 64];
+        snprintf(path, sizeof path, "%s/frame-%05llu.bmp", snapshot_dir(), (unsigned long long)frame);
+        if (w.format == VK_FORMAT_B8G8R8A8_UNORM || w.format == VK_FORMAT_B8G8R8A8_SRGB) write_bmp(path, grab.map, w.extent.width, w.extent.height);
+        KL_INFO("gpu", "snapshot of frame %llu: %s (source %ux%u format %d)", (unsigned long long)frame, path, f.width, f.height, int(f.format));
+        memory::free_block(grab);
+    }
+    VkResult pr = VK_SUCCESS;
+    exec::with_queue(q, [&](VkQueue vq) {
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &w.done[idx];
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &w.chain;
+        pi.pImageIndices = &idx;
+        pr = vk::vkQueuePresentKHR(vq, &pi);
+    });
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) make_chain();
+    return true;
+}
+}  // namespace
+
+HRESULT present(int q, uint32_t planes, const void* plane_list, const void*) {
     stats::add(stats::Presents);
     static int n = 0;
-    if (n++ < 1) KL_INFO("gpu", "PresentX: %u planes (status screen until frames are translated)", planes);
+    if (n++ < 1) KL_INFO("gpu", "PresentX: %u planes", planes);
+    images::Image* src = nullptr;
+    if (planes && plane_list) {
+        auto* p = static_cast<const Plane*>(plane_list);
+        if (p->count && p->resources && p->resources[0]) src = images::of_resource(p->resources[0]);
+    }
+    if (src && show(q, src)) {
+        if (!g_shown) g_shown = true, KL_INFO("gpu", "first frame shown: the title's own image is on screen now");
+        stats::add(stats::FramesShown);
+        return S_OK;
+    }
+    if (g_shown) return S_OK;
     // Painting every frame is cheap at 30 fps; skip if behind.
     static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     auto now = std::chrono::steady_clock::now();

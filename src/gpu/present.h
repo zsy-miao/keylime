@@ -1,9 +1,9 @@
-// keylime GPU: PresentX -> a Vulkan swap chain on our window.
+// keylime GPU: PresentX -> a Vulkan swap chain on the title's window.
 #pragma once
-#include <mutex>
+#include <windows.h>
 
-#include "gpu/vk.h"
+#include <cstdint>
 
 namespace kl::gpu::present {
-HRESULT present(VkQueue queue, std::mutex* queue_lock, uint32_t planes, const void* plane_list, const void* params);
+HRESULT present(int queue, uint32_t planes, const void* plane_list, const void* params);
 }  // namespace kl::gpu::present

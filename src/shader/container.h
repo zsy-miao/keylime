@@ -68,7 +68,15 @@ struct Program {
     std::vector<uint8_t> patched_code() const;
 };
 
+// A DXBC signature element (ISG1 / OSG1): semantic, register (row) and component mask.
+struct Signature {
+    std::string name;
+    uint32_t index = 0, system_value = 0, component_type = 0, reg = 0;
+    uint8_t mask = 0;
+};
+
 struct Container {
+    std::vector<Signature> inputs, outputs;
     uint32_t program_version = 0;  // kind << 16 | major << 4 | minor
     bool has_bitcode = false;
     std::vector<Program> programs;

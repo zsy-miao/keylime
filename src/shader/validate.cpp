@@ -47,7 +47,7 @@ Layout make_layout(VkDevice d) {
     ci.bindingCount = 3;
     ci.pBindings = binds;
     KL_VK_CHECK(vk::vkCreateDescriptorSetLayout(d, &ci, nullptr, &l.set));
-    VkPushConstantRange pc{VK_SHADER_STAGE_ALL, 0, 160};
+    VkPushConstantRange pc{VK_SHADER_STAGE_ALL, 0, 32};
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &l.set;

@@ -18,11 +18,44 @@ enum class Op : uint16_t {
     ExecuteIndirect, Write32, Write64, WaitValue, CopyMem, Resolve, ResolveQueries, Query, Discard, Count
 };
 
+// Payloads (shared by the recorders and the executor). `gfx` is 1 for graphics, 0 for compute.
+namespace cmd {
+struct Draw { uint32_t count, instances, first, first_instance; };
+struct DrawIndexed { uint32_t count, instances, first; int32_t base; uint32_t first_instance; };
+struct Dispatch { uint32_t x, y, z, flags; };
+struct CopyBuffer { uint64_t dst, src, len; };
+struct Write { uint64_t address, value; uint32_t bytes, flags; };
+struct ResolveQueries { uint64_t dst; uint32_t count; };
+struct Root { uint32_t gfx, slot; uint64_t value; };              // table handle / view address / root signature
+struct RootConstants { uint32_t gfx, slot, first, count; uint32_t values[64]; };
+struct IndexBuffer { uint64_t address; uint32_t size, format; };
+struct VertexView { uint64_t address; uint32_t size, stride; };
+struct VertexBuffers { uint32_t start, count; VertexView views[32]; };
+struct Targets { uint32_t count, single; uint64_t rtv[8]; uint64_t dsv; };
+struct ClearRtv { uint64_t handle; float color[4]; };
+struct ClearDsv { uint64_t handle; uint32_t flags; float depth; uint32_t stencil; };
+struct ClearUav { uint64_t gpu_handle, cpu_handle, resource; uint32_t values[4]; };
+// A D3D12_TEXTURE_COPY_LOCATION: resource, type (0 subresource, 1 placed footprint), then
+// subresource index or {offset, format, width, height, depth, row pitch}.
+struct CopyLocation {
+    void* resource;
+    uint32_t type, pad;
+    uint64_t offset;
+    uint32_t format, width, height, depth, row_pitch, pad2;
+};
+static_assert(sizeof(CopyLocation) == 48);
+struct CopyTexture { CopyLocation dst, src; uint32_t x, y, z, has_box; uint32_t box[6]; };
+struct CopyResource { void* dst; void* src; };
+struct Heaps { uint32_t count, pad; void* heaps[8]; };
+struct Viewports { uint32_t count, pad; float v[16][6]; };
+struct Scissors { uint32_t count, pad; int32_t r[16][4]; };
+}  // namespace cmd
+
 class Stream {
 public:
     void open(uint32_t kind) {
         kind_ = kind, bytes_.clear(), closed_ = false, commands_ = 0;
-        uploads_.clear();
+        for (auto& c : chunks_) c.used = 0;
     }
     void close() { closed_ = true; }
     bool closed() const { return closed_; }
@@ -50,7 +83,8 @@ public:
 
 private:
     std::vector<uint8_t> bytes_;
-    std::vector<std::unique_ptr<uint8_t[]>> uploads_;
+    struct Chunk { uint8_t* p; uint64_t size, used; };
+    std::vector<Chunk> chunks_;  // GPU-visible memory, kept across resets
     uint32_t kind_ = 0;
     size_t commands_ = 0;
     bool closed_ = false;
@@ -60,6 +94,7 @@ namespace list {
 Stream* stream_of(void* list);
 }
 namespace stream {
+// The number of commands of each kind recorded (diagnostics).
 // Fills the list table slots of every recorded command (older slot numbers; `newer` shifts them).
 void fill_list_methods(void** table, bool newer);
 // Carries out the commands that only touch memory, at submission.

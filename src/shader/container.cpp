@@ -186,6 +186,22 @@ bool parse(const uint8_t* data, size_t size, Container& out, std::string& err) {
         if (!c.u32(32 + 4 * i, off) || !c.u32(off + 4, len)) return err = "truncated part table", false;
         View part;
         if (!c.sub(uint64_t(off) + 8, len, part)) return err = "part out of bounds", false;
+        if (!memcmp(data + off, "ISG1", 4) || !memcmp(data + off, "OSG1", 4)) {
+            auto& sig = data[off] == 'I' ? out.inputs : out.outputs;
+            uint32_t n = 0;
+            part.u32(0, n);
+            for (uint32_t e = 0; e < n && e < 64; ++e) {
+                uint32_t w[8];
+                if (8 + 32 * (e + 1) > part.n) break;
+                memcpy(w, part.p + 8 + 32 * e, 32);
+                Signature s{};
+                s.index = w[2], s.system_value = w[3], s.component_type = w[4], s.reg = w[5];
+                s.mask = uint8_t(w[6] & 0xff);
+                for (size_t k = w[1]; k < part.n && part.p[k]; ++k) s.name.push_back(char(part.p[k]));
+                sig.push_back(std::move(s));
+            }
+            continue;
+        }
         if (memcmp(data + off, "DXIL", 4)) continue;
         part.u32(0, out.program_version);
         uint32_t bc_off, bc_len;
