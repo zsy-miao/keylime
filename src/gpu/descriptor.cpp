@@ -8,9 +8,14 @@
 // raw addresses -- no mirroring of title heaps into host heaps every frame.
 #include <windows.h>
 
+#include <algorithm>
+#include <cstring>
+
 #include "gpu/device.h"
 #include "gpu/descriptor.h"
 #include "gpu/fence.h"
+#include "gpu/resource.h"
+#include "gpu/texture.h"
 #include "log.h"
 
 namespace kl::gpu::descriptor {
@@ -80,10 +85,268 @@ HRESULT WINAPI create_heap(void*, const HeapDesc* d, const Iid* iid, void** out)
 
 uint32_t WINAPI increment_size(void*, uint32_t kind) { return increment(kind); }
 
+// ------------------------------------------------------------- views ----
+// Real RDNA 2 words (docs/rdna2-descriptors.md). Image FORMAT holds the DXGI
+// format for now (keylime-internal until the GFX10 IMG_FORMAT table lands).
+
+uint32_t dst_sel(uint32_t mapping, int c) {
+    // D3D12 4-component mapping: 3 bits per channel (0-3 = source channel, 4 = 0, 5 = 1);
+    // 0x1688 is the default identity.
+    uint32_t v = (mapping >> (3 * c)) & 7;
+    if (v <= 3) return 4 + v;
+    return v == 5 ? 1 : 0;
+}
+
+void buffer_words(uint32_t* w, uint64_t address, uint32_t stride, uint32_t records, uint32_t format) {
+    w[0] = uint32_t(address);
+    w[1] = uint32_t(address >> 32) & 0xffff;
+    w[1] |= (stride & 0x3fff) << 16;
+    w[2] = records;
+    w[3] = 4 | 5 << 3 | 6 << 6 | 7 << 9;  // xyzw
+    w[3] |= (format & 0x7f) << 12;
+    w[3] |= 1u << 24;  // RESOURCE_LEVEL (1 on GFX10)
+    w[3] |= 3u << 28;  // OOB_SELECT raw
+}
+
+// T# types.
+enum : uint32_t { T1D = 8, T2D = 9, T3D = 10, TCUBE = 11, T1DA = 12, T2DA = 13, T2DMS = 14, T2DMSA = 15 };
+
+void image_words(uint32_t* w, const resource::Info& r, uint32_t format, uint32_t type, uint32_t base_level,
+                 uint32_t levels, uint32_t base_array, uint32_t arrays, uint32_t mapping) {
+    memset(w, 0, 32);
+    texture::Layout l;
+    resource::texture_layout(r.desc, l);
+    uint32_t width = uint32_t(r.desc.width), height = r.desc.height;
+    uint32_t mips = r.desc.mip_levels ? r.desc.mip_levels : uint32_t(l.mips.size());
+    uint64_t a = r.address >> 8;
+    w[0] = uint32_t(a);
+    w[1] = uint32_t(a >> 32) & 0xff;
+    w[1] |= (format & 0x1ff) << 20;
+    w[1] |= ((width - 1) & 3) << 30;
+    w[2] = ((width - 1) >> 2) & 0xfff;
+    w[2] |= ((height - 1) & 0x3fff) << 14;
+    w[2] |= 1u << 31;
+    for (int c = 0; c < 4; ++c) w[3] |= dst_sel(mapping, c) << (3 * c);
+    if (levels == ~0u || base_level + levels > mips) levels = mips - base_level;
+    w[3] |= (base_level & 0xf) << 12;
+    w[3] |= ((base_level + levels - 1) & 0xf) << 16;
+    uint32_t sw = r.desc.layout == 1 ? 0 : (r.desc.layout & ~0xffu) == 0x100 ? (r.desc.layout & 0xff)
+                : texture::default_swizzle(r.desc.dimension == resource::TEX1D ? texture::Dim::Tex1d
+                                            : r.desc.dimension == resource::TEX3D ? texture::Dim::Tex3d : texture::Dim::Tex2d,
+                                            r.desc.flags & resource::FLAG_DEPTH, r.desc.flags & resource::FLAG_RENDER_TARGET);
+    w[3] |= (sw & 0x1f) << 20;
+    w[3] |= (type & 0xf) << 28;
+    uint32_t depth = r.desc.dimension == resource::TEX3D ? r.desc.depth_or_array : (arrays ? arrays : r.desc.depth_or_array);
+    w[4] = (depth - 1) & 0x1fff;
+    w[4] |= (base_array & 0x1fff) << 16;
+    w[5] = ((mips - 1) & 0xf) << 4;  // MAX_MIP
+}
+
+struct CbvDesc { uint64_t location; uint32_t size; uint32_t pad; };
+void WINAPI create_cbv(void*, const CbvDesc* d, uint64_t handle) {
+    if (!handle || !d) return;
+    auto* w = reinterpret_cast<uint32_t*>(handle);
+    memset(w, 0, 32);
+    buffer_words(w, d->location, 0, d->size, 0);
+}
+
+struct SrvDesc {
+    uint32_t format, dim, mapping, pad;
+    union {
+        struct { uint64_t first; uint32_t count, stride, flags; } buffer;
+        struct { uint32_t most_detailed, levels, first_array, array_size, plane; float min_lod; } tex;
+    };
+};
+static_assert(sizeof(SrvDesc) == 40);
+
+void WINAPI create_srv(void*, void* res, const SrvDesc* d, uint64_t handle) {
+    if (!handle) return;
+    auto* w = reinterpret_cast<uint32_t*>(handle);
+    memset(w, 0, 32);
+    resource::Info r;
+    if (!res) return;  // null view: all zero reads zero
+    if (!resource::info(res, r)) return;
+    if (r.desc.dimension == resource::BUFFER) {
+        uint32_t stride = d ? d->buffer.stride : 0;
+        uint64_t first = d ? d->buffer.first : 0;
+        uint32_t count = d ? d->buffer.count : uint32_t(r.desc.width);
+        uint32_t esize = stride ? stride : 4;
+        buffer_words(w, r.address + first * esize, stride, stride ? count : count * 4, 0);
+        return;
+    }
+    uint32_t format = d && d->format ? d->format : r.desc.format;
+    uint32_t mapping = d ? d->mapping : 0x1688;
+    uint32_t type = T2D, bl = 0, lv = ~0u, ba = 0, as = 0;
+    if (d) {
+        switch (d->dim) {
+            case 2: type = T1D; bl = d->tex.most_detailed; lv = d->tex.levels; break;
+            case 3: type = T1DA; bl = d->tex.most_detailed; lv = d->tex.levels; ba = d->tex.first_array; as = d->tex.array_size; break;
+            case 4: type = T2D; bl = d->tex.most_detailed; lv = d->tex.levels; break;
+            case 5: type = T2DA; bl = d->tex.most_detailed; lv = d->tex.levels; ba = d->tex.first_array; as = d->tex.array_size; break;
+            case 6: type = T2DMS; break;
+            case 7: type = T2DMSA; ba = d->tex.most_detailed; as = d->tex.levels; break;
+            case 8: type = T3D; bl = d->tex.most_detailed; lv = d->tex.levels; break;
+            case 9: type = TCUBE; bl = d->tex.most_detailed; lv = d->tex.levels; break;
+            case 10: type = TCUBE; bl = d->tex.most_detailed; lv = d->tex.levels; ba = d->tex.first_array; as = d->tex.array_size * 6; break;
+            default: break;
+        }
+    } else {
+        type = r.desc.dimension == resource::TEX1D ? T1D : r.desc.dimension == resource::TEX3D ? T3D
+             : r.desc.depth_or_array > 1 ? T2DA : r.desc.sample_count > 1 ? T2DMS : T2D;
+    }
+    image_words(w, r, format, type, bl, lv, ba, as, mapping);
+}
+
+struct UavDesc {
+    uint32_t format, dim;
+    union {
+        struct { uint64_t first; uint32_t count, stride; uint64_t counter_offset; uint32_t flags; } buffer;
+        struct { uint32_t mip, first_array, array_size, plane; } tex;
+    };
+};
+static_assert(sizeof(UavDesc) == 40);
+
+void WINAPI create_uav(void*, void* res, void*, const UavDesc* d, uint64_t handle) {
+    if (!handle) return;
+    auto* w = reinterpret_cast<uint32_t*>(handle);
+    memset(w, 0, 32);
+    resource::Info r;
+    if (!res || !resource::info(res, r)) return;
+    if (r.desc.dimension == resource::BUFFER) {
+        uint32_t stride = d ? d->buffer.stride : 0;
+        uint64_t first = d ? d->buffer.first : 0;
+        uint32_t count = d ? d->buffer.count : uint32_t(r.desc.width / 4);
+        uint32_t esize = stride ? stride : 4;
+        buffer_words(w, r.address + first * esize, stride, stride ? count : count * 4, 0);
+        return;
+    }
+    uint32_t format = d && d->format ? d->format : r.desc.format;
+    uint32_t type = T2D, mip = 0, ba = 0, as = 0;
+    if (d) {
+        mip = d->tex.mip;
+        switch (d->dim) {
+            case 2: type = T1D; break;
+            case 3: type = T1DA; ba = d->tex.first_array; as = d->tex.array_size; break;
+            case 4: type = T2D; break;
+            case 5: type = T2DA; ba = d->tex.first_array; as = d->tex.array_size; break;
+            case 8: type = T3D; break;
+        }
+    }
+    image_words(w, r, format, type, mip, 1, ba, as, 0x1688);
+}
+
+// Views of memory the title placed itself (no resource object): (resource desc, view desc, handle).
+void WINAPI create_placed_view(void*, const resource::ResourceDesc* rd, const void* vd, uint64_t handle, bool uav) {
+    if (!handle || !rd) return;
+    // The address is in the view description's trailing words (as VIctory found: 16 words).
+    const uint32_t* v = static_cast<const uint32_t*>(vd);
+    resource::Info r{};
+    r.desc = *rd;
+    memcpy(&r.address, v + 14, 8);
+    auto* w = reinterpret_cast<uint32_t*>(handle);
+    if (rd->dimension == resource::BUFFER) {
+        memset(w, 0, 32);
+        buffer_words(w, r.address, 0, uint32_t(rd->width), 0);
+        return;
+    }
+    uint32_t type = rd->dimension == resource::TEX1D ? T1D : rd->dimension == resource::TEX3D ? T3D
+                  : rd->depth_or_array > 1 ? T2DA : T2D;
+    image_words(w, r, v[0] ? v[0] : rd->format, type, 0, uav ? 1 : ~0u, 0, 0, 0x1688);
+}
+void WINAPI create_placed_srv(void* d, const resource::ResourceDesc* rd, const void* vd, uint64_t h) { create_placed_view(d, rd, vd, h, false); }
+void WINAPI create_placed_uav(void* d, const resource::ResourceDesc* rd, const void* vd, uint64_t h) { create_placed_view(d, rd, vd, h, true); }
+
+// Samplers: D3D12_SAMPLER_DESC -> S#.
+struct SamplerDesc {
+    uint32_t filter, u, v, w;
+    float bias;
+    uint32_t aniso, compare;
+    float border[4], min_lod, max_lod;
+};
+uint32_t clamp_mode(uint32_t a) {  // D3D 1 wrap 2 mirror 3 clamp 4 border 5 mirror once -> SQ_TEX_*
+    switch (a) { case 1: return 0; case 2: return 1; case 3: return 2; case 4: return 6; case 5: return 3; default: return 0; }
+}
+uint32_t lod_fixed(float f) { float c = f < 0 ? 0 : f > 15.99f ? 15.99f : f; return uint32_t(c * 256.0f) & 0xfff; }
+void sampler_words(uint32_t* w, const SamplerDesc& d) {
+    memset(w, 0, 16);
+    bool aniso = (d.filter & 0x40) != 0, cmp = (d.filter & 0x80) != 0;
+    uint32_t mip = (d.filter >> 0) & 1, mag = (d.filter >> 2) & 1, min = (d.filter >> 4) & 1;
+    uint32_t ratio = 0;
+    for (uint32_t a = d.aniso; a > 1 && ratio < 4; a >>= 1) ++ratio;
+    w[0] = clamp_mode(d.u) | clamp_mode(d.v) << 3 | clamp_mode(d.w) << 6;
+    if (aniso) w[0] |= ratio << 9;
+    if (cmp) w[0] |= (d.compare ? (d.compare - 1) & 7 : 0) << 12;
+    w[0] |= 1u << 27;  // TRUNC_COORD as D3D
+    w[1] = lod_fixed(d.min_lod) | lod_fixed(d.max_lod) << 12;
+    int bias = int(d.bias * 256.0f);
+    w[2] = uint32_t(bias) & 0x3fff;
+    w[2] |= (aniso ? 2u : mag) << 20 | (aniso ? 2u : min) << 22 | (mip + 1) << 26;
+    // Border: transparent black / opaque black / opaque white.
+    bool white = d.border[0] == 1 && d.border[3] == 1;
+    bool opaque = d.border[3] == 1;
+    w[3] = (white ? 2u : opaque ? 1u : 0u) << 30;
+}
+void WINAPI create_sampler(void*, const SamplerDesc* d, uint64_t handle) {
+    if (handle && d) sampler_words(reinterpret_cast<uint32_t*>(handle), *d);
+}
+// The console's own sampler description (27 words): leading words as the PC layout for now.
+void WINAPI create_sampler_x(void* dev, const SamplerDesc* d, uint64_t handle) {
+    static bool once = false;
+    if (!once) once = true, KL_WARN("gpu", "console sampler descriptions read as PC ones (layout not verified)");
+    create_sampler(dev, d, handle);
+}
+
+// Render target / depth views: ours alone (128-byte slots): tag, resource, view description.
+struct TargetRecord {
+    uint32_t tag, described;
+    void* resource;
+    uint32_t desc[6];
+};
+constexpr uint32_t RTV_TAG = 0x56545276, DSV_TAG = 0x56534476;  // "vRTV", "vDSV"
+void target(void* res, const uint32_t* d, uint64_t handle, uint32_t tag) {
+    if (!handle) return;
+    TargetRecord t{tag, d ? 1u : 0u, res, {}};
+    if (d) memcpy(t.desc, d, sizeof t.desc);
+    memcpy(reinterpret_cast<void*>(handle), &t, sizeof t);
+}
+void WINAPI create_rtv(void*, void* res, const uint32_t* d, uint64_t handle) { target(res, d, handle, RTV_TAG); }
+void WINAPI create_dsv(void*, void* res, const uint32_t* d, uint64_t handle) { target(res, d, handle, DSV_TAG); }
+
+// Copies: descriptors are bytes, as on the console.
+void WINAPI copy_simple(void*, uint32_t count, uint64_t dst, uint64_t src, uint32_t kind) {
+    if (dst && src) memmove(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), size_t(count) * increment(kind));
+}
+void WINAPI copy(void*, uint32_t dn, const uint64_t* ds, const uint32_t* dsz, uint32_t sn, const uint64_t* ss,
+                 const uint32_t* ssz, uint32_t kind) {
+    uint32_t step = increment(kind);
+    if (!step || !ds || !ss) return;
+    uint32_t di = 0, si = 0, doff = 0, soff = 0;
+    while (di < dn && si < sn) {
+        uint32_t dc = dsz ? dsz[di] : 1, sc = ssz ? ssz[si] : 1;
+        uint32_t n = std::min(dc - doff, sc - soff);
+        memmove(reinterpret_cast<void*>(ds[di] + uint64_t(doff) * step), reinterpret_cast<void*>(ss[si] + uint64_t(soff) * step), size_t(n) * step);
+        doff += n, soff += n;
+        if (doff == dc) ++di, doff = 0;
+        if (soff == sc) ++si, soff = 0;
+    }
+}
+
+
 struct Init {
     Init() {
         device_set(14, (void*)&create_heap);     // 0x70
         device_set(15, (void*)&increment_size);  // 0x78
+        device_set(17, (void*)&create_cbv);      // 0x88
+        device_set(18, (void*)&create_srv);      // 0x90
+        device_set(19, (void*)&create_uav);      // 0x98
+        device_set(20, (void*)&create_rtv);      // 0xa0
+        device_set(21, (void*)&create_dsv);      // 0xa8
+        device_set(22, (void*)&create_sampler);  // 0xb0
+        device_set(23, (void*)&copy);            // 0xb8
+        device_set(24, (void*)&copy_simple);     // 0xc0
+        device_set(61, (void*)&create_sampler_x);   // 0x1e8
+        device_set(70, (void*)&create_placed_srv);  // 0x230
+        device_set(71, (void*)&create_placed_uav);  // 0x238
     }
 } g_init;
 

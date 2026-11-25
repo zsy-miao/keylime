@@ -18,6 +18,7 @@
 #include "hle/hle.h"
 #include "hle/xmem.h"
 #include "log.h"
+#include "stats.h"
 #include "miniz.h"
 
 namespace kl::dstorage {
@@ -264,6 +265,9 @@ void worker() {
         uint64_t lane_id = pick->id;
         g.unlock();
         HRESULT hr = execute(c.req);
+        stats::add(stats::StorageRequests);
+        stats::add(stats::StorageBytes, c.req.destination_size);
+        if (FAILED(hr)) stats::add(stats::StorageFailures);
         ++s.requests;
         s.bytes += c.req.destination_size;
         if (FAILED(hr) && s.failures++ < 16)
@@ -405,7 +409,8 @@ HRESULT WINAPI open_file(void*, const wchar_t* path, const GUID* iid, void** out
         KL_WARN("dstorage", "opening %ls failed: %lu", path, e);
         return from_win32(e);
     }
-    KL_INFO("dstorage", "file opened %ls", path);
+    KL_TRACE("dstorage", "file opened %ls", path);
+    stats::add(stats::FilesOpened);
     auto* f = new Instance<File>{{kFile, "dstorage file", {1}}, {h}};
     (void)iid;
     return put(out, f);

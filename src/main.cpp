@@ -12,12 +12,14 @@
 #include "hle/hle.h"
 #include "loader.h"
 #include "log.h"
+#include "stats.h"
 #include "runtime.h"
 
 namespace fs = std::filesystem;
 
 namespace kl {
 
+namespace cpu { void install(); }
 static Runtime g_runtime;
 Runtime& runtime() { return g_runtime; }
 
@@ -62,7 +64,8 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
     if (VirtualQuery(sp, &mbi, sizeof mbi)) {
         auto* end = reinterpret_cast<const uintptr_t*>(static_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize);
         for (int i = 0; i < 2048 && sp + i < end && shown < 12; ++i)
-            if (loader().find(sp[i])) {
+            if (loader().find(sp[i]) || (sp[i] >= uintptr_t(GetModuleHandleW(nullptr)) &&
+                                         sp[i] < uintptr_t(GetModuleHandleW(nullptr)) + (32u << 20))) {
                 KL_ERROR("crash", "  stack[%d] %s", i, describe(sp[i]).c_str());
                 ++shown;
             }
@@ -110,6 +113,8 @@ static int run(const fs::path& exe, bool execute, bool list_only) {
         return 0;
     }
     AddVectoredExceptionHandler(1, on_exception);
+    cpu::install();  // first: AMD-only instructions are emulated before any report
+    stats::start();
     uint32_t code = l.run_main();
     KL_INFO("main", "title exited with %u", code);
     return int(code);

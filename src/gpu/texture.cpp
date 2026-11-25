@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 
 #include "addrinterface.h"
@@ -95,25 +96,13 @@ uint32_t default_swizzle(Dim dim, bool depth, bool rt) {
     return ADDR_SW_4KB_S;
 }
 
-bool layout(const Desc& d, Layout& out) {
-    ADDR_HANDLE h = handle();
-    if (!h) return false;
-    uint32_t bytes, block;
-    if (!element(d.format, bytes, block)) return false;
-    out = {};
-    out.bytes_per_element = bytes;
-    out.block = block;
-    uint32_t mips = d.mips ? d.mips : full_mip_count(d.width, d.height, d.dim == Dim::Tex3d ? d.depth_or_array : 1);
-
-    ADDR2_COMPUTE_SURFACE_INFO_INPUT in{};
-    ADDR2_COMPUTE_SURFACE_INFO_OUTPUT o{};
-    std::vector<ADDR2_MIP_INFO> mi(mips);
+namespace {
+void fill_input(const Desc& d, uint32_t bytes, uint32_t block, uint32_t mips, ADDR2_COMPUTE_SURFACE_INFO_INPUT& in) {
+    in = {};
     in.size = sizeof in;
-    o.size = sizeof o;
-    o.pMipInfo = mi.data();
     in.resourceType = d.dim == Dim::Tex1d ? ADDR_RSRC_TEX_1D : d.dim == Dim::Tex3d ? ADDR_RSRC_TEX_3D : ADDR_RSRC_TEX_2D;
     in.swizzleMode = AddrSwizzleMode(d.swizzle);
-    // Block formats: addrlib works in elements; pass the element size and block-divided dims.
+    // Block formats are given in elements (one element = one 4x4 block).
     in.bpp = bytes == 3 ? 24 : bytes * 8;
     in.format = ADDR_FMT_INVALID;
     in.width = (d.width + block - 1) / block;
@@ -123,20 +112,145 @@ bool layout(const Desc& d, Layout& out) {
     in.numSamples = d.samples ? d.samples : 1;
     in.numFrags = in.numSamples;
     in.flags.texture = 1;
-    in.flags.view3dAs2dArray = 0;
+}
+}  // namespace
+
+// Depth-stencil formats as the console stores them: depth plane element size, and whether a
+// stencil plane follows (D32S8 family 19-22, D24S8 family 44-47 as 32-bit depth, D16S8 118-120).
+static bool depth_stencil(uint32_t f, uint32_t& depth_bytes) {
+    if (f >= 19 && f <= 22) return depth_bytes = 4, true;
+    if (f >= 44 && f <= 47) return depth_bytes = 4, true;
+    if (f >= 118 && f <= 120) return depth_bytes = 2, true;
+    return false;
+}
+
+static bool layout_plane(const Desc& d, Layout& out);
+
+bool layout(const Desc& d, Layout& out) {
+    uint32_t db;
+    if (!depth_stencil(d.format, db)) return layout_plane(d, out);
+    Desc depth = d;
+    depth.format = db == 4 ? 41 /* R32_FLOAT */ : 56 /* R16_UNORM */;
+    if (!layout_plane(depth, out)) return false;
+    Desc stencil = d;
+    stencil.format = 62;  // R8_UINT
+    Layout s;
+    if (!layout_plane(stencil, s)) return false;
+    uint64_t a = s.alignment > out.alignment ? s.alignment : out.alignment;
+    out.desc.format = d.format;
+    out.has_stencil = true;
+    out.stencil_offset = (out.size + s.alignment - 1) & ~(s.alignment - 1);
+    out.stencil_size = s.size;
+    out.size = out.stencil_offset + s.size;
+    out.size = (out.size + a - 1) & ~(a - 1);
+    out.alignment = a;
+    return true;
+}
+
+static bool layout_plane(const Desc& d, Layout& out) {
+    ADDR_HANDLE h = handle();
+    if (!h) return false;
+    uint32_t bytes, block;
+    if (!element(d.format, bytes, block)) return false;
+    out = {};
+    out.desc = d;
+    out.bytes_per_element = bytes;
+    out.block = block;
+    uint32_t mips = d.mips ? d.mips : full_mip_count(d.width, d.height, d.dim == Dim::Tex3d ? d.depth_or_array : 1);
+    out.desc.mips = mips;
+    ADDR2_COMPUTE_SURFACE_INFO_INPUT in;
+    fill_input(d, bytes, block, mips, in);
+    ADDR2_COMPUTE_SURFACE_INFO_OUTPUT o{};
+    std::vector<ADDR2_MIP_INFO> mi(mips);
+    o.size = sizeof o;
+    o.pMipInfo = mi.data();
     if (Addr2ComputeSurfaceInfo(h, &in, &o) != ADDR_OK) return false;
     out.size = o.surfSize;
     out.alignment = o.baseAlign;
     out.slice_size = o.sliceSize;
+    out.block_w = o.blockWidth;
+    out.block_h = o.blockHeight;
+    out.block_d = o.blockSlices ? o.blockSlices : 1;
+    out.slices = in.numSlices;
+    out.swizzle = d.swizzle;
+    out.thick = d.dim == Dim::Tex3d && out.block_d > 1;
+    out.first_tail_mip = o.mipChainInTail ? 0 : (o.firstMipIdInTail < mips ? o.firstMipIdInTail : mips);
     out.mips.resize(mips);
     for (uint32_t i = 0; i < mips; ++i) {
-        out.mips[i].offset = mi[i].offset;
-        out.mips[i].pitch = mi[i].pitch;
-        out.mips[i].height = mi[i].height;
-        out.mips[i].depth = mi[i].depth;
-        out.mips[i].in_tail = o.mipChainInTail || (o.firstMipIdInTail <= i);
+        auto& m = out.mips[i];
+        m.offset = mi[i].offset;
+        m.pitch = mi[i].pitch;
+        m.height = mi[i].height;
+        m.depth = mi[i].depth;
+        m.width_e = std::max(1u, in.width >> i);
+        m.height_e = std::max(1u, in.height >> i);
+        m.in_tail = i >= out.first_tail_mip;
+        m.tail_offset = mi[i].mipTailOffset;
+        m.tail_x = mi[i].mipTailCoordX;
+        m.tail_y = mi[i].mipTailCoordY;
+        m.tail_z = mi[i].mipTailCoordZ;
     }
     return true;
 }
 
+static bool copy(const Layout& l, void* surface, uint32_t mip, uint32_t slice, void* linear, uint64_t row,
+                 uint64_t depth_pitch, bool to_surface) {
+    ADDR_HANDLE h = handle();
+    if (!h || mip >= l.mips.size()) return false;
+    ADDR2_COPY_MEMSURFACE_INPUT in{};
+    in.size = sizeof in;
+    in.swizzleMode = AddrSwizzleMode(l.swizzle);
+    in.format = ADDR_FMT_INVALID;
+    in.flags.texture = 1;
+    in.resourceType = l.desc.dim == Dim::Tex1d ? ADDR_RSRC_TEX_1D : l.desc.dim == Dim::Tex3d ? ADDR_RSRC_TEX_3D : ADDR_RSRC_TEX_2D;
+    in.bpp = l.bytes_per_element == 3 ? 24 : l.bytes_per_element * 8;
+    in.unAlignedDims = {(l.desc.width + l.block - 1) / l.block,
+                        l.desc.dim == Dim::Tex1d ? 1u : (l.desc.height + l.block - 1) / l.block,
+                        l.desc.depth_or_array ? l.desc.depth_or_array : 1u};
+    in.numMipLevels = uint32_t(l.mips.size());
+    in.numSamples = l.desc.samples ? l.desc.samples : 1;
+    in.pitchInElement = l.mips[0].pitch;
+    in.pMappedSurface = surface;
+    ADDR2_COPY_MEMSURFACE_REGION r{};
+    r.size = sizeof r;
+    r.mipId = mip;
+    r.slice = slice;
+    const auto& m = l.mips[mip];
+    uint32_t depth = l.desc.dim == Dim::Tex3d ? std::max(1u, l.desc.depth_or_array >> mip) : 1;
+    r.copyDims = {m.width_e, m.height_e, depth};
+    r.pMem = linear;
+    r.memRowPitch = row;
+    r.memSlicePitch = depth_pitch;
+    auto rc = to_surface ? Addr2CopyMemToSurface(h, &in, &r, 1) : Addr2CopySurfaceToMem(h, &in, &r, 1);
+    return rc == ADDR_OK;
+}
+
+bool tile(const Layout& l, void* surface, uint32_t mip, uint32_t slice, const void* linear, uint64_t row, uint64_t dp) {
+    return copy(l, surface, mip, slice, const_cast<void*>(linear), row, dp, true);
+}
+bool detile(const Layout& l, const void* surface, uint32_t mip, uint32_t slice, void* linear, uint64_t row, uint64_t dp) {
+    return copy(l, const_cast<void*>(surface), mip, slice, linear, row, dp, false);
+}
+
+bool element_offset(const Layout& l, uint32_t mip, uint32_t x, uint32_t y, uint32_t z, uint64_t& out) {
+    ADDR_HANDLE h = handle();
+    if (!h || mip >= l.mips.size()) return false;
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT in{};
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT o{};
+    in.size = sizeof in;
+    o.size = sizeof o;
+    in.x = x, in.y = y, in.slice = z, in.mipId = mip;
+    in.swizzleMode = AddrSwizzleMode(l.swizzle);
+    in.flags.texture = 1;
+    in.resourceType = l.desc.dim == Dim::Tex1d ? ADDR_RSRC_TEX_1D : l.desc.dim == Dim::Tex3d ? ADDR_RSRC_TEX_3D : ADDR_RSRC_TEX_2D;
+    in.bpp = l.bytes_per_element * 8;
+    in.unalignedWidth = (l.desc.width + l.block - 1) / l.block;
+    in.unalignedHeight = (l.desc.height + l.block - 1) / l.block;
+    in.numSlices = l.desc.depth_or_array ? l.desc.depth_or_array : 1;
+    in.numMipLevels = uint32_t(l.mips.size());
+    in.numSamples = in.numFrags = l.desc.samples ? l.desc.samples : 1;
+    if (Addr2ComputeSurfaceAddrFromCoord(h, &in, &o) != ADDR_OK) return false;
+    out = o.addr;
+    return true;
+}
 }  // namespace kl::gpu::texture

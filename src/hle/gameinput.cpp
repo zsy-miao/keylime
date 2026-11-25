@@ -17,6 +17,7 @@
 
 #include "hle/hle.h"
 #include "log.h"
+#include "stats.h"
 
 #pragma comment(lib, "xinput.lib")
 
@@ -304,6 +305,7 @@ uint32_t WINAPI add_ref(void*) { return 1; }
 uint64_t WINAPI timestamp(Object*) { return now_us(); }
 
 HRESULT WINAPI current_reading(Object* o, uint32_t kind, const Device* d, Out out) {
+    stats::add(stats::InputReadings);
     Hub* h = hub_of(o);
     std::lock_guard g(h->lock);
     auto newest = [&](size_t i) -> Reading* {

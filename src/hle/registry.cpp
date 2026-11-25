@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "log.h"
+#include "stats.h"
 
 namespace kl::hle {
 
@@ -107,6 +108,7 @@ struct Site {
 };
 
 extern "C" uint64_t kl_unimplemented(Site* site) {
+    stats::add(stats::Stubs);
     uint64_t n = ++site->calls;
     if (n <= 3 || (n & (n - 1)) == 0)
         KL_WARN("stub", "unimplemented %s!%s (call %llu) -> 0", site->dll.c_str(), site->symbol.c_str(),

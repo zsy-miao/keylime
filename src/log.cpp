@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
 namespace kl {
@@ -11,6 +12,7 @@ std::mutex g_lock;
 FILE* g_file = nullptr;
 LARGE_INTEGER g_start{}, g_freq{};
 bool g_trace = false;
+bool g_color = false;
 }  // namespace
 
 void log_open(const wchar_t* path) {
@@ -19,6 +21,10 @@ void log_open(const wchar_t* path) {
     char v[8]{};
     g_trace = GetEnvironmentVariableA("KEYLIME_TRACE", v, sizeof v) > 0 && v[0] != '0';
     if (path) _wfopen_s(&g_file, path, L"w");
+    // Colors in a real console (ANSI escape codes).
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (GetConsoleMode(out, &mode) && SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) g_color = true;
 }
 
 bool trace_enabled() { return g_trace; }
@@ -38,7 +44,16 @@ void logf(Level level, const char* area, const char* fmt, ...) {
     int n = snprintf(line, sizeof line, "%9.3f %s [%5lu] %-8s %s\n", t, names[int(level)],
                      GetCurrentThreadId(), area, msg);
     if (n > 0) {
-        fwrite(line, 1, size_t(n), stdout);
+        if (g_color) {
+            static const char* colors[] = {"[90m", "[0m", "[33m", "[91m"};
+            const char* c = strcmp(area, "status") == 0 ? "[96m" : strcmp(area, "title") == 0 ? "[92m" : colors[int(level)];
+            fputs(c, stdout);
+            fwrite(line, 1, size_t(n), stdout);
+            fputs("[0m", stdout);
+        } else {
+            fwrite(line, 1, size_t(n), stdout);
+        }
+        fflush(stdout);
         if (g_file) {
             fwrite(line, 1, size_t(n), g_file);
             if (level >= Level::Warn) fflush(g_file);

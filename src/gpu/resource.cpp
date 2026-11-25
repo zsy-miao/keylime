@@ -13,6 +13,7 @@
 #include "gpu/fence.h"
 #include "hle/xmem.h"
 #include "log.h"
+#include "stats.h"
 
 namespace kl::gpu::resource {
 namespace {
@@ -126,6 +127,7 @@ HRESULT WINAPI resource_query(Resource* r, const Iid* iid, void** out) {
 
 HRESULT hand_out(const ResourceDesc& d, const HeapProperties& heap, uint32_t heap_flags, Backing b, uint8_t* data,
                  Heap* in, uint64_t attributes, const Iid* iid, void** out) {
+    stats::add(stats::Resources);
     auto* r = new Resource{{resource_table(), 0, {0}}, d, heap, heap_flags, b, data, in, attributes};
     {
         std::lock_guard g(g_lock);
@@ -159,6 +161,13 @@ HRESULT WINAPI create_placed(void*, Heap* heap, uint64_t offset, const ResourceD
     }
     ++heap->object.refs;
     return hand_out(*d, heap->desc.properties, heap->desc.flags, Backing::Placed, heap->memory + offset, heap, 0, iid, out);
+}
+
+// Device 0x3f8: enhanced-barrier committed creation (heap, flags, desc1, layout, clear, protected
+// session, castable count, castable formats, iid, out); the title's back buffers come this way.
+HRESULT WINAPI create_committed3(void* dev, const HeapProperties* heap, uint32_t flags, const ResourceDesc* d, uint32_t,
+                                 const void* clear, void*, uint32_t, const uint32_t*, const Iid* iid, void** out) {
+    return create_committed(dev, heap, flags, d, 0, clear, iid, out);
 }
 
 // Device 0x428 (Device9..11 addition): a resource at a virtual address the title mapped
@@ -299,6 +308,7 @@ struct Init {
         device_set(75, (void*)&unregister_page_pool);    // 0x258
         device_set(76, (void*)&create_committed);        // 0x260 CreateCommittedResourceX (PC desc + DCC options)
         device_set(108, (void*)&allocation_info2);       // 0x360
+        device_set(127, (void*)&create_committed3);      // 0x3f8
         device_set(133, (void*)&create_at_address);      // 0x428
     }
 } g_init;

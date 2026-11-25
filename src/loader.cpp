@@ -4,6 +4,10 @@
 #include <atomic>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 
 #include "hle/hle.h"
 #include "log.h"
@@ -397,6 +401,29 @@ uint32_t Loader::run_main() {
     return code;
 }
 
+// Our own code: function and line from keylime.pdb.
+static std::string symbol(uintptr_t a) {
+    static std::once_flag once;
+    static bool ok = false;
+    std::call_once(once, [] {
+        SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        ok = SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    });
+    if (!ok) return {};
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
+    auto* si = reinterpret_cast<SYMBOL_INFO*>(buf);
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = 255;
+    DWORD64 disp = 0;
+    if (!SymFromAddr(GetCurrentProcess(), a, &disp, si)) return {};
+    std::string out = std::string(" ") + si->Name;
+    IMAGEHLP_LINE64 line{sizeof line};
+    DWORD d32 = 0;
+    if (SymGetLineFromAddr64(GetCurrentProcess(), a, &d32, &line))
+        out += " (" + fs::path(line.FileName).filename().string() + ":" + std::to_string(line.LineNumber) + ")";
+    return out;
+}
+
 std::string describe(uintptr_t a) {
     char buf[160];
     if (g_loader)
@@ -411,6 +438,7 @@ std::string describe(uintptr_t a) {
         GetModuleFileNameW(m, path, MAX_PATH);
         snprintf(buf, sizeof buf, "%ls+0x%llx", fs::path(path).filename().c_str(),
                  (unsigned long long)(a - reinterpret_cast<uintptr_t>(m)));
+        if (m == GetModuleHandleW(nullptr)) return buf + symbol(a);
         return buf;
     }
     snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)a);

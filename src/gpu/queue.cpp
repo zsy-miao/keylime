@@ -16,7 +16,9 @@
 #include "gpu/host.h"
 #include "gpu/list.h"
 #include "gpu/present.h"
+#include "gpu/stream.h"
 #include "log.h"
+#include "stats.h"
 
 namespace kl::gpu::queue {
 namespace {
@@ -81,8 +83,12 @@ void submit(Queue* q, const std::vector<VkCommandBuffer>& cbs, VkSemaphore wait,
 void WINAPI execute(Queue* q, uint32_t count, void* const* lists) {
     if (!lists) return;
     std::vector<VkCommandBuffer> cbs;
-    for (uint32_t i = 0; i < count; ++i)
+    stats::add(stats::Submits);
+    stats::add(stats::Lists, count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (Stream* s = list::stream_of(lists[i])) stream::run_cpu_side(*s);
         if (VkCommandBuffer cb = list::close_for_submit(lists[i])) cbs.push_back(cb);
+    }
     if (!cbs.empty()) submit(q, cbs, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, 0);
     for (uint32_t i = 0; i < count; ++i) list::submitted(lists[i], q->host->q);
 }
