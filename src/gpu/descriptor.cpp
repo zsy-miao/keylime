@@ -91,6 +91,7 @@ HRESULT WINAPI create_heap(void*, const HeapDesc* d, const Iid* iid, void** out)
         h->start = uint64_t(m);
     }
     if (h->start >> 32) KL_WARN("gpu", "descriptor heap at %llx is above 4 GiB: shaders cannot reach it", (unsigned long long)h->start);
+    memory::own(h->start, size);
     memory::ensure(h->start, size);
     KL_TRACE("gpu", "descriptor heap: type %u, %u descriptors, flags %u, %s at %llx", d->kind, d->count, d->flags,
              placed ? "title memory" : "ours", (unsigned long long)h->start);
@@ -158,15 +159,17 @@ void image_words(uint32_t* w, const resource::Info& r, uint32_t format, uint32_t
 
 // A buffer view's V#: structured (stride), raw (byte-addressed, stride 0) or typed (element size).
 void buffer_view(uint32_t* w, uint64_t address, uint32_t format, uint64_t first, uint32_t count, uint32_t stride, bool raw) {
+    uint32_t bytes = 4, block = 1;
     if (stride) {
         buffer_words(w, address + first * stride, stride, count, 0);
+        bytes = stride;
     } else if (raw || !format) {
         buffer_words(w, address + first * 4, 0, count * 4, 0);
     } else {
-        uint32_t bytes = 4, block = 1;
         texture::element(format, bytes, block);
         buffer_words(w, address + first * bytes, bytes, count, format);
     }
+    memory::own(address + first * bytes, uint64_t(count) * bytes, false);
     memory::ensure(address + first * (stride ? stride : 4), 1);
 }
 
@@ -177,6 +180,7 @@ void WINAPI create_cbv(void*, const CbvDesc* d, uint64_t handle) {
     memset(w, 0, 32);
     // Constant buffers are 16-byte rows (shaders index them as structured buffers of float4).
     buffer_words(w, d->location, 16, (d->size + 15) / 16, 0);
+    memory::own(d->location, d->size, false);
     memory::ensure(d->location, d->size ? d->size : 1);
 }
 

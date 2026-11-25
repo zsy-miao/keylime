@@ -593,6 +593,7 @@ VkShaderModule make_module(const shader::Translation& t) {
 VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64_t hash, shader::Translation& t) {
     std::string err;
     uint64_t key = module_key(p, o, hash);
+    memory::name_shader(shader::code_id(p), hash, p.stage == shader::HwStage::Ps ? 1 : p.stage == shader::HwStage::Cs ? 2 : 0);
     if (load_spirv(key, t)) {
         stats::add(stats::ShadersCached);
         return make_module(t);

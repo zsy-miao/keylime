@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 
@@ -70,9 +71,14 @@ void WINAPI dispatch_mesh(void* l, uint32_t x, uint32_t y, uint32_t z) {
     if (auto* s = S(l)) s->add(Op::DispatchMesh, Dispatch{x, y, z, 0});
     stats::add(stats::Draws);
 }
-void WINAPI dispatch_mesh_x(void* l, uint32_t x, uint32_t y, uint32_t z, uint32_t f) {
-    if (auto* s = S(l)) s->add(Op::DispatchMesh, Dispatch{x, y, z, f});
+void WINAPI dispatch_mesh_x(void* l, uint32_t x, uint64_t flags, uint64_t indirect, uint64_t payload) {
     stats::add(stats::Draws);
+    if (indirect) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) KL_WARN("gpu", "mesh dispatches with GPU-side group counts are not run yet (flags %llx, payload %llx)", (unsigned long long)flags, (unsigned long long)payload);
+        return;
+    }
+    if (auto* s = S(l)) s->add(Op::DispatchMesh, Dispatch{x, 1, 1, uint32_t(flags)});
 }
 uint64_t buffer_address(void* res, uint64_t offset) {
     resource::Info r;

@@ -255,16 +255,45 @@ struct T {
 
     // -------------------------------------------------------- memory ----
     // title address -> device address through the 2-level page table (1 GiB, 64 KiB pages).
-    Id translate_addr(Id addr) {
+    Id page_table() { return load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(1)}), t_u64); }
+    Id translate_addr(Id addr) { return dev_of(page_entry(addr), addr); }
+    Id dev_of(Id entry, Id addr) {
+        Id page = b.op(spv::OpBitwiseAnd, t_u64, {entry, b.c_u64(~(1ull << 63))});
+        return b.op(spv::OpIAdd, t_u64, {page, b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64(0xffff)})});
+    }
+    // Entries of imported pages that no GPU resource or heap covers carry bit 63: stores there
+    // are skipped, counted and the first one's address kept for the host's log.
+    Id guarded(Id entry) { return b.op(spv::OpINotEqual, t_bool, {b.op(spv::OpShiftRightLogical, t_u64, {entry, b.c_u32(63)}), b.c_u64(0)}); }
+    void report_guard(Id bad, Id addr) {
+        Id yes = b.id(), after = b.id(), first = b.id(), done = b.id();
+        b.op_void(spv::OpSelectionMerge, {after, 0});
+        b.op_void(spv::OpBranchConditional, {bad, yes, after});
+        b.label(yes);
+        Id rec = b.op(spv::OpIAdd, t_u64, {page_table(), b.c_u64((1ull << 17) * 8)});
+        auto at = [&](uint32_t k) { return b.op(spv::OpConvertUToPtr, p_psb_u32, {b.op(spv::OpIAdd, t_u64, {rec, b.c_u64(4 * k)})}); };
+        Id old = b.op(spv::OpAtomicIAdd, t_u32, {at(0), u(spv::ScopeDevice), u(0), u(1)});
+        Id is_first = b.op(spv::OpIEqual, t_bool, {old, u(0)});
+        b.op_void(spv::OpSelectionMerge, {done, 0});
+        b.op_void(spv::OpBranchConditional, {is_first, first, done});
+        b.label(first);
+        auto put = [&](uint32_t k, Id v) { b.op_void(spv::OpStore, {at(k), v, uint32_t(spv::MemoryAccessAlignedMask), 4}); };
+        put(1, u(code_id(p)));
+        put(2, b.op(spv::OpUConvert, t_u32, {addr}));
+        put(3, b.op(spv::OpUConvert, t_u32, {b.op(spv::OpShiftRightLogical, t_u64, {addr, b.c_u32(32)})}));
+        b.op_void(spv::OpBranch, {done});
+        b.label(done);
+        b.op_void(spv::OpBranch, {after});
+        b.label(after);
+    }
+    Id page_entry(Id addr) {
         addr = b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64((1ull << 47) - 1)});
-        Id pt = load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(1)}), t_u64);
+        Id pt = page_table();
         Id i1 = b.op(spv::OpShiftRightLogical, t_u64, {addr, b.c_u32(30)});
         Id a1 = b.op(spv::OpIAdd, t_u64, {pt, b.op(spv::OpShiftLeftLogical, t_u64, {i1, b.c_u32(3)})});
         Id l2 = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {a1}), uint32_t(spv::MemoryAccessAlignedMask), 8});
         Id i2 = b.op(spv::OpBitwiseAnd, t_u64, {b.op(spv::OpShiftRightLogical, t_u64, {addr, b.c_u32(16)}), b.c_u64(0x3fff)});
         Id a2 = b.op(spv::OpIAdd, t_u64, {l2, b.op(spv::OpShiftLeftLogical, t_u64, {i2, b.c_u32(3)})});
-        Id page = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {a2}), uint32_t(spv::MemoryAccessAlignedMask), 8});
-        return b.op(spv::OpIAdd, t_u64, {page, b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64(0xffff)})});
+        return b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {a2}), uint32_t(spv::MemoryAccessAlignedMask), 8});
     }
     // `count` consecutive dwords from `addr64`: one instruction touches at most two 64 KiB pages,
     // so two page-table walks serve all of them (the walks are half of a shader's driver
@@ -298,11 +327,19 @@ struct T {
         b.op_void(spv::OpSelectionMerge, {after, 0});
         b.op_void(spv::OpBranchConditional, {go, yes, after});
         b.label(yes);
-        Id dev0 = translate_addr(addr64), devl = dev0, in_page = 0;
+        Id e0 = page_entry(addr64), el = e0, in_page = 0;
+        Id dev0 = dev_of(e0, addr64), devl = dev0;
         if (count > 1) {
-            devl = translate_addr(b.op(spv::OpIAdd, t_u64, {addr64, b.c_u64(uint64_t(4 * (count - 1)))}));
+            Id last = b.op(spv::OpIAdd, t_u64, {addr64, b.c_u64(uint64_t(4 * (count - 1)))});
+            el = page_entry(last);
+            devl = dev_of(el, last);
             in_page = b.op(spv::OpBitwiseAnd, t_u64, {addr64, b.c_u64(0xffff)});
         }
+        Id bad = guarded(b.op(spv::OpBitwiseOr, t_u64, {e0, el}));
+        Id store_ = b.id(), skip = b.id();
+        b.op_void(spv::OpSelectionMerge, {skip, 0});
+        b.op_void(spv::OpBranchConditional, {bad, skip, store_});
+        b.label(store_);
         for (int k = 0; k < count; ++k) {
             Id dev = dev0;
             if (count > 1) {
@@ -313,6 +350,9 @@ struct T {
             }
             b.op_void(spv::OpStore, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), vals[size_t(k)], uint32_t(spv::MemoryAccessAlignedMask), 4});
         }
+        b.op_void(spv::OpBranch, {skip});
+        b.label(skip);
+        report_guard(bad, addr64);
         b.op_void(spv::OpBranch, {after});
         b.label(after);
     }
@@ -1486,7 +1526,10 @@ struct T {
     // out-of-bounds ones operate on the zero page with a neutral value.
     void buffer_atomic(const Inst& i, std::string_view n, Id addr, Id in_bounds, uint16_t data) {
         Id go = b.op(spv::OpLogicalAnd, t_bool, {in_bounds, active()});
-        Id dev = translate_addr(b.op(spv::OpSelect, t_u64, {go, addr, b.c_u64(0)}));
+        Id a = b.op(spv::OpSelect, t_u64, {go, addr, b.c_u64(0)});
+        Id bad = guarded(page_entry(a));
+        report_guard(bad, a);
+        Id dev = translate_addr(b.op(spv::OpSelect, t_u64, {bad, b.c_u64(0), a}));
         Id ptr = b.op(spv::OpConvertUToPtr, p_psb_u32, {dev});
         Id v_ = get_v(data);
         Id old;
@@ -1981,6 +2024,12 @@ struct T {
 };
 
 }  // namespace
+
+uint32_t code_id(const Program& p) {
+    uint32_t h = 2166136261u;
+    for (uint8_t c : p.code) h = (h ^ c) * 16777619u;
+    return h;
+}
 
 uint64_t translator_build() {
     uint64_t h = 0xcbf29ce484222325ull;

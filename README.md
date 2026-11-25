@@ -213,6 +213,9 @@ shader compiles, VRAM and streaming; F3 toggles it (`KEYLIME_OVERLAY=0` starts i
 Crash diagnostics: every distinct fault is logged once, an unhandled crash writes
 `logs\crash.dmp`, and if no frame is shown for 6 s every thread's stack goes to
 `logs\stacks.txt` (also `KEYLIME_STACKS_AT=<seconds>`).
+Shader stores to title memory that no GPU resource or heap covers are skipped and the
+first ones are logged with the shader's hash ("stored to ..., where no GPU resource or heap
+lies"); `KEYLIME_STORE_GUARD=0` turns that guard off.
 Keyboard stands in for a controller: Enter = A, Backspace = B, Esc = Menu, Tab = View,
 arrows = D-pad, WASD / IJKL = sticks, Q / E = shoulders, Z / C = triggers.
 

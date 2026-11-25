@@ -34,6 +34,13 @@ void remapped(uint64_t address, uint64_t len);
 // Device address of the page table's directory (for shaders' push constants).
 uint64_t page_table();
 
+// Title memory a GPU resource or heap covers. Shader stores to imported pages that none covers
+// are skipped and logged (the page-table entry carries a guard bit); KEYLIME_STORE_GUARD=0 turns
+// the guard off.
+void own(uint64_t address, uint64_t len, bool allocation = true);  // false: a view of one
+// For the guard's log: which shader a translated shader's id stands for (stage 0 VS, 1 PS, 2 CS).
+void name_shader(uint32_t id, uint64_t hash, int stage);
+
 // Host-visible GPU memory for the host's own tables and staging (persistently mapped).
 struct Block {
     VkBuffer buffer = VK_NULL_HANDLE;

@@ -3,8 +3,12 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "gpu/host.h"
@@ -21,6 +25,8 @@ constexpr uint64_t DIRECTORY = 1ull << 17;     // 2^47 bytes of address space / 
 constexpr uint64_t TABLE = GIB / PAGE;          // 16384 entries per 1 GiB table
 constexpr uint64_t TABLE_BYTES = TABLE * 8;     // 128 KiB
 constexpr uint64_t POOL_TABLES = 256;           // tables per pool block (32 MiB)
+constexpr uint64_t GUARD = 1ull << 63;          // page-table entry bit: no GPU allocation covers the page
+constexpr uint64_t GUARD_RECORD = DIRECTORY * 8; // in the directory block: u32 count, u32 shader, u64 address
 
 struct Region {
     uint64_t end;
@@ -53,6 +59,10 @@ uint64_t g_empty_table_device = 0;
 uint64_t* g_empty_table = nullptr;
 Stats g_stats{};
 bool g_started = false;
+bool g_guard = true;
+std::unordered_set<uint64_t> g_owned;      // pages a GPU allocation covers
+std::map<uint64_t, uint64_t> g_allocs;      // start -> length of each
+std::unordered_map<uint32_t, std::pair<uint64_t, int>> g_shader_names;
 
 std::vector<uint32_t> families() {
     auto& q = host::get().queues;
@@ -108,7 +118,9 @@ void map_pages(uint64_t start, uint64_t end, uint64_t device) {
         if (d >= DIRECTORY) break;
         uint64_t* t = device ? table_for(d) : g_tables[d];
         if (!t) continue;
-        t[(p >> 16) & (TABLE - 1)] = device ? device + (p - start) : g_scratch.device;  // wraps for a partial first page
+        uint64_t e = device ? device + (p - start) : g_scratch.device;  // wraps for a partial first page
+        if (device && g_guard && !g_owned.count(p >> 16)) e |= GUARD;
+        t[(p >> 16) & (TABLE - 1)] = e;
     }
 }
 
@@ -276,6 +288,45 @@ std::map<uint64_t, Region>::iterator holding(uint64_t a) {
     return a < it->second.end ? it : g_regions.end();
 }
 
+void describe(uint64_t a, char* out, size_t n) {
+    auto it = g_allocs.upper_bound(a);
+    if (it == g_allocs.begin()) {
+        snprintf(out, n, "no GPU allocation below it");
+        return;
+    }
+    --it;
+    snprintf(out, n, "%llu bytes past the end of the GPU allocation at %llx (%llu bytes)",
+             (unsigned long long)(a - it->first - it->second), (unsigned long long)it->first, (unsigned long long)it->second);
+}
+
+// Shaders count the stores they skipped on guarded pages and keep the first one's address.
+void watch_guard() {
+    SetThreadDescription(GetCurrentThread(), L"keylime-store-guard");
+    auto* rec = reinterpret_cast<volatile uint32_t*>(g_dir.map + GUARD_RECORD);
+    std::unordered_set<uint64_t> told;
+    uint64_t total = 0;
+    for (;;) {
+        Sleep(2);
+        uint32_t n = rec[0];
+        if (!n) continue;
+        uint32_t shader = rec[1];
+        uint64_t a = rec[2] | uint64_t(rec[3]) << 32;
+        rec[0] = 0;
+        total += n;
+        if (told.size() >= 32 || !told.insert(a >> 16).second) continue;
+        char where[160], who[64] = "";
+        {
+            std::lock_guard g(g_lock);
+            describe(a, where, sizeof where);
+            if (auto it = g_shader_names.find(shader); it != g_shader_names.end())
+                snprintf(who, sizeof who, " (%s %016llx)", it->second.second == 1 ? "pixel shader" : it->second.second == 2 ? "compute shader" : "shader",
+                         (unsigned long long)it->second.first);
+        }
+        KL_WARN("gpu", "shader %08x%s stored to %llx, where no GPU resource or heap lies: skipped (%s; %llu such stores so far)", shader, who,
+                (unsigned long long)a, where, (unsigned long long)total);
+    }
+}
+
 }  // namespace
 
 bool make_block(uint64_t size, bool prefer_vram, Block& out, VkBufferUsageFlags extra) {
@@ -329,8 +380,12 @@ bool start() {
         return false;
     }
     // Scratch: where unmapped pages lead (one page plus room for a wide access past its end).
-    if (!make_block(2 * PAGE, true, g_scratch) || !make_block(DIRECTORY * 8, true, g_dir)) return false;
+    if (!make_block(2 * PAGE, true, g_scratch) || !make_block(GUARD_RECORD + 64, true, g_dir)) return false;
     memset(g_scratch.map, 0, size_t(g_scratch.size));
+    memset(g_dir.map + GUARD_RECORD, 0, 64);
+    char v[4];
+    g_guard = !(GetEnvironmentVariableA("KEYLIME_STORE_GUARD", v, sizeof v) && v[0] == '0');
+    if (g_guard) std::thread(watch_guard).detach();
     // The empty table every directory entry starts with.
     Block empty;
     if (!make_block(TABLE_BYTES, true, empty)) return false;
@@ -430,6 +485,25 @@ void remapped(uint64_t address, uint64_t len) {
 }
 
 uint64_t page_table() { return g_dir.device; }
+
+void own(uint64_t address, uint64_t len, bool allocation) {
+    if (!address || !len || !g_guard) return;
+    std::lock_guard g(g_lock);
+    if (allocation) {
+        auto& l = g_allocs[address];
+        l = std::max(l, len);
+    }
+    for (uint64_t p = address >> 16; p <= (address + len - 1) >> 16; ++p) {
+        if (!g_owned.insert(p).second) continue;
+        uint64_t d = p >> 14;
+        if (d < DIRECTORY && g_tables[d]) g_tables[d][p & (TABLE - 1)] &= ~GUARD;
+    }
+}
+
+void name_shader(uint32_t id, uint64_t hash, int stage) {
+    std::lock_guard g(g_lock);
+    g_shader_names[id] = {hash, stage};
+}
 
 Stats stats() {
     std::lock_guard g(g_lock);

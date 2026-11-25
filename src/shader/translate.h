@@ -38,6 +38,8 @@ struct Options {
 
 bool translate(const Program& p, Translation& out, std::string& error, const Options* opt = nullptr);
 uint64_t translator_build();
+// A 32-bit id of the program's code, which translated shaders report to the store guard.
+uint32_t code_id(const Program& p);
 
 // The texture table's hash and probe count: the host fills the table with these and the
 // translated shaders look keys up with the same ones.
