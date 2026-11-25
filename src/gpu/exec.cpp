@@ -1846,9 +1846,23 @@ struct Builder {
 
 }  // namespace
 
+void log_tdr() {
+    auto read = [](const wchar_t* name, DWORD& v) {
+        DWORD size = sizeof v;
+        return RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", name, RRF_RT_REG_DWORD,
+                            nullptr, &v, &size) == ERROR_SUCCESS;
+    };
+    DWORD level = 3, delay = 2;
+    bool has_level = read(L"TdrLevel", level), has_delay = read(L"TdrDelay", delay);
+    KL_INFO("gpu", "Windows GPU timeout: level %lu%s, delay %lu s%s", (unsigned long)level, has_level ? "" : " (default)",
+            (unsigned long)delay, has_delay ? "" : " (default)");
+    if (level == 0) KL_WARN("gpu", "GPU timeout detection is off (TdrLevel 0): a GPU hang freezes the run instead of ending it");
+}
+
 bool start() {
     if (g_started) return true;
     auto& h = host::get();
+    log_tdr();
     uint32_t fam[2] = {h.queues.graphics_family, h.queues.compute_family};
     VkQueue qs[2] = {h.queues.graphics, h.queues.compute};
     for (int i = 0; i < 2; ++i) {
