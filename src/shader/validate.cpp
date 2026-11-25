@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstdlib>
 // keylime shader <dir> --spirv: translates every program to SPIR-V and builds a real
 // Vulkan pipeline from it, so the driver's compiler validates the translator.
 #include <windows.h>
@@ -205,7 +207,10 @@ int validate(const fs::path& dir, bool driver) {
                 VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
                 ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main"};
                 ci.layout = L.layout;
+                if (getenv("KEYLIME_FAST_PIPELINES")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+                auto t0 = std::chrono::steady_clock::now();
                 r = vk::vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+                printf("  %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             } else if (p.stage == HwStage::Vs) {
                 r = graphics(d, L.layout, m, VK_NULL_HANDLE, t, 0, pipe);
             } else {

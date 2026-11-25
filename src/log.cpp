@@ -8,7 +8,7 @@
 
 namespace kl {
 namespace {
-std::mutex g_lock;
+std::recursive_mutex g_lock;  // recursive: a fault inside logf must still be reportable
 FILE* g_file = nullptr;
 LARGE_INTEGER g_start{}, g_freq{};
 bool g_trace = false;

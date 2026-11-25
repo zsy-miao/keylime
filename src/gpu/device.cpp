@@ -142,6 +142,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(void*, const uint32_t* parameters, const Ii
                 memory::remapped(a, n);
                 images::written(a, n);
             });
+            xmem::set_free_hook([](uint64_t a, uint64_t n) { memory::forget(a, n); });
         }
     });
     if (!ok || !host::ready()) {

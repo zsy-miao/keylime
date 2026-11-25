@@ -410,6 +410,8 @@ static std::string symbol(uintptr_t a) {
         ok = SymInitialize(GetCurrentProcess(), nullptr, TRUE);
     });
     if (!ok) return {};
+    static std::recursive_mutex lock;  // dbghelp is single-threaded
+    std::lock_guard g(lock);
     alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
     auto* si = reinterpret_cast<SYMBOL_INFO*>(buf);
     si->SizeOfStruct = sizeof(SYMBOL_INFO);

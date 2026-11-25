@@ -17,10 +17,22 @@ from the console's RDNA 2 machine code to **SPIR-V**.
 The real retail GTA VI exe boots natively, reaches the main menu with all
 audio working, and keylime renders its frames on Vulkan.
 
-**Current blocker:** after the main menu, the game crashes at what looks like
-its first indirect call. `ExecuteIndirect` is recorded but not run on the GPU
-yet, and some unimplemented interface methods return an error code where the
-game expects a pointer or a size. Both are being worked on.
+**Current blocker:** about 48 s in, when the game world starts loading after
+the menu, the game sends thousands of new shaders at once and crashes or
+freezes shortly after. What we know:
+
+- The NVIDIA driver can take 2–26 s to compile one translated compute shader.
+  Done on the title's submit thread, that stalls the GPU long enough for the
+  game's own GPU watchdog to abort ("GPU Loc Sig", a deliberate write to
+  address 0 with code `0x4D8BD421`).
+- Pipelines now build on background workers. Draws whose pipeline is still
+  compiling are skipped, with a 20 ms wait budget per submission. Skipping
+  *compute dispatches* is unsafe: the game then read a bogus address and hit
+  an `int3` (`game_scarlett_master.exe+0x4da6315`). Next step: compute
+  dispatches must wait for their pipeline, and compiles should start when the
+  pipeline is created, not at first use.
+- `ExecuteIndirect`, mesh shader dispatches and GPU memory waits are still
+  skipped.
 
 - [x] Retail exe boots natively: archives stream through DirectStorage
       (thousands of requests, 260+ MB), main loop holds 30 fps
@@ -38,7 +50,7 @@ game expects a pointer or a size. Both are being worked on.
 - [x] BCPack-compressed textures decode in the DirectStorage path
 - [x] `xgameruntime` areas (user, store, save, async, networking, package,
       storage, system and more) emulated well enough to reach the menu
-- [ ] Get past the crash at the first indirect call after the main menu
+- [ ] Get through world loading after the menu (pipeline compile stalls, see above)
 - [ ] `ExecuteIndirect`, mesh shader dispatches and GPU memory waits
 
 ## Status
@@ -128,6 +140,11 @@ Requirements: Windows 10/11 x64, Visual Studio 2022 (or Build Tools) with the C+
     build\keylime.exe shader <dir|file> [--dis]   parse/disassemble console shader containers
 
 Logs go to `logs\keylime.log`; set `KEYLIME_TRACE=1` for detailed logging.
+A debug panel in the top-left corner shows fps, a frame-time graph, GPU work,
+shader compiles, VRAM and streaming; F3 toggles it (`KEYLIME_OVERLAY=0` starts it hidden).
+Crash diagnostics: every distinct fault is logged once, an unhandled crash writes
+`logs\crash.dmp`, and if no frame is shown for 6 s every thread's stack goes to
+`logs\stacks.txt` (also `KEYLIME_STACKS_AT=<seconds>`).
 Keyboard stands in for a controller: Enter = A, Backspace = B, Esc = Menu, Tab = View,
 arrows = D-pad, WASD / IJKL = sticks, Q / E = shoulders, Z / C = triggers.
 

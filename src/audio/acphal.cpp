@@ -322,6 +322,7 @@ void decoder_thread() {
             g_wake_cv.wait_for(g, std::chrono::milliseconds(2), [] { return g_woken; });
             g_woken = false;
         }
+        std::lock_guard setup(g_xma_setup);  // contexts may be released and reallocated meanwhile
         for (uint32_t i = 0; i < g_xma.voices.size(); ++i) {
             std::lock_guard g(*g_xma.locks[i]);
             Context c;

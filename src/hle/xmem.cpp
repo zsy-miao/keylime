@@ -209,9 +209,11 @@ void* WINAPI XMemAllocDefault(SIZE_T size, uint64_t attributes) {
     return _aligned_malloc(size ? size : 1, align);
 }
 
+void before_free(void* p);
 void WINAPI XMemFreeDefault(void* address, uint64_t attributes) {
     if (!address) return;
     if (attributes & ALLOC_32BIT) {
+        before_free(address);
         VirtualFree(address, 0, MEM_RELEASE);
         return;
     }
@@ -263,7 +265,16 @@ BOOL WINAPI XMemFreePhysicalPages(SIZE_T n, const uint64_t* pages) {
     return TRUE;
 }
 
-WriteHook g_write_hook = nullptr, g_remap_hook = nullptr;
+WriteHook g_write_hook = nullptr, g_remap_hook = nullptr, g_free_hook = nullptr;
+void before_free(void* p) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (g_free_hook && p && VirtualQuery(p, &mbi, sizeof mbi) && mbi.AllocationBase == p) {
+        // The whole allocation: walk its regions.
+        uintptr_t end = uintptr_t(p);
+        while (VirtualQuery(reinterpret_cast<void*>(end), &mbi, sizeof mbi) && mbi.AllocationBase == p) end += mbi.RegionSize;
+        g_free_hook(uint64_t(uintptr_t(p)), uint64_t(end - uintptr_t(p)));
+    }
+}
 
 void* map_physical_locked(void* address, SIZE_T n, const uint64_t* pages);
 void* WINAPI XMemMapPhysicalPages(void* address, SIZE_T n, const uint64_t* pages) {
@@ -369,10 +380,12 @@ void* gpu_alloc(size_t size, size_t alignment) {
     return VirtualAlloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &param, 1);
 }
 void gpu_free(void* p) {
+    before_free(p);
     if (p) VirtualFree(p, 0, MEM_RELEASE);
 }
 
 void set_remap_hook(WriteHook h) { g_remap_hook = h; }
+void set_free_hook(WriteHook h) { g_free_hook = h; }
 
 // True if any page of [va, va + len) is physical memory shown at another address too
 // (writes there change this range without touching it).

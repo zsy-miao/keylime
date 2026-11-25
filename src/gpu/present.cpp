@@ -120,6 +120,7 @@ struct Swap {
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
     VkExtent2D extent{};
     std::vector<VkImage> images;
+    std::vector<VkImageView> views;  // for the debug panel
     std::vector<VkSemaphore> done;
     VkSemaphore acquire[8]{};
     uint32_t next = 0;
@@ -198,6 +199,16 @@ bool make_chain() {
     vk::vkGetSwapchainImagesKHR(h.device, chain, &n, nullptr);
     w.images.resize(n);
     vk::vkGetSwapchainImagesKHR(h.device, chain, &n, w.images.data());
+    for (auto v : w.views) vk::vkDestroyImageView(h.device, v, nullptr);
+    w.views.assign(n, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i < n; ++i) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = w.images[i];
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = pick.format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vk::vkCreateImageView(h.device, &vi, nullptr, &w.views[i]);
+    }
     while (w.done.size() < n) w.done.push_back(binary());
     KL_INFO("gpu", "swap chain %ux%u, %u images, %s", w.extent.width, w.extent.height, n,
             mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
@@ -220,6 +231,8 @@ void layout(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout t
     di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
     vk::vkCmdPipelineBarrier2(cb, &di);
 }
+
+#include "gpu/overlay.inc"
 
 // KEYLIME_SNAPSHOTS=<dir>: writes what is shown at some frames as BMP files (for checking frames without a person).
 const char* snapshot_dir() {
@@ -271,6 +284,7 @@ bool show(int q, images::Image* src) {
     ++frame;
     memory::Block grab;
     if (snapshot_dir() && snapshot_due(frame)) memory::make_block(uint64_t(w.extent.width) * w.extent.height * 4, false, grab);
+    overlay::frame();
     bool ok = exec::run(q, [&](VkCommandBuffer cb) {
         layout(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue black{};
@@ -284,6 +298,7 @@ bool show(int q, images::Image* src) {
         b.dstOffsets[0] = {ox, oy, 0};
         b.dstOffsets[1] = {ox + dw, oy + dh, 1};
         vk::vkCmdBlitImage(cb, f.image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        overlay::draw(cb, dst, w.views[idx], w.extent);
         if (grab.buffer) {
             layout(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy c{};

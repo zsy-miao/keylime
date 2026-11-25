@@ -11,6 +11,7 @@
 #include "log.h"
 #include "runtime.h"
 
+namespace kl { LPTOP_LEVEL_EXCEPTION_FILTER title_unhandled_filter(LPTOP_LEVEL_EXCEPTION_FILTER f); }
 namespace kl::hle {
 namespace {
 
@@ -175,6 +176,10 @@ BOOL WINAPI kTerminateProcess(HANDLE p, UINT code) {
     return TerminateProcess(p, code);
 }
 
+LPTOP_LEVEL_EXCEPTION_FILTER WINAPI kSetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f) {
+    return kl::title_unhandled_filter(f);
+}
+
 }  // namespace
 
 KL_MODULE("kernel",
@@ -191,6 +196,7 @@ KL_MODULE("kernel",
               KL_EXPORT_AS("GetProcAddress", kGetProcAddress), KL_EXPORT_AS("FreeLibrary", kFreeLibrary),
               KL_EXPORT_AS("OutputDebugStringA", kOutputDebugStringA), KL_EXPORT_AS("OutputDebugStringW", kOutputDebugStringW),
               KL_EXPORT_AS("ExitProcess", kExitProcess), KL_EXPORT_AS("TerminateProcess", kTerminateProcess),
+              KL_EXPORT_AS("SetUnhandledExceptionFilter", kSetUnhandledExceptionFilter),
           }));
 
 }  // namespace kl::hle

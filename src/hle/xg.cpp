@@ -14,6 +14,8 @@
 #include "gpu/texture.h"
 #include "hle/hle.h"
 #include "log.h"
+#include "loader.h"
+#include <intrin.h>
 
 namespace kl::xg {
 namespace {
@@ -204,9 +206,10 @@ HRESULT WINAPI tiling(Computer* c, uint32_t* tiles, PackedMips* packed, uint32_t
     return S_OK;
 }
 
-HRESULT WINAPI unused(Computer* c) {
-    KL_WARN("xg", "unimplemented texture computer method (fmt %u)", c->desc.format);
-    return E_NOTIMPL;
+uint64_t WINAPI unused(Computer* c) {
+    KL_WARN("xg", "unimplemented texture computer method (fmt %u, called from %s)", c->desc.format,
+            describe(uintptr_t(_ReturnAddress())).c_str());
+    return 0xDEAD000080004001ull;
 }
 
 const void* const kVtable[13] = {(void*)add_ref, (void*)release, (void*)layout, (void*)unused, (void*)unused,

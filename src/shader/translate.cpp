@@ -201,7 +201,7 @@ struct T {
     void set_mask(uint16_t sdst, Id cond) {
         Id m = ballot(b.op(spv::OpLogicalAnd, t_bool, {cond, active()}));
         set_s(sdst, m);
-        if (sdst != SNULL) set_s(uint16_t(sdst + 1), u(0));
+        if (sdst != SNULL && p.wave64) set_s(uint16_t(sdst + 1), u(0));
     }
     Id mask_bit(Id mask) { return ne0(band(shr(mask, lane), u(1))); }
     Id fclamp(Id x, bool clamp) { return clamp ? ext(GLSLstd450FClamp, t_f32, {x, f(0), f(1)}) : x; }
@@ -215,6 +215,7 @@ struct T {
     // -------------------------------------------------------- memory ----
     // title address -> device address through the 2-level page table (1 GiB, 64 KiB pages).
     Id translate_addr(Id addr) {
+        addr = b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64((1ull << 47) - 1)});
         Id pt = load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(1)}), t_u64);
         Id i1 = b.op(spv::OpShiftRightLogical, t_u64, {addr, b.c_u32(30)});
         Id a1 = b.op(spv::OpIAdd, t_u64, {pt, b.op(spv::OpShiftLeftLogical, t_u64, {i1, b.c_u32(3)})});
@@ -229,8 +230,15 @@ struct T {
         return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), uint32_t(spv::MemoryAccessAlignedMask), 4});
     }
     void mem_store(Id addr64, Id val) {
+        Id yes = b.id(), after = b.id();
+        Id go = b.op(spv::OpINotEqual, t_bool, {addr64, b.c_u64(0)});
+        b.op_void(spv::OpSelectionMerge, {after, 0});
+        b.op_void(spv::OpBranchConditional, {go, yes, after});
+        b.label(yes);
         Id dev = translate_addr(addr64);
         b.op_void(spv::OpStore, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), val, uint32_t(spv::MemoryAccessAlignedMask), 4});
+        b.op_void(spv::OpBranch, {after});
+        b.label(after);
     }
     Id add64(Id a64, Id off32) { return b.op(spv::OpIAdd, t_u64, {a64, b.op(spv::OpUConvert, t_u64, {off32})}); }
     Id add64s(Id a64, Id off32) { return b.op(spv::OpIAdd, t_u64, {a64, b.op(spv::OpSConvert, t_u64, {bc(t_i32, off32)})}); }
@@ -708,7 +716,7 @@ struct T {
             if (n == "s_pack_lh_b32_b16") return sres(bor(band(S0(), u(0xffff)), band(S1(), u(0xffff0000))));
             if (n == "s_pack_hh_b32_b16") return sres(bor(shr(S0(), u(16)), band(S1(), u(0xffff0000))));
             if (n.find("_saveexec_b32") != std::string_view::npos || n.find("_saveexec_b64") != std::string_view::npos ||
-                n.find("_wrexec_b32") != std::string_view::npos) {
+                n.find("_wrexec_b32") != std::string_view::npos || n.find("_wrexec_b64") != std::string_view::npos) {
                 Id e = get_s(EXEC_LO), s0v = S0(), r;
                 bool wrexec = n.find("wrexec") != std::string_view::npos;
                 if (n.rfind("s_and_", 0) == 0) r = band(s0v, e);
@@ -718,8 +726,14 @@ struct T {
                 else if (n.rfind("s_orn2_", 0) == 0) r = bor(s0v, bnot(e));
                 else if (n.rfind("s_andn1_", 0) == 0) r = band(bnot(s0v), e);
                 else if (n.rfind("s_nand_", 0) == 0) r = bnot(band(s0v, e));
+                else if (n.rfind("s_nor_", 0) == 0) r = bnot(bor(s0v, e));
+                else if (n.rfind("s_xnor_", 0) == 0) r = bnot(bxor(s0v, e));
+                else if (n.rfind("s_orn1_", 0) == 0) r = bor(bnot(s0v), e);
                 else return unsupported(i);
-                if (!wrexec) sres(e), set_s(uint16_t(sd + 1), u(0));
+                if (!wrexec) {
+                    sres(e);
+                    if (n.find("_b64") != std::string_view::npos) set_s(uint16_t(sd + 1), u(0));
+                }
                 else sres(r);
                 set_s(EXEC_LO, r);
                 return set_scc(ne0(r));
@@ -1001,7 +1015,11 @@ struct T {
             return;
         }
         if (n == "v_readfirstlane_b32") {
-            Id x = b.op(spv::OpGroupNonUniformBroadcastFirst, t_u32, {u(spv::ScopeSubgroup), S0()});
+            // The first lane in EXEC (every invocation runs the dispatcher loop, so the subgroup's
+            // first invocation is not the first active lane).
+            Id e = get_s(EXEC_LO);
+            Id first = sel(t_u32, ne0(e), tou(ext(GLSLstd450FindILsb, t_i32, {e})), u(0));
+            Id x = b.op(spv::OpGroupNonUniformShuffle, t_u32, {u(spv::ScopeSubgroup), S0(), first});
             return set_s(i.dst.vgpr() ? i.dst.vgpr_index() : i.dst.code, x);  // dst is an SGPR (encoded in vdst)
         }
         if (n == "v_readlane_b32") {
@@ -1193,7 +1211,10 @@ struct T {
             return;
         }
         if (i.enc == Enc::DS && lds) {
-            auto at = [&](Id byte) { return b.op(spv::OpAccessChain, lds_ptr, {lds, shr(byte, u(2))}); };
+            const uint32_t last = (p.lds_bytes + 3) / 4 - 1;
+            auto at = [&](Id byte) {
+                return b.op(spv::OpAccessChain, lds_ptr, {lds, ext(GLSLstd450UMin, t_u32, {shr(byte, u(2)), u(last)})});
+            };
             Id addr = iadd(get_v(i.vaddr), u(uint32_t(i.mem_offset & 0xffff)));
             if (n == "ds_read_b32" || n == "ds_read_b64" || n == "ds_read_b128" || n == "ds_read_b96") {
                 int c = n == "ds_read_b32" ? 1 : n == "ds_read_b64" ? 2 : n == "ds_read_b96" ? 3 : 4;
@@ -1227,7 +1248,7 @@ struct T {
                                          n == "ds_and_b32" || n == "ds_max_u32" || n == "ds_min_u32" || n == "ds_xor_b32" ||
                                          n == "ds_write_b16" || n == "ds_write_b8")) {
             Id addr = iadd(get_v(i.vaddr), u(uint32_t(i.mem_offset & 0xffff)));
-            Id ptr = b.op(spv::OpAccessChain, lds_ptr, {lds, shr(addr, u(2))});
+            Id ptr = b.op(spv::OpAccessChain, lds_ptr, {lds, ext(GLSLstd450UMin, t_u32, {shr(addr, u(2)), u((p.lds_bytes + 3) / 4 - 1)})});
             if (n == "ds_write_b16" || n == "ds_write_b8") {
                 Id shift = shl(band(addr, u(3)), u(3));
                 Id merged = b.op(spv::OpBitFieldInsert, t_u32, {load(ptr, t_u32), get_v(i.data0), shift, u(n == "ds_write_b16" ? 16 : 8)});
@@ -1486,6 +1507,7 @@ struct T {
         scc = b.local(p_fn_bool, b.c_bool(false));
         pc = b.local(p_fn_u32, u(0));
         done = b.local(p_fn_bool, b.c_bool(false));
+        Id trips = b.local(p_fn_u32, u(0));
         prologue();
         Id header = b.id(), dispatch = b.id(), sw_merge = b.id(), cont = b.id(), merge = b.id();
         b.op_void(spv::OpBranch, {header});
@@ -1555,7 +1577,10 @@ struct T {
         b.label(sw_merge);
         b.op_void(spv::OpBranch, {cont});
         b.label(cont);
-        b.op_void(spv::OpBranchConditional, {load(done, t_bool), merge, header});
+        Id t = iadd(load(trips, t_u32), u(1));
+        store(trips, t);
+        Id stop = b.op(spv::OpLogicalOr, t_bool, {load(done, t_bool), b.op(spv::OpUGreaterThan, t_bool, {t, u(1u << 20)})});
+        b.op_void(spv::OpBranchConditional, {stop, merge, header});
         b.label(merge);
         b.op_void(spv::OpReturn, {});
         b.end_function();

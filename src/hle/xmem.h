@@ -18,6 +18,8 @@ using WriteHook = void (*)(uint64_t address, uint64_t len);
 void set_write_hook(WriteHook h);
 // Called (outside xmem's lock) when a title range starts showing other pages.
 void set_remap_hook(WriteHook h);
+// Called just before title memory is released (GPU imports of it must go first).
+void set_free_hook(WriteHook h);
 bool map_alias(uint64_t to, uint64_t from, uint64_t len);
 
 // A view of physical pages: title addresses [va, va + len) show bytes [offset, offset + len)

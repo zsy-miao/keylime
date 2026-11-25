@@ -3,12 +3,17 @@
 //   keylime imports <title.exe>        list what the title imports and how we would bind it
 #include <windows.h>
 #include <tlhelp32.h>
+#include <dbghelp.h>
+
+#include <algorithm>
+#include <atomic>
 
 #include <cstdio>
 #include <fstream>
 #include <thread>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "hle/files.h"
 #include "hle/hle.h"
@@ -37,16 +42,9 @@ static fs::path local_dir(const char* sub) {
 
 // ---------------------------------------------------------------- crashes ----
 
-static LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
+static void report(EXCEPTION_POINTERS* ep, const char* how) {
     auto* er = ep->ExceptionRecord;
     DWORD code = er->ExceptionCode;
-    // Only faults worth a report; C++ throws, debug prints, etc. pass silently.
-    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
-        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION &&
-        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != STATUS_HEAP_CORRUPTION && code != 0xC0000409)
-        return EXCEPTION_CONTINUE_SEARCH;
-    static LONG reports = 0;
-    if (InterlockedIncrement(&reports) > 8) return EXCEPTION_CONTINUE_SEARCH;
     auto* c = ep->ContextRecord;
     std::string what;
     if (code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
@@ -55,36 +53,96 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
         snprintf(b, sizeof b, " (%s at 0x%llx)", kind, (unsigned long long)er->ExceptionInformation[1]);
         what = b;
     }
-    KL_ERROR("crash", "exception 0x%08lx%s at %s", code, what.c_str(), describe(c->Rip).c_str());
+    KL_ERROR("crash", "%s exception 0x%08lx%s at %s", how, code, what.c_str(), describe(c->Rip).c_str());
     KL_ERROR("crash", "rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rsp=%llx", c->Rax, c->Rbx, c->Rcx,
              c->Rdx, c->Rsi, c->Rdi, c->Rsp);
     KL_ERROR("crash", "r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx", c->R8, c->R9,
              c->R10, c->R11, c->R12, c->R13, c->R14, c->R15);
-    // Return addresses on the stack that fall inside mapped images.
+    // A call through a bad pointer: name the call site (the return address is at [rsp]).
     auto* sp = reinterpret_cast<const uintptr_t*>(c->Rsp);
     MEMORY_BASIC_INFORMATION mbi{};
-    int shown = 0;
-    if (VirtualQuery(sp, &mbi, sizeof mbi)) {
+    if (VirtualQuery(sp, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) {
+        if (code == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[0] == 8)
+            KL_ERROR("crash", "  called from %s", describe(sp[0]).c_str());
         auto* end = reinterpret_cast<const uintptr_t*>(static_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize);
+        int shown = 0;
+        uintptr_t exe = uintptr_t(GetModuleHandleW(nullptr));
         for (int i = 0; i < 2048 && sp + i < end && shown < 12; ++i)
-            if (loader().find(sp[i]) || (sp[i] >= uintptr_t(GetModuleHandleW(nullptr)) &&
-                                         sp[i] < uintptr_t(GetModuleHandleW(nullptr)) + (32u << 20))) {
+            if (loader().find(sp[i]) || (sp[i] >= exe && sp[i] < exe + (32u << 20))) {
                 KL_ERROR("crash", "  stack[%d] %s", i, describe(sp[i]).c_str());
                 ++shown;
             }
     }
+}
+
+// Runs the report on a fresh thread when the faulting stack may be unusable.
+static void report_safely(EXCEPTION_POINTERS* ep, const char* how) {
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+        std::thread t([&] { report(ep, how); });
+        t.join();
+    } else {
+        report(ep, how);
+    }
+}
+
+static void minidump(EXCEPTION_POINTERS* ep) {
+    std::thread t([ep, tid = GetCurrentThreadId()] {
+        HANDLE f = CreateFileW(L"logs/crash.dmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return;
+        MINIDUMP_EXCEPTION_INFORMATION mei{tid, ep, FALSE};
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+                          MINIDUMP_TYPE(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo), &mei,
+                          nullptr, nullptr);
+        CloseHandle(f);
+        KL_ERROR("crash", "minidump written to logs/crash.dmp");
+    });
+    t.join();
+}
+
+// First-chance faults: many are handled (our probes, the title's own SEH), so each distinct
+// faulting address is reported once and the search goes on. The real crash is reported again,
+// with a minidump, by the unhandled filter.
+static LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != STATUS_HEAP_CORRUPTION && code != 0xC0000409)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static std::atomic<uintptr_t> seen[64];
+    static std::atomic<int> count{0};
+    uintptr_t rip = ep->ContextRecord->Rip;
+    for (int i = 0, n = std::min(count.load(), 64); i < n; ++i)
+        if (seen[i] == rip) return EXCEPTION_CONTINUE_SEARCH;
+    int at = count++;
+    if (at >= 64) return EXCEPTION_CONTINUE_SEARCH;
+    seen[at] = rip;
+    report_safely(ep, "first-chance");
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_title_filter = nullptr;
+static LONG WINAPI on_unhandled(EXCEPTION_POINTERS* ep) {
+    static std::atomic<bool> once{false};
+    if (!once.exchange(true)) {
+        report_safely(ep, "UNHANDLED");
+        minidump(ep);
+    }
+    return g_title_filter ? g_title_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+// The title's SetUnhandledExceptionFilter: kept behind ours.
+LPTOP_LEVEL_EXCEPTION_FILTER title_unhandled_filter(LPTOP_LEVEL_EXCEPTION_FILTER f) {
+    auto old = g_title_filter;
+    g_title_filter = f;
+    return old;
 }
 
 // KEYLIME_STACKS_AT=<seconds>: logs where every thread is at that moment (title return addresses
 // on each stack), for finding what a stalled title waits on. Addresses are gathered while the
 // thread is suspended (no allocation), described after it resumes.
-static void stacks_later() {
-    char v[16]{};
-    if (!GetEnvironmentVariableA("KEYLIME_STACKS_AT", v, 16)) return;
-    double at = atof(v);
-    std::thread([at] {
-        Sleep(DWORD(at * 1000));
+static void dump_stacks(const char* why) {
+    {
+        std::vector<std::string> lines;
+        lines.push_back(std::string("thread stacks: ") + why);
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te{sizeof te};
         DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
@@ -123,10 +181,41 @@ static void stacks_later() {
             }
             CloseHandle(h);
             if (!n) continue;
-            KL_INFO("stacks", "thread %lu %s: at %s", te.th32ThreadID, name.c_str(), describe(found[0]).c_str());
-            for (int i = 1; i < n; ++i) KL_INFO("stacks", "    %s", describe(found[i]).c_str());
+            lines.push_back("thread " + std::to_string(te.th32ThreadID) + " " + name + ": at " + describe(found[0]));
+            for (int i = 1; i < n; ++i) lines.push_back("    " + describe(found[i]));
         }
         CloseHandle(snap);
+        // The file first: a deadlock may hold the log's lock.
+        if (FILE* f = fopen("logs/stacks.txt", "a")) {
+            for (auto& l : lines) fprintf(f, "%s\n", l.c_str());
+            fclose(f);
+        }
+        for (auto& l : lines) KL_INFO("stacks", "%s", l.c_str());
+    }
+}
+
+static void stacks_later() {
+    char v[16]{};
+    if (GetEnvironmentVariableA("KEYLIME_STACKS_AT", v, 16)) {
+        double at = atof(v);
+        std::thread([at] {
+            Sleep(DWORD(at * 1000));
+            dump_stacks("KEYLIME_STACKS_AT");
+        }).detach();
+    }
+    // Watchdog: frames were being shown and then stop for 6 s -> where is everyone?
+    std::thread([] {
+        uint64_t last = 0;
+        int still = 0, dumps = 0;
+        for (;;) {
+            Sleep(1000);
+            uint64_t now = stats::g_counters[stats::FramesShown].load();
+            if (now != last || now == 0) {
+                last = now, still = 0;
+                continue;
+            }
+            if (++still == 6 && dumps++ < 3) dump_stacks("no frame shown for 6 s");
+        }
     }).detach();
 }
 
@@ -170,6 +259,7 @@ static int run(const fs::path& exe, bool execute, bool list_only) {
         return 0;
     }
     AddVectoredExceptionHandler(1, on_exception);
+    SetUnhandledExceptionFilter(on_unhandled);
     cpu::install();
     stacks_later();  // first: AMD-only instructions are emulated before any report
     stats::start();

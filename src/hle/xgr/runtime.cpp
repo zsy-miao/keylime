@@ -7,6 +7,8 @@
 
 #include "hle/hle.h"
 #include "log.h"
+#include "loader.h"
+#include <intrin.h>
 
 namespace kl::xgr {
 namespace {
@@ -33,10 +35,12 @@ HRESULT WINAPI query_interface(Object* o, const GUID*, void** out) {
 
 // Logging stubs, one per slot (the slot is in the function).
 template <size_t S>
-HRESULT WINAPI missing(Object* o) {
-    static std::atomic<bool> once{false};
-    if (!once.exchange(true)) KL_WARN("xgr", "runtime method not implemented: %s +0x%zx", o ? o->area : "?", S * 8);
-    return E_NOTIMPL_;
+uint64_t WINAPI missing(Object* o) {
+    static std::atomic<int> times{0};
+    if (times++ < 4)
+        KL_WARN("xgr", "runtime method not implemented: %s +0x%zx (called from %s)", o ? o->area : "?", S * 8,
+                describe(uintptr_t(_ReturnAddress())).c_str());
+    return 0xDEAD000080004001ull;
 }
 template <size_t... I>
 void* const* stubs(std::index_sequence<I...>) {

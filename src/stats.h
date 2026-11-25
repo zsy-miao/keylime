@@ -12,6 +12,7 @@ enum Counter : int {
     Pipelines, Resources, StorageRequests, StorageBytes, StorageFailures, FilesOpened,
     XmaVoices, XmaFrames, OpusPackets, AudioCommands, InputReadings, Stubs,
     Images, TextureUploads, TextureWrites, DrawsRun, DispatchesRun, DrawsSkipped, FramesShown, BcpackBytes,
+    PipelinesBuilt, WaitingOnCompile, Compiling /* gauge */,
     // gauges (set, not added): GPU memory state
     ImagesResident, ImageMiB, VramBudgetMiB, MemoryImports, Evictions, Count
 };

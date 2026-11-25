@@ -3,6 +3,7 @@
 #include <intrin.h>
 
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -32,17 +33,19 @@ const char* kind_name(Kind k) {
 
 namespace {
 std::mutex g_seen_lock;
-std::map<std::pair<int, int>, int> g_seen;
+std::map<std::tuple<int, int, uintptr_t>, int> g_seen;
 
 // One generated thunk per (kind, slot): mov ecx, kind; mov edx, slot; mov r8, [rsp]; jmp missing.
-extern "C" HRESULT kl_gpu_missing(uint32_t kind, uint32_t slot, uintptr_t caller) {
+// Low half E_NOTIMPL for HRESULT callers; as a pointer it faults at a recognisable address.
+constexpr uint64_t kMissing = 0xDEAD000080004001ull;
+extern "C" uint64_t kl_gpu_missing(uint32_t kind, uint32_t slot, uintptr_t caller) {
     {
         std::lock_guard g(g_seen_lock);
-        if (g_seen[{int(kind), int(slot)}]++ != 0) return E_NOTIMPL;
+        if (g_seen.size() > 4096 || g_seen[{int(kind), int(slot), caller}]++ != 0) return kMissing;
     }
     KL_WARN("gpu", "%s method 0x%x not implemented (called from %s)", kind_name(Kind(kind)), slot * 8,
             describe(caller).c_str());
-    return E_NOTIMPL;
+    return kMissing;
 }
 
 void* missing_thunk(Kind kind, size_t slot) {
