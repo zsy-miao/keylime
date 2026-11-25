@@ -31,7 +31,7 @@ shortly after. What changed, waiting for a test run:
   the rest and waits for it within a budget of 0.5 s per frame over all
   threads; past it, draws and dispatches whose pipeline isn't ready are
   dropped. Compute pipelines get a quick unoptimized build first.
-- Pipelines a run used are listed in `cache\\used-pipelines.txt`; the next run
+- Pipelines a run used are listed in `cache\used-pipelines.txt`; the next run
   starts building those as soon as the game creates them, so the first run
   after a change still drops some work and later runs should drop less.
 - Translated shaders are cheaper for the driver: structured loops and
