@@ -10,6 +10,7 @@
 #include "shader/structure.h"
 
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -83,6 +84,7 @@ struct T {
     Id u(uint32_t x) {
         Id c = b.c_u32(x);
         consts[c] = x;
+        if (x == ~0u && !no_lane_facts) mine_ids.insert(c);
         return c;
     }
     Id shift_amount(Id n) {
@@ -119,8 +121,12 @@ struct T {
     Id sel(Id type, Id c, Id a, Id z) { return b.op(spv::OpSelect, type, {c, a, z}); }
     Id iadd(Id a, Id z) { return b.op(spv::OpIAdd, t_u32, {a, z}); }
     Id isub(Id a, Id z) { return b.op(spv::OpISub, t_u32, {a, z}); }
-    Id band(Id a, Id z) { return b.op(spv::OpBitwiseAnd, t_u32, {a, z}); }
-    Id bor(Id a, Id z) { return b.op(spv::OpBitwiseOr, t_u32, {a, z}); }
+    Id band(Id a, Id z) { return mine_if(b.op(spv::OpBitwiseAnd, t_u32, {a, z}), mine_ids.count(a) && mine_ids.count(z)); }
+    Id bor(Id a, Id z) { return mine_if(b.op(spv::OpBitwiseOr, t_u32, {a, z}), mine_ids.count(a) || mine_ids.count(z)); }
+    Id mine_if(Id x, bool yes) {
+        if (yes) mine_ids.insert(x);
+        return x;
+    }
     Id bxor(Id a, Id z) { return b.op(spv::OpBitwiseXor, t_u32, {a, z}); }
     Id bnot(Id a) { return b.op(spv::OpNot, t_u32, {a}); }
     Id shl(Id a, Id n) { return b.op(spv::OpShiftLeftLogical, t_u32, {a, shift_amount(n)}); }
@@ -157,10 +163,20 @@ struct T {
         h = was;
         return r;
     }
-    Id get_s(uint16_t i) { return i == SNULL ? u(0) : load(sreg(i), t_u32); }
+    // SGPRs whose value has this invocation's lane bit set, and values known to: an EXEC_LO with
+    // the bit makes every lane active, so writes skip the select against the old value.
+    std::bitset<SGPRS> mine_reg;
+    bool no_lane_facts = false;
+    std::unordered_set<Id> mine_ids;
+    Id get_s(uint16_t i) {
+        if (i == SNULL) return u(0);
+        Id x = load(sreg(i), t_u32);
+        if (i < SGPRS && mine_reg[i]) mine_ids.insert(x);
+        return x;
+    }
     void set_s(uint16_t i, Id x) {
         if (i == EXEC_LO || i == EXEC_HI) ++exec_gen;
-        if (i != SNULL && i < SGPRS) store(sreg(i), x);
+        if (i != SNULL && i < SGPRS) store(sreg(i), x), mine_reg[i] = mine_ids.count(x) > 0;
     }
     // Both dwords of a lane mask ORed: zero when no lane of the 64 is set (the upper one stays 0 for wave32).
     // (wave32 code may use vcc_hi as a plain SGPR, so only wave64 programs read the upper dword.)
@@ -212,6 +228,11 @@ struct T {
         if (o.code >= 193 && o.code <= 208) x = b.op(spv::OpSConvert, t_u64, {bc(t_i32, raw(o))});
         return x;
     }
+    // A 64-bit scalar source as its two dwords (as raw64 reads it).
+    std::pair<Id, Id> dwords(const Operand& o) {
+        if (o.code <= 105 || o.code == VCC_LO || o.code == EXEC_LO || (o.code >= 108 && o.code <= 123)) return {get_s(o.code), get_s(uint16_t(o.code + 1))};
+        return {raw(o), o.code >= 193 && o.code <= 208 ? u(~0u) : u(0)};
+    }
     void set_s64(uint16_t i, Id x64) {
         set_s(i, b.op(spv::OpUConvert, t_u32, {x64}));
         set_s(uint16_t(i + 1), b.op(spv::OpUConvert, t_u32, {b.op(spv::OpShiftRightLogical, t_u64, {x64, b.c_u32(32)})}));
@@ -240,11 +261,13 @@ struct T {
     Id act_value[2] = {};
     uint32_t act_block[2] = {~0u, ~0u}, act_gen[2] = {~0u, ~0u}, exec_gen = 0;
     Id active() {
+        if (!wide && mine_reg[EXEC_LO]) return b.c_bool(true);
         if (act_gen[h] == exec_gen && act_block[h] == b.labels) return act_value[h];
         act_gen[h] = exec_gen, act_block[h] = b.labels;
         return act_value[h] = mask_bit(mask_reg(EXEC_LO));
     }
     void set_v(uint16_t i, Id x) {
+        if (!wide && mine_reg[EXEC_LO] && !dpp_write && !(sdwa && sdwa->sdwa_dst_sel != 6)) return store(vreg(i), x);
         Id old = get_v(i);
         Id act = active();
         if (dpp_write) act = b.op(spv::OpLogicalAnd, t_bool, {act, dpp_write});
@@ -267,7 +290,7 @@ struct T {
     }
     // A per-lane condition into a wave mask register (VOPC semantics: inactive lanes read 0).
     void set_mask(uint16_t sdst, Id cond) {
-        Id m = ballot(b.op(spv::OpLogicalAnd, t_bool, {cond, active()}));
+        Id m = ballot(!wide && mine_reg[EXEC_LO] ? cond : b.op(spv::OpLogicalAnd, t_bool, {cond, active()}));
         if (wide) return set_s(sdst == SNULL ? sdst : uint16_t(sdst + h), m);
         set_s(sdst, m);
         if (sdst != SNULL && p.wave64) set_s(uint16_t(sdst + 1), u(0));
@@ -694,7 +717,7 @@ struct T {
             }
         }
         // EXEC = every lane that runs (helpers included).
-        set_s(EXEC_LO, ballot(b.c_bool(true)));
+        set_s(EXEC_LO, mine_if(ballot(b.c_bool(true)), !wide && !no_lane_facts));
         set_s(EXEC_HI, u(0));
         if (p.stage == HwStage::Ms) mesh_prologue();
         if (p.stage == HwStage::Vs) {
@@ -952,25 +975,34 @@ struct T {
                 Id a = S0(), z = S1();
                 if (inv0) a = bnot(a);
                 if (inv1) z = bnot(z);
-                Id r = b.op(o, t_u32, {a, z});
+                Id r = o == spv::OpBitwiseAnd ? band(a, z) : o == spv::OpBitwiseOr ? bor(a, z) : b.op(o, t_u32, {a, z});
                 if (invr) r = bnot(r);
                 sres(r);
                 set_scc(ne0(r));
             } else {
-                Id a = raw64(i.src[0]), z = raw64(i.src[1]);
-                if (inv0) a = b.op(spv::OpNot, t_u64, {a});
-                if (inv1) z = b.op(spv::OpNot, t_u64, {z});
-                Id r = b.op(o, t_u64, {a, z});
-                if (invr) r = b.op(spv::OpNot, t_u64, {r});
-                set_s64(sd, r);
-                set_scc(b.op(spv::OpINotEqual, t_bool, {r, b.c_u64(0)}));
+                auto [a0, a1] = dwords(i.src[0]);
+                auto [z0, z1] = dwords(i.src[1]);
+                auto one = [&](Id a, Id z) {
+                    if (inv0) a = bnot(a);
+                    if (inv1) z = bnot(z);
+                    Id r = o == spv::OpBitwiseAnd ? band(a, z) : o == spv::OpBitwiseOr ? bor(a, z) : b.op(o, t_u32, {a, z});
+                    return invr ? bnot(r) : r;
+                };
+                Id r0 = one(a0, z0), r1 = one(a1, z1);
+                set_s(sd, r0);
+                set_s(uint16_t(sd + 1), r1);
+                set_scc(ne0(bor(r0, r1)));
             }
         };
         // ---- scalar ALU ----
         if (i.enc == Enc::SOP1 || i.enc == Enc::SOP2 || i.enc == Enc::SOPK || i.enc == Enc::SOPC) {
             if (n.rfind("s_waitcnt", 0) == 0 || n == "s_version" || n == "s_subvector_loop_begin" || n == "s_subvector_loop_end") return;
             if (n == "s_mov_b32") return sres(S0());
-            if (n == "s_mov_b64") return set_s64(sd, raw64(i.src[0]));
+            if (n == "s_mov_b64") {
+                auto [lo, hi] = dwords(i.src[0]);
+                set_s(sd, lo);
+                return set_s(uint16_t(sd + 1), hi);
+            }
             if (n == "s_movk_i32") return sres(u(uint32_t(int32_t(int16_t(i.simm16)))));
             if (n == "s_cmov_b32") return sres(sel(t_u32, get_scc(), S0(), get_s(sd)));
             if (n == "s_not_b32") { Id r = bnot(S0()); sres(r); return set_scc(ne0(r)); }
@@ -2154,7 +2186,36 @@ struct T {
         return b.op(spv::OpULessThanEqual, t_bool, {isub(load(pc, t_u32), u(lo)), u(hi - lo)});
     }
 
+    // Lane-bit facts into a block: those every emitted predecessor leaves. A predecessor emitted
+    // later (a back edge) is assumed to keep them, and checked once all is emitted: a block whose
+    // assumption failed is translated again without it (`distrust`).
+    std::vector<std::vector<uint32_t>> preds;
+    std::vector<std::bitset<SGPRS>> exit_mine, assumed;
+    std::vector<char> emitted;
+    std::set<uint32_t> distrust, broken;
     void block(uint32_t bi, uint32_t start) {
+        if (bi || !preds[bi].empty()) {
+            std::bitset<SGPRS> in;
+            in.set();
+            bool any = false, later = false;
+            for (uint32_t q : preds[bi]) {
+                if (emitted[q]) in &= exit_mine[q], any = true;
+                else later = true;
+            }
+            if (bi == 0) in &= mine_reg, any = true;
+            if (!any || (later && distrust.count(bi))) in.reset();
+            assumed[bi] = in;
+            mine_reg = in;
+        }
+        block_body(bi, start);
+        exit_mine[bi] = mine_reg, emitted[bi] = 1;
+    }
+    void check_assumptions() {
+        for (uint32_t bi = 0; bi < end_block; ++bi)
+            for (uint32_t q : preds[bi])
+                if (emitted[q] && emitted[bi] && (exit_mine[q] & assumed[bi]) != assumed[bi]) broken.insert(bi);
+    }
+    void block_body(uint32_t bi, uint32_t start) {
         size_t ii = first_inst[bi];
         for (; ii < insts.size(); ++ii) {
             const Inst& i = insts[ii];
@@ -2339,7 +2400,15 @@ struct T {
         find_regions();
         std::vector<cfg::Region> cr;
         for (auto& r : regions) cr.push_back({r.lo, r.hi});
-        auto nodes = cfg::plan(terms(), cr, &out.plan_note);
+        auto tm = terms();
+        preds.assign(end_block, {}), exit_mine.assign(end_block, {}), assumed.assign(end_block, {}), emitted.assign(end_block, 0);
+        for (uint32_t bi = 0; bi < end_block; ++bi) {
+            auto to = [&](uint32_t t) { if (t < end_block) preds[t].push_back(bi); };
+            if (tm[bi].kind == cfg::Exit::Next) to(bi + 1);
+            if (tm[bi].kind == cfg::Exit::Jump) to(tm[bi].t);
+            if (tm[bi].kind == cfg::Exit::Branch) to(tm[bi].t), to(tm[bi].f);
+        }
+        auto nodes = cfg::plan(tm, cr, &out.plan_note);
         count_plan(nodes);
         run(nodes, starts);
         if (p.stage == HwStage::Ms) mesh_epilogue();
@@ -2423,18 +2492,30 @@ bool translate(const Program& p, Translation& out, std::string& error, const Opt
         error = std::string("stage ") + stage_name(p.stage) + " not translated yet";
         return false;
     }
-    T t(p, out, opt);
-    if (!t.decode_all()) {
-        error = t.error;
-        return false;
+    const Translation start = out;
+    std::set<uint32_t> distrust;
+    for (int pass = 0;; ++pass) {
+        out = start;
+        T t(p, out, opt);
+        t.distrust = distrust;
+        if (pass == 8) t.no_lane_facts = true;
+        if (!t.decode_all()) {
+            error = t.error;
+            return false;
+        }
+        t.globals();
+        if (!t.body()) {
+            error = t.error;
+            return false;
+        }
+        t.check_assumptions();
+        if (!t.broken.empty() && pass < 8) {
+            distrust.insert(t.broken.begin(), t.broken.end());
+            continue;
+        }
+        out.spirv = t.b.finish();
+        return true;
     }
-    t.globals();
-    if (!t.body()) {
-        error = t.error;
-        return false;
-    }
-    out.spirv = t.b.finish();
-    return true;
 }
 
 }  // namespace kl::shader
