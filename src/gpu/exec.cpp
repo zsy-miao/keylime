@@ -50,6 +50,9 @@ struct HostQueue {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkSemaphore timeline = VK_NULL_HANDLE;
     std::atomic<uint64_t> submitted{0};
+    // Commands are being recorded (they may name objects retired meanwhile: those wait for the
+    // submission that carries them).
+    std::atomic<int> recording{0};
     std::deque<Cb*> busy;
     std::vector<Cb*> idle;
 };
@@ -91,10 +94,13 @@ void collect() {
         if (g_retirees.empty()) return;
         uint64_t done[2] = {completed(g_q[0]), completed(g_q[1])};
         uint64_t sub[2] = {g_q[0].submitted.load(), g_q[1].submitted.load()};
+        bool rec[2] = {g_q[0].recording.load() != 0, g_q[1].recording.load() != 0};
         while (!g_retirees.empty()) {
             auto& r = g_retirees.front();
             bool ok = true;
-            for (int q = 0; q < 2; ++q) ok &= done[q] >= std::min(r.need[q], sub[q]);
+            // Done once the submission after the retiring is done; a queue that records nothing
+            // now and finished all it was given will not use the object either.
+            for (int q = 0; q < 2; ++q) ok &= done[q] >= r.need[q] || (!rec[q] && sub[q] < r.need[q] && done[q] >= sub[q]);
             if (!ok) break;
             due.push_back(std::move(r.f));
             g_retirees.pop_front();
@@ -542,7 +548,6 @@ struct Builder {
     }
 
     bool begin_rendering() {
-        images::prepare(cb);
         VkRenderingAttachmentInfo color[8]{}, depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         att = {};
         uint32_t w = ~0u, h = ~0u;
@@ -590,7 +595,6 @@ struct Builder {
             w = vps.count ? uint32_t(std::max(1.0f, vps.v[0][2])) : 1;
             h = vps.count ? uint32_t(std::max(1.0f, vps.v[0][3])) : 1;
         }
-        images::prepare(cb);  // first-use layouts of target images seen just now
         extent = {w, h};
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
         ri.renderArea = {{0, 0}, extent};
@@ -910,7 +914,6 @@ struct Builder {
         end_rendering();
         images::Image* di = t.dst.type == 0 ? images::of_resource(t.dst.resource) : nullptr;
         images::Image* si = t.src.type == 0 ? images::of_resource(t.src.resource) : nullptr;
-        images::prepare(cb);
         full_barrier(cb);
         if (di && si) {
             uint32_t dm, dl, sm, sl;
@@ -997,7 +1000,6 @@ struct Builder {
         images::Image* si = images::of_resource(r.src);
         if (!di || !si) return;
         end_rendering();
-        images::prepare(cb);
         full_barrier(cb);
         auto df = images::facts(di), sf = images::facts(si);
         std::vector<VkImageCopy> rs;
@@ -1020,7 +1022,6 @@ struct Builder {
         images::Image* im = images::of_resource(t.resource);
         if (!im) return;
         end_rendering();
-        images::prepare(cb);
         auto f = images::facts(im);
         VkClearColorValue v;
         memcpy(v.float32, c.color, 16);
@@ -1039,7 +1040,6 @@ struct Builder {
         auto f = images::facts(im);
         if (!f.depth) return;
         end_rendering();
-        images::prepare(cb);
         VkImageAspectFlags a = 0;
         if (c.flags & 1) a |= VK_IMAGE_ASPECT_DEPTH_BIT;
         if ((c.flags & 2) && f.stencil) a |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -1068,7 +1068,6 @@ struct Builder {
         }
         images::Image* im = images::of_resource(res);
         if (!im) return;
-        images::prepare(cb);
         auto f = images::facts(im);
         if (f.depth) return;
         VkClearColorValue v;
@@ -1082,7 +1081,6 @@ struct Builder {
     }
 
     void run(const Stream& s) {
-        images::prepare(cb);
         s.each([&](Op op, const uint8_t* p, uint32_t size) {
             auto get = [&](auto& v) { memcpy(&v, p, std::min<size_t>(sizeof v, size)); };
             switch (op) {
@@ -1292,11 +1290,25 @@ bool start() {
 int queue_for(uint32_t kind) { return kind == 2 ? COMPUTE : GRAPHICS; }
 VkQueue vk_queue(int q) { return g_q[q & 1].q; }
 
+// Texture uploads and first-use layouts for what was just recorded go in a submission of their
+// own ahead of it; work waits for the other queue's latest uploads too (images are shared).
+void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs) {
+    Cb* pre = get_cb(h);
+    if (pre && images::prepare(pre->cb, qi, h.submitted.load() + 1)) submit(h, {pre}, {}, {});
+    else if (pre) cbs.insert(cbs.begin(), pre);  // empty: rides along
+    std::vector<Semaphore> waits;
+    int other = (qi & 1) ^ 1;
+    uint64_t up = images::upload_value(other);
+    if (up && g_q[other].timeline && up > completed(g_q[other])) waits.push_back({g_q[other].timeline, up});
+    submit(h, cbs, waits, {});
+}
+
 void execute(int qi, uint32_t count, void* const* lists) {
     HostQueue& h = g_q[qi & 1];
-    std::vector<Cb*> cbs;
     {
         std::lock_guard g(h.lock);
+        h.recording++;
+        std::vector<Cb*> cbs;
         for (uint32_t i = 0; i < count; ++i) {
             Stream* s = list::stream_of(lists[i]);
             if (!s) continue;
@@ -1306,7 +1318,8 @@ void execute(int qi, uint32_t count, void* const* lists) {
             b.run(*s);
             cbs.push_back(c);
         }
-        if (!cbs.empty()) submit(h, cbs, {}, {});
+        if (!cbs.empty()) prepare_and_submit(h, qi, std::move(cbs));
+        h.recording--;
     }
     collect();
 }
@@ -1329,14 +1342,26 @@ void wait(int qi, VkSemaphore s, uint64_t v) {
 bool run(int qi, const std::function<void(VkCommandBuffer)>& f, VkSemaphore wait_bin, VkSemaphore signal_bin) {
     HostQueue& h = g_q[qi & 1];
     std::lock_guard g(h.lock);
+    struct Recording {
+        HostQueue& h;
+        Recording(HostQueue& q) : h(q) { h.recording++; }
+        ~Recording() { h.recording--; }
+    } rec(h);
+    std::vector<Cb*> cbs;
+    Cb* pre = get_cb(h);
+    if (pre && images::prepare(pre->cb, qi, h.submitted.load() + 1)) submit(h, {pre}, {}, {});
+    else if (pre) cbs.push_back(pre);  // empty: rides along
     Cb* c = get_cb(h);
     if (!c) return false;
-    images::prepare(c->cb);
+    cbs.push_back(c);
     f(c->cb);
     std::vector<Semaphore> w, s;
     if (wait_bin) w.push_back({wait_bin, 0});
     if (signal_bin) s.push_back({signal_bin, 0});
-    submit(h, {c}, w, s);
+    int other = (qi & 1) ^ 1;
+    uint64_t up = images::upload_value(other);
+    if (up && g_q[other].timeline && up > completed(g_q[other])) w.push_back({g_q[other].timeline, up});
+    submit(h, cbs, w, s);
     return true;
 }
 
@@ -1350,7 +1375,8 @@ void with_queue(int qi, const std::function<void(VkQueue)>& f) {
 
 void retire(std::function<void()> f) {
     std::lock_guard g(exec::g_retire_lock);
-    exec::g_retirees.push_back({{exec::g_q[0].submitted.load() + 1, exec::g_q[1].submitted.load() + 1}, std::move(f)});
+    // +2: what is being recorded now may go as two submissions (its uploads, then its work).
+    exec::g_retirees.push_back({{exec::g_q[0].submitted.load() + 2, exec::g_q[1].submitted.load() + 2}, std::move(f)});
 }
 
 }  // namespace kl::gpu

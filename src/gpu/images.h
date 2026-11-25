@@ -22,7 +22,8 @@ struct Image;
 
 bool start();  // once, after memory::start
 
-// The image of a title texture resource (made on first use); null for buffers / unknown formats.
+// The image of a title texture resource, resident (made on first use); null for buffers, unknown
+// formats, or no room in VRAM this frame.
 Image* of_resource(void* resource);
 // A shader resource / unordered view of `resource` with `format` (0: the resource's) was made:
 // shaders may now find the image by its address.
@@ -35,8 +36,13 @@ VkDescriptorSetLayout set_layout();
 VkDescriptorSet set();
 uint64_t table();  // device address of the texture table
 
-// Records uploads of changed images and first-use layout changes (outside rendering).
-void prepare(VkCommandBuffer cb);
+// Records uploads of changed images, first-use layout changes and clears into `cb`, which is
+// submitted to host queue `queue` as timeline value `value` ahead of the work that uses them.
+// False if there was nothing to record.
+bool prepare(VkCommandBuffer cb, int queue, uint64_t value);
+// The submission (timeline value) on host queue `queue` that carries its latest uploads: work on
+// the other queue waits for it.
+uint64_t upload_value(int queue);
 
 struct Facts {
     VkImage image;
@@ -55,7 +61,8 @@ void gpu_wrote(Image* i);
 // Title memory changed without a CPU write we could see (streaming writes through other mappings).
 void written(uint64_t address, uint64_t len);
 
-// A draw samples the image at this T# base address (keeps aliased images checked for new contents).
+// A draw samples the image at this T# base address: it becomes resident if it is not, stays
+// resident while used, and aliased images are checked for new contents.
 void touch(uint64_t address);
 void frame_done();  // once per presented frame
 

@@ -46,9 +46,17 @@ void address_range(uint64_t flags, uintptr_t& lo, uintptr_t& hi) {
 
 // ------------------------------------------------------------ physical ----
 
+std::atomic<uint64_t> g_next_section{1};
+std::mutex g_gone_lock;
+std::vector<uint64_t> g_gone;  // sections released, for sections_gone()
 struct Section {
     HANDLE h;
-    ~Section() { CloseHandle(h); }
+    uint64_t id, bytes;
+    ~Section() {
+        CloseHandle(h);
+        std::lock_guard g(g_gone_lock);
+        g_gone.push_back(id);
+    }
 };
 struct Slice {
     std::shared_ptr<Section> section;
@@ -236,7 +244,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t flags, SIZE_T* count, uint64_t* p
         return FALSE;
     }
     KL_INFO("xmem", "XMemAllocatePhysicalPages: %zu pages (%zu MiB), flags %llx", n, size / MiB, (unsigned long long)flags);
-    auto section = std::shared_ptr<Section>(new Section{h});
+    auto section = std::shared_ptr<Section>(new Section{h, g_next_section++, uint64_t(size)});
     std::lock_guard g(g_lock);
     uint64_t first = g_phys.next_page;
     g_phys.next_page += n * FRAMES;
@@ -255,9 +263,22 @@ BOOL WINAPI XMemFreePhysicalPages(SIZE_T n, const uint64_t* pages) {
     return TRUE;
 }
 
+WriteHook g_write_hook = nullptr, g_remap_hook = nullptr;
+
+void* map_physical_locked(void* address, SIZE_T n, const uint64_t* pages);
 void* WINAPI XMemMapPhysicalPages(void* address, SIZE_T n, const uint64_t* pages) {
+    void* r;
+    {
+        std::lock_guard g(g_lock);
+        r = map_physical_locked(address, n, pages);
+    }
+    // The range shows other pages now: the GPU's view of it and copies made from it are stale.
+    if (g_remap_hook && address && n) g_remap_hook(uint64_t(address), uint64_t(n) * kPage);
+    return r;
+}
+
+void* map_physical_locked(void* address, SIZE_T n, const uint64_t* pages) {
     uintptr_t base = uintptr_t(address);
-    std::lock_guard g(g_lock);
     unmap(g_phys, base, n * kPage);
     if (!pages) return address;
     for (size_t i = 0; i < n;) {
@@ -351,7 +372,6 @@ void gpu_free(void* p) {
     if (p) VirtualFree(p, 0, MEM_RELEASE);
 }
 
-WriteHook g_write_hook = nullptr, g_remap_hook = nullptr;
 void set_remap_hook(WriteHook h) { g_remap_hook = h; }
 
 // True if any page of [va, va + len) is physical memory shown at another address too
@@ -392,6 +412,30 @@ bool map_alias(uint64_t to, uint64_t from, uint64_t len) {
     return ok;
 }
 thread_local std::vector<std::pair<uint64_t, uint64_t>> g_notes;
+
+bool physical_at(uint64_t va, PhysicalSpan& out) {
+    std::lock_guard g(g_lock);
+    auto it = g_phys.views.upper_bound(uintptr_t(va));
+    if (it == g_phys.views.begin()) return false;
+    --it;
+    uint64_t base = it->first, len = it->second.first;
+    if (va >= base + len) return false;
+    const Slice& s = it->second.second;
+    out.section = s.section->id;
+    out.handle = s.section->h;
+    out.section_bytes = s.section->bytes;
+    out.va = base;
+    out.len = len;
+    out.offset = uint64_t(s.index) * kPage;
+    return true;
+}
+
+std::vector<uint64_t> sections_gone() {
+    std::lock_guard g(g_gone_lock);
+    std::vector<uint64_t> v;
+    v.swap(g_gone);
+    return v;
+}
 
 void set_write_hook(WriteHook h) { g_write_hook = h; }
 

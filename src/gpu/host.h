@@ -24,7 +24,7 @@ struct Queues {
 
 struct Caps {
     bool buffer_address = false, mesh_shader = false, host_memory_import = false, cuda_binary = false;
-    bool ray_tracing = false, descriptor_buffer = false, rebar = false, int64_atomics = false;
+    bool ray_tracing = false, descriptor_buffer = false, rebar = false, int64_atomics = false, memory_budget = false;
     uint64_t rebar_bytes = 0, vram_bytes = 0;
     uint32_t vram_type = ~0u, rebar_type = ~0u, host_type = ~0u, readback_type = ~0u;
     uint64_t host_import_alignment = 0;
@@ -44,5 +44,8 @@ struct Host {
 bool start();   // once, at device creation
 bool ready();
 Host& get();
+
+// What the driver lets this process keep in VRAM (the device-local heap), and how much it holds now.
+void vram(uint64_t& budget, uint64_t& usage);
 
 }  // namespace kl::gpu::host

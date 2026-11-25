@@ -139,7 +139,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(void*, const uint32_t* parameters, const Ii
             xmem::set_write_hook([](uint64_t a, uint64_t n) { images::written(a, n); });
             // Other pages there now: imports of the old ones go, textures there reload.
             xmem::set_remap_hook([](uint64_t a, uint64_t n) {
-                memory::forget(a, n);
+                memory::remapped(a, n);
                 images::written(a, n);
             });
         }

@@ -27,6 +27,9 @@ bool ensure(uint64_t address, uint64_t len = 1);
 bool locate(uint64_t address, VkBuffer& buffer, uint64_t& offset, uint64_t& left);
 // Title memory released (or about to be reused): its imports go.
 void forget(uint64_t address, uint64_t len);
+// Title memory shows other pages now: what the GPU saw there goes, and physical pages shown
+// there now become visible to it at once.
+void remapped(uint64_t address, uint64_t len);
 
 // Device address of the page table's directory (for shaders' push constants).
 uint64_t page_table();
@@ -44,6 +47,7 @@ void free_block(Block& b);
 
 struct Stats {
     uint64_t regions, bytes, failures;
+    uint64_t imports, shadow_bytes;  // Vulkan allocations holding title memory; physical memory imported
 };
 Stats stats();
 

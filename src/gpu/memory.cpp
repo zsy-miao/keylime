@@ -10,6 +10,7 @@
 #include "gpu/host.h"
 #include "gpu/images.h"
 #include "gpu/retire.h"
+#include "hle/xmem.h"
 #include "log.h"
 
 namespace kl::gpu::memory {
@@ -26,7 +27,21 @@ struct Region {
     VkBuffer buffer;
     VkDeviceMemory memory;
     uint64_t device;
+    bool owned = true;    // false: a window on a shadow (which owns the buffer)
+    uint64_t offset = 0;  // where `start` is in `buffer`
 };
+
+// Physical memory (xmem sections) is imported once per SHADOW bytes of each section, through
+// our own view of it: every title address showing those pages is a window on that import.
+// (Importing each title mapping instead costs one Vulkan allocation per 64 KiB alias, and the
+// driver runs out of allocations long before memory.)
+constexpr uint64_t SHADOW = GIB;
+struct Shadow {
+    void* view = nullptr;
+    uint64_t len = 0;
+    Region r{};
+};
+std::map<std::pair<uint64_t, uint64_t>, Shadow> g_shadows;  // (section, chunk)
 
 std::mutex g_lock;
 std::map<uint64_t, Region> g_regions;  // by start
@@ -102,6 +117,8 @@ void drop(std::map<uint64_t, Region>::iterator it) {
     uint64_t start = it->first;
     g_stats.regions--, g_stats.bytes -= r.end - start;
     g_regions.erase(it);
+    if (!r.owned) return;
+    g_stats.imports--;
     retire([r] {
         auto dev = host::get().device;
         vk::vkDestroyBuffer(dev, r.buffer, nullptr);
@@ -154,7 +171,80 @@ bool import(uint64_t start, uint64_t end, Region& out) {
     }
     vk::vkBindBufferMemory(h.device, buf, mem, 0);
     out = {end, buf, mem, address_of(buf)};
+    g_stats.imports++;
     return true;
+}
+
+std::map<uint64_t, Region>::iterator holding(uint64_t a);
+
+// Shadows of sections that are gone: their imports go (no title address shows them any more).
+void sweep_shadows() {
+    for (uint64_t id : xmem::sections_gone())
+        for (auto it = g_shadows.lower_bound({id, 0}); it != g_shadows.end() && it->first.first == id;) {
+            Shadow sh = it->second;
+            it = g_shadows.erase(it);
+            g_stats.imports--, g_stats.shadow_bytes -= sh.len;
+            retire([sh] {
+                auto dev = host::get().device;
+                vk::vkDestroyBuffer(dev, sh.r.buffer, nullptr);
+                vk::vkFreeMemory(dev, sh.r.memory, nullptr);
+                UnmapViewOfFile(sh.view);
+            });
+        }
+}
+
+// The import of chunk `chunk` of a section (made on first use).
+Shadow* shadow_of(const xmem::PhysicalSpan& p, uint64_t chunk) {
+    auto key = std::make_pair(p.section, chunk);
+    if (auto it = g_shadows.find(key); it != g_shadows.end()) return &it->second;
+    uint64_t off = chunk * SHADOW, len = std::min(SHADOW, p.section_bytes - off);
+    void* v = MapViewOfFile(HANDLE(p.handle), FILE_MAP_WRITE, DWORD(off >> 32), DWORD(off), size_t(len));
+    // The section is reserved, committed as used: commit the whole chunk so it can be imported.
+    if (!v || !VirtualAlloc(v, size_t(len), MEM_COMMIT, PAGE_READWRITE)) {
+        if (v) UnmapViewOfFile(v);
+        if (g_stats.failures++ < 16) KL_WARN("gpu", "could not map %llu MiB of physical memory for the GPU: %lu",
+                                             (unsigned long long)(len >> 20), GetLastError());
+        return nullptr;
+    }
+    Shadow sh;
+    sh.view = v, sh.len = len;
+    if (!import(uint64_t(v), uint64_t(v) + len, sh.r)) {
+        UnmapViewOfFile(v);
+        if (g_stats.failures++ < 16) KL_WARN("gpu", "could not import %llu MiB of physical memory for the GPU",
+                                             (unsigned long long)(len >> 20));
+        return nullptr;
+    }
+    g_stats.shadow_bytes += len;
+    KL_INFO("gpu", "physical memory: section %llu bytes %llx+%llx imported once (%llu MiB of shadows)",
+            (unsigned long long)p.section, (unsigned long long)off, (unsigned long long)len,
+            (unsigned long long)(g_stats.shadow_bytes >> 20));
+    return &g_shadows.emplace(key, sh).first->second;
+}
+
+// Title address `address` is physical memory: make the part of its view inside one shadow
+// chunk a window on that shadow. 0: not physical memory; -1: physical but failed; 1: done.
+int ensure_physical(uint64_t address, uint64_t len) {
+    xmem::PhysicalSpan p;
+    if (!xmem::physical_at(address, p)) return 0;
+    uint64_t at = p.offset + (address - p.va);  // section offset of `address`
+    uint64_t chunk = at / SHADOW;
+    Shadow* sh = shadow_of(p, chunk);
+    if (!sh) return -1;
+    uint64_t chunk_start = chunk * SHADOW, chunk_end = chunk_start + sh->len;
+    // The window: the view's addresses whose section bytes fall in this chunk.
+    uint64_t lo = std::max(p.offset, chunk_start), hi = std::min(p.offset + p.len, chunk_end);
+    uint64_t start = p.va + (lo - p.offset), end = p.va + (hi - p.offset);
+    for (auto o = g_regions.lower_bound(start); o != g_regions.end() && o->first < end;) drop(o++);
+    if (auto o = holding(start); o != g_regions.end()) drop(o);
+    Region r = sh->r;
+    r.end = end;
+    r.device = sh->r.device + (lo - chunk_start);
+    r.owned = false;
+    r.offset = lo - chunk_start;
+    g_regions.emplace(start, r);
+    map_pages(start, end, r.device);
+    g_stats.regions++, g_stats.bytes += end - start;
+    return address + len <= end ? 1 : -1;
 }
 
 // The committed run of the allocation holding `a`: [start, end).
@@ -261,6 +351,8 @@ bool ensure(uint64_t address, uint64_t len) {
     if (!g_started) return false;
     auto it = holding(address);
     if (it != g_regions.end() && address + len <= it->second.end) return true;
+    sweep_shadows();
+    if (int r = ensure_physical(address, len)) return r > 0;
     uint64_t start, end;
     if (!committed_run(address, start, end)) return false;
     // Regions inside the new run are superseded by it.
@@ -292,7 +384,7 @@ bool locate(uint64_t address, VkBuffer& buffer, uint64_t& offset, uint64_t& left
     auto it = holding(address);
     if (it == g_regions.end()) return false;
     buffer = it->second.buffer;
-    offset = address - it->first;
+    offset = it->second.offset + (address - it->first);
     left = it->second.end - address;
     return true;
 }
@@ -308,6 +400,33 @@ void forget(uint64_t address, uint64_t len) {
         drop(o++);
     }
     for (auto [s, e] : gone) map_pages(s, e, 0);
+}
+
+void remapped(uint64_t address, uint64_t len) {
+    std::lock_guard g(g_lock);
+    if (!g_started) return;
+    uint64_t end = address + len;
+    // What the GPU saw there goes...
+    std::vector<std::pair<uint64_t, uint64_t>> gone;
+    if (auto o = holding(address); o != g_regions.end()) gone.push_back({o->first, o->second.end}), drop(o);
+    for (auto o = g_regions.lower_bound(address); o != g_regions.end() && o->first < end;) {
+        gone.push_back({o->first, o->second.end});
+        drop(o++);
+    }
+    for (auto [s, e] : gone) map_pages(s, e, 0);
+    // ...and physical pages shown there now are windows on their shadows at once (resources made
+    // earlier on this range keep working; nothing else would map it again).
+    sweep_shadows();
+    for (uint64_t a = address & ~(PAGE - 1); a < end;) {
+        xmem::PhysicalSpan p;
+        if (!xmem::physical_at(a, p)) {
+            a += PAGE;
+            continue;
+        }
+        ensure_physical(a, 1);
+        auto it = holding(a);
+        a = it != g_regions.end() ? std::max(it->second.end, a + PAGE) : a + PAGE;
+    }
 }
 
 uint64_t page_table() { return g_dir.device; }

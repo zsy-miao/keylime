@@ -11,11 +11,14 @@ enum Counter : int {
     Presents, Submits, Lists, Draws, Dispatches, Copies, Barriers, OtherCommands,
     Pipelines, Resources, StorageRequests, StorageBytes, StorageFailures, FilesOpened,
     XmaVoices, XmaFrames, OpusPackets, AudioCommands, InputReadings, Stubs,
-    Images, TextureUploads, TextureWrites, DrawsRun, DispatchesRun, DrawsSkipped, FramesShown, BcpackBytes, Count
+    Images, TextureUploads, TextureWrites, DrawsRun, DispatchesRun, DrawsSkipped, FramesShown, BcpackBytes,
+    // gauges (set, not added): GPU memory state
+    ImagesResident, ImageMiB, VramBudgetMiB, MemoryImports, Evictions, Count
 };
 
 extern std::atomic<uint64_t> g_counters[Count];
 inline void add(Counter c, uint64_t n = 1) { g_counters[c].fetch_add(n, std::memory_order_relaxed); }
+inline void set(Counter c, uint64_t v) { g_counters[c].store(v, std::memory_order_relaxed); }
 
 void start();  // the status thread
 

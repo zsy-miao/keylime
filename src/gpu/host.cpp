@@ -60,6 +60,22 @@ void pick_memory(Host& h) {
 }  // namespace
 
 Host& get() { return g_host; }
+
+void vram(uint64_t& budget, uint64_t& usage) {
+    Host& h = g_host;
+    budget = h.caps.vram_bytes, usage = 0;
+    if (!h.caps.memory_budget) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    p.pNext = &b;
+    vk::vkGetPhysicalDeviceMemoryProperties2(h.physical, &p);
+    uint64_t best = 0;
+    for (uint32_t i = 0; i < p.memoryProperties.memoryHeapCount; ++i)
+        if ((p.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && p.memoryProperties.memoryHeaps[i].size > best) {
+            best = p.memoryProperties.memoryHeaps[i].size;
+            budget = b.heapBudget[i], usage = b.heapUsage[i];
+        }
+}
 bool ready() { return g_ready; }
 
 bool start() {
@@ -119,6 +135,7 @@ bool start() {
     h.caps.ray_tracing = has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) && has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
     h.caps.descriptor_buffer = has(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     h.caps.host_import_alignment = hostp.minImportedHostPointerAlignment;
+    h.caps.memory_budget = has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
     KL_INFO("vk", "GPU %s (driver %u.%u, Vulkan %u.%u.%u), subgroup %u lanes", h.name.c_str(),
             (h.props.driverVersion >> 22) & 0x3ff, (h.props.driverVersion >> 14) & 0xff, VK_API_VERSION_MAJOR(h.props.apiVersion),
@@ -185,6 +202,7 @@ bool start() {
     std::vector<const char*> dext = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     if (h.caps.mesh_shader) dext.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     if (h.caps.host_memory_import) dext.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (h.caps.memory_budget) dext.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = uint32_t(qci.size());

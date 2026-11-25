@@ -152,14 +152,90 @@ VkComponentMapping mapping_of(const Format& f) {
 }
 
 // ------------------------------------------------------------- memory ----
+// Image memory: 256 MiB device-local chunks, sub-allocated first fit with coalescing free
+// ranges (images larger than half a chunk get their own). Freed ranges are reused at once;
+// chunks left empty go back to the driver, keeping one spare.
 struct Chunk {
-    VkDeviceMemory memory;
-    uint64_t size, used;
-    uint32_t type;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint64_t size = 0, used = 0;
+    uint32_t type = 0;
+    bool dedicated = false;
+    std::map<uint64_t, uint64_t> free;  // offset -> length
 };
-std::vector<Chunk> g_chunks;
+struct Alloc {
+    Chunk* chunk = nullptr;
+    uint64_t offset = 0, size = 0;
+};
+std::mutex g_mem_lock;                 // the chunks (freeing happens from retire callbacks)
+std::vector<Chunk*> g_chunks;
+std::atomic<uint64_t> g_chunk_bytes{0};  // held from the driver
+std::atomic<uint64_t> g_live_bytes{0};   // sub-allocated (until the GPU is done with it)
 
-bool bind_memory(VkImage image) {
+bool take(Chunk* c, uint64_t size, uint64_t align, uint64_t& at) {
+    for (auto it = c->free.begin(); it != c->free.end(); ++it) {
+        uint64_t s = (it->first + align - 1) & ~(align - 1), e = it->first + it->second;
+        if (s + size > e) continue;
+        uint64_t fs = it->first;
+        c->free.erase(it);
+        if (s > fs) c->free[fs] = s - fs;
+        if (s + size < e) c->free[s + size] = e - (s + size);
+        c->used += size;
+        at = s;
+        return true;
+    }
+    return false;
+}
+
+void give(const Alloc& a) {
+    if (!a.chunk) return;
+    std::lock_guard m(g_mem_lock);
+    Chunk* c = a.chunk;
+    uint64_t at = a.offset, size = a.size;
+    c->used -= a.size;
+    g_live_bytes -= a.size;
+    auto next = c->free.lower_bound(at);
+    if (next != c->free.end() && at + size == next->first) size += next->second, next = c->free.erase(next);
+    if (next != c->free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == at) {
+            prev->second += size;
+            size = 0;
+        }
+    }
+    if (size) c->free[at] = size;
+    if (c->used) return;
+    size_t empty = 0;
+    for (Chunk* o : g_chunks) empty += o->used == 0 && !o->dedicated;
+    if (c->dedicated || empty > 1) {
+        vk::vkFreeMemory(host::get().device, c->memory, nullptr);
+        g_chunk_bytes -= c->size;
+        std::erase(g_chunks, c);
+        delete c;
+    }
+}
+
+// VRAM the driver gives us (budget) and what the whole process holds there (usage).
+struct Vram {
+    uint64_t budget = 0, usage = 0;
+    // Usage if the free space inside our chunks counted as free (it is, for new images).
+    uint64_t effective() const {
+        uint64_t slack = g_chunk_bytes.load() - std::min(g_chunk_bytes.load(), g_live_bytes.load());
+        return usage > slack ? usage - slack : 0;
+    }
+};
+Vram vram_now() {
+    Vram v;
+    host::vram(v.budget, v.usage);
+    if (!v.budget) v.budget = host::get().caps.vram_bytes;
+    if (!v.usage) v.usage = g_chunk_bytes.load();  // no budget extension: what we know of
+    return v;
+}
+// Thresholds (fractions of the budget): new chunks stop at HARD; above TRIM, images unused for
+// a while go; below EAGER, textures get GPU copies as soon as they are described.
+constexpr double HARD = 0.92, TRIM = 0.82, TRIM_TO = 0.72, EAGER = 0.55;
+
+// Binds `image` to memory; false (nothing held) if there is no room within the budget.
+bool bind_memory(VkImage image, Alloc& out) {
     auto& h = host::get();
     VkMemoryRequirements req;
     vk::vkGetImageMemoryRequirements(h.device, image, &req);
@@ -170,26 +246,50 @@ bool bind_memory(VkImage image) {
                 type = i;
                 break;
             }
-    for (auto& c : g_chunks) {
-        if (c.type != type) continue;
-        uint64_t at = (c.used + req.alignment - 1) & ~(req.alignment - 1);
-        if (at + req.size <= c.size) {
-            c.used = at + req.size;
-            return vk::vkBindImageMemory(h.device, image, c.memory, at) == VK_SUCCESS;
+    std::lock_guard m(g_mem_lock);
+    bool dedicated = req.size > CHUNK / 2;
+    if (!dedicated)
+        for (Chunk* c : g_chunks) {
+            uint64_t at;
+            if (c->type != type || c->dedicated || c->size - c->used < req.size || !take(c, req.size, req.alignment, at)) continue;
+            if (vk::vkBindImageMemory(h.device, image, c->memory, at) != VK_SUCCESS) {
+                Alloc a{c, at, req.size};
+                g_live_bytes += req.size;
+                g_mem_lock.unlock();
+                give(a);
+                g_mem_lock.lock();
+                return false;
+            }
+            out = {c, at, req.size};
+            g_live_bytes += req.size;
+            return true;
         }
-    }
+    uint64_t size = dedicated ? req.size : CHUNK;
+    Vram v = vram_now();
+    if (v.usage + size > uint64_t(double(v.budget) * HARD)) return false;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = std::max(CHUNK, req.size);
+    ai.allocationSize = size;
     ai.memoryTypeIndex = type;
-    VkDeviceMemory m;
-    if (!KL_VK_CHECK(vk::vkAllocateMemory(h.device, &ai, nullptr, &m))) return false;
-    g_chunks.push_back({m, ai.allocationSize, req.size, type});
-    return vk::vkBindImageMemory(h.device, image, m, 0) == VK_SUCCESS;
+    VkDeviceMemory mem;
+    if (vk::vkAllocateMemory(h.device, &ai, nullptr, &mem) != VK_SUCCESS) return false;
+    auto* c = new Chunk{mem, size, 0, type, dedicated, {{0, size}}};
+    g_chunks.push_back(c);
+    g_chunk_bytes += size;
+    uint64_t at = 0;
+    take(c, req.size, req.alignment, at);
+    out = {c, at, req.size};
+    g_live_bytes += req.size;
+    return vk::vkBindImageMemory(h.device, image, mem, at) == VK_SUCCESS;
 }
+
+void protect(uint64_t start, uint64_t end, DWORD prot);
 
 // ------------------------------------------------------------- images ----
 }  // namespace
 
+// An image is described when the title makes a view of its memory, and resident (a Vulkan
+// image in VRAM with the contents) while it is in use; images unused for a while are evicted
+// when VRAM runs short and come back on their next use.
 struct Image {
     uint64_t address = 0, size = 0;
     resource::ResourceDesc desc{};
@@ -197,16 +297,19 @@ struct Image {
     bool has_layout = false;
     uint32_t dxgi = 0, view_dxgi = 0;
     Format fmt{};
-    VkImage image = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;  // null: not resident
+    Alloc mem{};
     uint32_t width = 1, height = 1, layers = 1, mips = 1;
     bool depth = false, stencil = false, rt = false, storage = false;
     VkImageView sampled = VK_NULL_HANDLE, storage_view = VK_NULL_HANDLE;
     uint32_t slot = 0;
     bool initialized = false, dirty = true, gpu_owned = false, watched = false, dead = false;
+    bool slot_live = false;  // the slot shows this image (else the dummy)
+    bool waiting = false;    // memory not readable yet: retried next frame
     // Memory shown at other addresses too (writes there never fault): checked by content hash
     // each frame while draws use it.
     bool aliased = false;
-    uint64_t mem_hash = 0, last_used = 0, checked = ~0ull;
+    uint64_t mem_hash = 0, last_used = 0, checked = ~0ull, failed = ~0ull;
     bool in_recent = false;
     std::map<uint64_t, VkImageView> targets;
 };
@@ -216,6 +319,7 @@ namespace {
 std::mutex g_lock;
 std::map<uint64_t, Image*> g_images;     // by title address
 std::vector<Image*> g_pending;           // to initialize / upload
+std::vector<Image*> g_waiting;           // memory not readable yet
 uint32_t g_next_slot = 1, g_next_sampler = 1;
 std::map<std::pair<uint32_t, uint32_t>, uint32_t> g_sampler_slots;
 VkDescriptorSetLayout g_layout = VK_NULL_HANDLE;
@@ -223,8 +327,13 @@ VkDescriptorPool g_pool = VK_NULL_HANDLE;
 VkDescriptorSet g_set = VK_NULL_HANDLE;
 memory::Block g_table;
 Image* g_dummy = nullptr;
-bool g_started = false, g_watch = true;
+bool g_started = false, g_watch = true, g_eager = true;
 std::vector<uint32_t> g_families;
+std::atomic<uint64_t> g_frame{0};
+uint64_t g_prepared_frame = ~0ull;
+std::vector<Image*> g_recent;  // aliased images draws used lately
+uint64_t g_resident = 0;
+uint64_t g_upload[2] = {0, 0};  // per host queue: the submission that carries its latest uploads
 
 // ----------------------------------------------------------- the table ----
 uint32_t hash(uint32_t lo, uint32_t hi) {  // must match the translator's slot_of
@@ -252,20 +361,21 @@ bool table_put(uint32_t lo, uint32_t hi, uint32_t slot) {
 }
 
 // --------------------------------------------------------- descriptors ----
-void write_image_slot(Image* im) {
+// Slot `slot` shows `sampled` (and `storage` in the storage array, if any).
+void write_slot(uint32_t slot, VkImageView sampled, VkImageView storage) {
     auto& h = host::get();
-    VkDescriptorImageInfo ii{VK_NULL_HANDLE, im->sampled, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ii{VK_NULL_HANDLE, sampled, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo si{VK_NULL_HANDLE, storage, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w[2]{};
     w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w[0].dstSet = g_set;
     w[0].dstBinding = 0;
-    w[0].dstArrayElement = im->slot;
+    w[0].dstArrayElement = slot;
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     w[0].pImageInfo = &ii;
     uint32_t n = 1;
-    VkDescriptorImageInfo si{VK_NULL_HANDLE, im->storage_view, VK_IMAGE_LAYOUT_GENERAL};
-    if (im->storage_view && im->slot < STORAGE_SLOTS) {
+    if (storage && slot < STORAGE_SLOTS) {
         w[1] = w[0];
         w[1].dstBinding = 2;
         w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -273,6 +383,10 @@ void write_image_slot(Image* im) {
         n = 2;
     }
     vk::vkUpdateDescriptorSets(h.device, n, w, 0, nullptr);
+}
+void write_image_slot(Image* im) { write_slot(im->slot, im->sampled, im->storage_view); }
+void write_dummy_slot(uint32_t slot) {
+    if (g_dummy && g_dummy->sampled) write_slot(slot, g_dummy->sampled, g_dummy->storage_view);
 }
 
 VkImageView make_view(Image* im, VkFormat f, VkImageAspectFlags aspect, uint32_t mip, uint32_t mips, uint32_t layer,
@@ -303,8 +417,18 @@ VkFormat storage_format(VkFormat f) {
     }
 }
 
-Image* create(uint64_t address, const resource::ResourceDesc& d) {
-    auto& h = host::get();
+// The view shaders sample: the image's format, or a same-sized one a typed view asked for.
+VkImageView sampled_view(Image* im) {
+    Format f = im->fmt;
+    if (im->view_dxgi != im->dxgi && !im->depth) {
+        Format v = format_of(im->view_dxgi);
+        if (v.vk != VK_FORMAT_UNDEFINED && format_size(v.vk) == format_size(im->fmt.vk)) f = v;
+    }
+    return make_view(im, f.vk, im->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, im->mips, 0, mapping_of(f));
+}
+
+// The description of a title texture (no Vulkan objects yet: see make_resident).
+Image* describe_image(uint64_t address, const resource::ResourceDesc& d) {
     Format fmt = format_of(d.format);
     if (fmt.vk == VK_FORMAT_UNDEFINED || d.dimension == resource::BUFFER) return nullptr;
     auto* im = new Image();
@@ -322,6 +446,95 @@ Image* create(uint64_t address, const resource::ResourceDesc& d) {
     im->depth = depth_format(fmt.vk);
     im->stencil = stencil_format(fmt.vk);
     im->rt = (d.flags & resource::FLAG_RENDER_TARGET) || im->depth;
+    im->gpu_owned = im->rt || (d.flags & resource::FLAG_UNORDERED);  // the GPU makes its contents
+    im->dirty = !im->gpu_owned && im->has_layout;
+    im->last_used = g_frame.load();
+    stats::add(stats::Images);
+    return im;
+}
+
+// Lets the Vulkan objects of `im` go once the GPU is done with them (lock held).
+void release(Image* im) {
+    if (!im->image) return;
+    VkImage image = im->image;
+    VkImageView s = im->sampled, st = im->storage_view;
+    std::vector<VkImageView> views;
+    for (auto& [k, v] : im->targets) views.push_back(v);
+    Alloc a = im->mem;
+    im->image = VK_NULL_HANDLE;
+    im->sampled = im->storage_view = VK_NULL_HANDLE;
+    im->targets.clear();
+    im->mem = {};
+    im->initialized = false;
+    im->slot_live = false;
+    --g_resident;
+    retire([image, s, st, views, a] {
+        auto dev = host::get().device;
+        for (VkImageView v : views) vk::vkDestroyImageView(dev, v, nullptr);
+        if (s) vk::vkDestroyImageView(dev, s, nullptr);
+        if (st) vk::vkDestroyImageView(dev, st, nullptr);
+        vk::vkDestroyImage(dev, image, nullptr);
+        give(a);
+    });
+}
+
+// Drops the GPU copy of an image the title can give again (its memory holds the contents).
+void evict(Image* im) {
+    if (!im->image || im->gpu_owned || im == g_dummy) return;
+    if (im->slot && im->slot_live) write_dummy_slot(im->slot);
+    release(im);
+    im->dirty = im->has_layout;
+    if (im->watched) {
+        // Nothing to keep current any more: writes need not fault.
+        protect(lo4k(im->address), hi4k(im->address + im->size), PAGE_READWRITE);
+        im->watched = false;
+    }
+    stats::add(stats::Evictions);
+}
+
+// Evicts images no draw used in the last `age` frames, least recently used first, until `bytes`
+// are freed. Returns what it freed.
+uint64_t evict_unused(uint64_t bytes, uint64_t age) {
+    uint64_t frame = g_frame.load();
+    std::vector<Image*> c;
+    for (auto& [a, im] : g_images)
+        if (im->image && !im->gpu_owned && !im->dead && im != g_dummy && im->last_used + age <= frame) c.push_back(im);
+    std::sort(c.begin(), c.end(), [](Image* a, Image* b) { return a->last_used < b->last_used; });
+    uint64_t freed = 0;
+    for (Image* im : c) {
+        if (freed >= bytes) break;
+        freed += im->mem.size;
+        evict(im);
+    }
+    return freed;
+}
+
+// Once a frame: keeps VRAM below the trim line and decides whether new textures go up eagerly.
+void manage_vram() {
+    Vram v = vram_now();
+    uint64_t eff = v.effective();
+    if (eff > uint64_t(double(v.budget) * TRIM)) {
+        uint64_t want = eff - uint64_t(double(v.budget) * TRIM_TO);
+        uint64_t freed = evict_unused(want, 30);
+        static int n = 0;
+        if (n++ < 8)
+            KL_INFO("gpu", "VRAM %llu of %llu MiB: evicted %llu MiB of textures unused for 30 frames", (unsigned long long)(eff >> 20),
+                    (unsigned long long)(v.budget >> 20), (unsigned long long)(freed >> 20));
+    }
+    g_eager = eff < uint64_t(double(v.budget) * EAGER);
+    stats::set(stats::ImagesResident, g_resident);
+    stats::set(stats::ImageMiB, g_chunk_bytes.load() >> 20);
+    stats::set(stats::VramBudgetMiB, v.budget >> 20);
+}
+
+// Gives `im` its Vulkan image and memory and queues its first upload (lock held). False if
+// VRAM is short even after evicting what was not used lately (tried again next frame).
+bool make_resident(Image* im) {
+    if (im->image) return true;
+    uint64_t frame = g_frame.load();
+    if (im->failed == frame || im->dead) return false;
+    auto& h = host::get();
+    const Format& fmt = im->fmt;
     // Block-compressed images: mips smaller than a block still need block-aligned copies (Vulkan handles it).
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
@@ -333,12 +546,13 @@ Image* create(uint64_t address, const resource::ResourceDesc& d) {
     ci.samples = VK_SAMPLE_COUNT_1_BIT;  // MSAA resources are single-sampled for now
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    im->storage = false;
     if (im->depth) {
         ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         ci.flags &= ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
     } else {
         if (supports(fmt.vk, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if ((d.flags & resource::FLAG_UNORDERED) && supports(storage_format(fmt.vk), VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+        if ((im->desc.flags & resource::FLAG_UNORDERED) && supports(storage_format(fmt.vk), VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
             ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
             im->storage = true;
         }
@@ -349,25 +563,46 @@ Image* create(uint64_t address, const resource::ResourceDesc& d) {
         ci.pQueueFamilyIndices = g_families.data();
     }
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vk::vkCreateImage(h.device, &ci, nullptr, &im->image) != VK_SUCCESS || !bind_memory(im->image)) {
+    VkImage image;
+    if (vk::vkCreateImage(h.device, &ci, nullptr, &image) != VK_SUCCESS) {
         static int warned = 0;
-        if (warned++ < 8) KL_WARN("gpu", "could not make an image for %llux%u format %u", (unsigned long long)d.width, d.height, d.format);
-        delete im;
-        return nullptr;
+        if (warned++ < 8)
+            KL_WARN("gpu", "could not make an image for %ux%u format %u", im->width, im->height, im->dxgi);
+        im->failed = frame;
+        return false;
     }
-    VkImageAspectFlags aspect = im->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-    im->sampled = make_view(im, fmt.vk, aspect, 0, im->mips, 0, mapping_of(fmt));
-    if (im->storage) im->storage_view = make_view(im, storage_format(fmt.vk), aspect, 0, 1, 0, {});
-    im->gpu_owned = im->rt || (d.flags & resource::FLAG_UNORDERED);  // the GPU makes its contents
+    Alloc a;
+    bool bound = bind_memory(image, a);
+    if (!bound) {
+        // Short of VRAM: what was not used lately goes; this image follows next frame.
+        VkMemoryRequirements req;
+        vk::vkGetImageMemoryRequirements(h.device, image, &req);
+        vk::vkDestroyImage(h.device, image, nullptr);
+        if (a.chunk) give(a);
+        evict_unused(std::max<uint64_t>(req.size, 512ull << 20), 2);
+        im->failed = frame;
+        static int warned = 0;
+        if (warned++ < 8)
+            KL_WARN("gpu", "VRAM full: %ux%u texture waits a frame while unused ones are evicted", im->width, im->height);
+        return false;
+    }
+    im->image = image;
+    im->mem = a;
+    ++g_resident;
+    im->sampled = sampled_view(im);
+    if (im->storage) im->storage_view = make_view(im, storage_format(fmt.vk), im->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, {});
+    im->initialized = false;
+    im->slot_live = false;
     im->dirty = !im->gpu_owned && im->has_layout;
-    KL_TRACE("gpu", "image at %llx: %ux%ux%u, %u mips, format %u, flags %x, layout %x -> %s%s", (unsigned long long)address, im->width,
-             im->height, im->layers, im->mips, d.format, d.flags, d.layout, im->gpu_owned ? "GPU made" : "uploaded",
+    KL_TRACE("gpu", "image at %llx: %ux%ux%u, %u mips, format %u, flags %x, layout %x -> %s%s", (unsigned long long)im->address, im->width,
+             im->height, im->layers, im->mips, im->desc.format, im->desc.flags, im->desc.layout, im->gpu_owned ? "GPU made" : "uploaded",
              im->has_layout ? "" : " (no layout!)");
-    stats::add(stats::Images);
-    return im;
+    g_pending.push_back(im);
+    return true;
 }
 
-// The image at `address` for `d` (made, slotted and queued for its first upload when new).
+// The image at `address` for `d` (described and slotted when new; a different texture at the
+// same address replaces the old one, which keeps the slot).
 Image* obtain(uint64_t address, const resource::ResourceDesc& d) {
     auto it = g_images.find(address);
     if (it != g_images.end()) {
@@ -377,20 +612,18 @@ Image* obtain(uint64_t address, const resource::ResourceDesc& d) {
             (o.mip_levels == d.mip_levels || !d.mip_levels || !o.mip_levels))
             return it->second;
     }
-    Image* im = create(address, d);
+    Image* im = describe_image(address, d);
     if (!im) return nullptr;
     if (it != g_images.end()) {
         Image* old = it->second;
+        bool was_resident = old->image != VK_NULL_HANDLE;
         old->dead = true;  // pending lists may still name it: they skip it from now on
+        if (old->slot && old->slot_live) write_dummy_slot(old->slot);
+        release(old);  // the old image goes when the GPU is done with it
         it->second = im;
-        im->slot = old->slot;  // the address keeps its slot; the old image goes when the GPU is done
-        retire([old] {
-            auto dev = host::get().device;
-            for (auto& [k, v] : old->targets) vk::vkDestroyImageView(dev, v, nullptr);
-            if (old->sampled) vk::vkDestroyImageView(dev, old->sampled, nullptr);
-            if (old->storage_view) vk::vkDestroyImageView(dev, old->storage_view, nullptr);
-            vk::vkDestroyImage(dev, old->image, nullptr);  // its memory stays in the chunk (bump allocator)
-        });
+        im->slot = old->slot;  // the address keeps its slot
+        im->last_used = old->last_used;
+        if (was_resident) make_resident(im);  // it was in use: the new one likely is too
     } else {
         g_images.emplace(address, im);
         if (g_next_slot >= IMAGE_SLOTS) {
@@ -400,13 +633,11 @@ Image* obtain(uint64_t address, const resource::ResourceDesc& d) {
         } else {
             im->slot = g_next_slot++;
         }
+        if (im->slot) {
+            uint64_t a = address >> 8;
+            table_put(uint32_t(a), uint32_t(a >> 32) & 0xff, im->slot);
+        }
     }
-    if (im->slot) {
-        write_image_slot(im);
-        uint64_t a = address >> 8;
-        table_put(uint32_t(a), uint32_t(a >> 32) & 0xff, im->slot);
-    }
-    g_pending.push_back(im);
     return im;
 }
 
@@ -441,7 +672,7 @@ void overlapping(uint64_t s, uint64_t e, F f) {
 void mark_dirty(Image* im) {
     if (!im->gpu_owned && !im->dirty && im->has_layout && !im->dead) {
         im->dirty = true;
-        g_pending.push_back(im);
+        if (im->image) g_pending.push_back(im);  // without a GPU copy there is nothing to refresh yet
     }
 }
 
@@ -502,6 +733,7 @@ void before_import(uint64_t start, uint64_t end) {
 struct Upload {
     Image* im;
     uint64_t at;
+    VkImage image;  // taken under the lock: another thread may release the image meanwhile
 };
 
 // Every page of [a, a + n) committed and readable (texture memory can be reserved before it is mapped).
@@ -538,9 +770,6 @@ uint64_t hash_memory(uint64_t a, uint64_t n) {
         return 0;
     }
 }
-std::atomic<uint64_t> g_frame{0};
-std::vector<Image*> g_recent;  // aliased images draws used lately
-
 uint64_t linear_size(const Image* im) {
     const auto& l = im->layout;
     uint64_t total = 0;
@@ -619,11 +848,25 @@ bool start() {
     resource::ResourceDesc dd{};
     dd.dimension = resource::TEX2D, dd.width = 1, dd.height = 1, dd.depth_or_array = 1, dd.mip_levels = 1, dd.format = 28;
     dd.sample_count = 1, dd.flags = resource::FLAG_RENDER_TARGET | resource::FLAG_UNORDERED;
-    g_dummy = create(0, dd);
-    if (g_dummy) {
-        g_dummy->slot = 0;
-        write_image_slot(g_dummy);
-        g_pending.push_back(g_dummy);
+    g_dummy = describe_image(0, dd);
+    if (!g_dummy || !make_resident(g_dummy)) {
+        KL_ERROR("gpu", "could not make the placeholder texture");
+        return false;
+    }
+    g_dummy->slot = 0;
+    {
+        // Every slot shows the placeholder until an image of its own is resident and uploaded.
+        std::vector<VkDescriptorImageInfo> si(IMAGE_SLOTS, {VK_NULL_HANDLE, g_dummy->sampled, VK_IMAGE_LAYOUT_GENERAL});
+        std::vector<VkDescriptorImageInfo> st(STORAGE_SLOTS, {VK_NULL_HANDLE, g_dummy->storage_view, VK_IMAGE_LAYOUT_GENERAL});
+        VkWriteDescriptorSet w[2]{};
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[0].dstSet = g_set, w[0].dstBinding = 0, w[0].descriptorCount = IMAGE_SLOTS;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, w[0].pImageInfo = si.data();
+        w[1] = w[0];
+        w[1].dstBinding = 2, w[1].descriptorCount = STORAGE_SLOTS;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w[1].pImageInfo = st.data();
+        vk::vkUpdateDescriptorSets(h.device, g_dummy->storage_view ? 2 : 1, w, 0, nullptr);
+        g_dummy->slot_live = true;
     }
     uint32_t zero[4] = {0, 0, 0, 0};
     {
@@ -650,12 +893,59 @@ bool start() {
     return true;
 }
 
+namespace {
+
+// ------------------------------------------------------------ staging ----
+// Upload staging comes from a pool of host-visible blocks that are used again once the GPU is
+// done with them (one allocation per upload batch would exhaust the driver's allocations).
+std::mutex g_staging_lock;
+std::vector<memory::Block> g_staging;  // free blocks
+uint64_t g_staging_bytes = 0;          // held in all blocks
+bool staging_get(uint64_t n, memory::Block& out) {
+    {
+        std::lock_guard g(g_staging_lock);
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < g_staging.size(); ++i)
+            if (g_staging[i].size >= n && (best == SIZE_MAX || g_staging[i].size < g_staging[best].size)) best = i;
+        if (best != SIZE_MAX) {
+            out = g_staging[best];
+            g_staging.erase(g_staging.begin() + best);
+            return true;
+        }
+    }
+    uint64_t size = 16ull << 20;
+    while (size < n) size <<= 1;
+    if (!memory::make_block(size, false, out)) return false;
+    std::lock_guard g(g_staging_lock);
+    g_staging_bytes += size;
+    return true;
+}
+void staging_put(const memory::Block& b) {
+    retire([b] {
+        std::lock_guard g(g_staging_lock);
+        if (g_staging_bytes > (1ull << 30)) {  // more than in flight usually needs: let it go
+            g_staging_bytes -= b.size;
+            memory::Block c = b;
+            auto dev = host::get().device;
+            vk::vkDestroyBuffer(dev, c.buffer, nullptr);
+            vk::vkFreeMemory(dev, c.memory, nullptr);
+            return;
+        }
+        g_staging.push_back(b);
+    });
+}
+
+}  // namespace
+
 Image* of_resource(void* res) {
     resource::Info r;
     if (!res || !resource::info(res, r) || r.desc.dimension == resource::BUFFER) return nullptr;
     std::lock_guard g(g_lock);
     if (!g_started) return nullptr;
-    return obtain(r.address, r.desc);
+    Image* im = obtain(r.address, r.desc);
+    if (!im) return nullptr;
+    im->last_used = g_frame.load();
+    return make_resident(im) ? im : nullptr;
 }
 
 void viewed(void* res, uint32_t format) {
@@ -664,20 +954,24 @@ void viewed(void* res, uint32_t format) {
     std::lock_guard g(g_lock);
     if (!g_started) return;
     Image* im = obtain(r.address, r.desc);
-    if (im && format && format != im->view_dxgi && !im->depth) {
+    if (!im) return;
+    if (format && format != im->view_dxgi && !im->depth) {
         // A differently typed view (say sRGB of a typeless texture): sample through that format.
         Format f = format_of(format);
-        if (f.vk != VK_FORMAT_UNDEFINED && format_size(f.vk) == format_size(im->fmt.vk) && f.vk != im->fmt.vk) {
-            VkImageView v = make_view(im, f.vk, VK_IMAGE_ASPECT_COLOR_BIT, 0, im->mips, 0, mapping_of(f));
-            if (v) {
-                VkImageView old = im->sampled;
-                im->sampled = v;
-                im->view_dxgi = format;
-                write_image_slot(im);
-                retire([old] { vk::vkDestroyImageView(host::get().device, old, nullptr); });
+        if (f.vk != VK_FORMAT_UNDEFINED && format_size(f.vk) == format_size(im->fmt.vk) && f.vk != format_of(im->view_dxgi).vk) {
+            im->view_dxgi = format;
+            if (im->image) {
+                VkImageView v = sampled_view(im);
+                if (v) {
+                    VkImageView old = im->sampled;
+                    im->sampled = v;
+                    if (im->slot_live) write_image_slot(im);
+                    retire([old] { vk::vkDestroyImageView(host::get().device, old, nullptr); });
+                }
             }
         }
     }
+    if (g_eager) make_resident(im);
 }
 
 void viewed_placed(uint64_t address, const void* desc, uint32_t format) {
@@ -687,7 +981,9 @@ void viewed_placed(uint64_t address, const void* desc, uint32_t format) {
     if (d.dimension == resource::BUFFER) return;
     if (format) d.format = format;
     std::lock_guard g(g_lock);
-    if (g_started) obtain(address, d);
+    if (!g_started) return;
+    Image* im = obtain(address, d);
+    if (im && g_eager) make_resident(im);
 }
 
 void sampler(const uint32_t* w) {
@@ -743,12 +1039,19 @@ VkDescriptorSetLayout set_layout() { return g_layout; }
 VkDescriptorSet set() { return g_set; }
 uint64_t table() { return g_table.device; }
 
-void prepare(VkCommandBuffer cb) {
+bool prepare(VkCommandBuffer cb, int queue, uint64_t value) {
     std::vector<Image*> work;
     {
         std::lock_guard g(g_lock);
-        // Aliased images in use: new contents written through another address show as a new hash.
         uint64_t frame = g_frame.load();
+        if (frame != g_prepared_frame) {
+            // Once a frame: VRAM upkeep, and textures whose memory was not readable try again.
+            g_prepared_frame = frame;
+            manage_vram();
+            for (Image* im : g_waiting) im->waiting = false, g_pending.push_back(im);
+            g_waiting.clear();
+        }
+        // Aliased images in use: new contents written through another address show as a new hash.
         for (size_t i = 0; i < g_recent.size();) {
             Image* im = g_recent[i];
             if (im->dead || frame - im->last_used > 90) {
@@ -757,24 +1060,23 @@ void prepare(VkCommandBuffer cb) {
                 continue;
             }
             ++i;
-            if (im->checked == frame || im->dirty || im->gpu_owned) continue;
+            if (im->checked == frame || im->dirty || im->gpu_owned || !im->image) continue;
             im->checked = frame;
             uint64_t h = hash_memory(im->address, im->size);
             if (h && h != im->mem_hash) mark_dirty(im);
         }
-        if (g_pending.empty()) return;
+        if (g_pending.empty()) return false;
         work.swap(g_pending);
-        static int n = 0;
-        if (n++ < 3) KL_INFO("gpu", "prepare: %zu images pending", work.size());
     }
     std::vector<VkImageMemoryBarrier2> first;
+    std::vector<std::pair<Image*, VkImage>> cleared;  // initialized here and made by the GPU (handles taken under the lock)
     std::vector<Upload> ups;
     uint64_t total = 0;
     {
         std::lock_guard g(g_lock);
         std::sort(work.begin(), work.end());
         work.erase(std::unique(work.begin(), work.end()), work.end());
-        work.erase(std::remove_if(work.begin(), work.end(), [](Image* im) { return im->dead; }), work.end());
+        work.erase(std::remove_if(work.begin(), work.end(), [](Image* im) { return im->dead || !im->image; }), work.end());
         for (Image* im : work) {
             if (!im->initialized) {
                 im->initialized = true;
@@ -788,6 +1090,7 @@ void prepare(VkCommandBuffer cb) {
                 b.image = im->image;
                 b.subresourceRange = {all_aspects(im), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
                 first.push_back(b);
+                if (im->gpu_owned || !im->has_layout || !im->address) cleared.push_back({im, im->image});
             }
             if (im->dirty && !im->gpu_owned && im->has_layout && im->address) {
                 if (!readable(im->address, im->size)) {
@@ -799,7 +1102,7 @@ void prepare(VkCommandBuffer cb) {
                                 (unsigned long long)im->address, (unsigned long long)im->size, m.State, m.Protect, m.Type,
                                 (unsigned long long)uint64_t(m.BaseAddress), (unsigned long long)m.RegionSize);
                     }
-                    g_pending.push_back(im);  // not mapped yet: try again later
+                    if (!im->waiting) im->waiting = true, g_waiting.push_back(im);  // not mapped yet: next frame
                     continue;
                 }
                 uint64_t need = linear_size(im);
@@ -808,35 +1111,33 @@ void prepare(VkCommandBuffer cb) {
                     continue;
                 }
                 im->dirty = false;
-                ups.push_back({im, total});
+                ups.push_back({im, total, im->image});
                 total += need;
             }
         }
     }
+    memory::Block staging;
+    if (!ups.empty() && !staging_get(total, staging)) {
+        KL_WARN("gpu", "no staging memory for %llu MiB of texture uploads", (unsigned long long)(total >> 20));
+        std::lock_guard g(g_lock);
+        for (auto& u : ups)
+            if (!u.im->waiting) u.im->dirty = true, u.im->waiting = true, g_waiting.push_back(u.im);  // next frame
+        ups.clear();
+    }
     barrier(cb, first, false);
     // Images the GPU makes start cleared (title memory starts zeroed too).
-    for (auto& b : first) {
-        Image* im = nullptr;
-        for (Image* w : work)
-            if (w->image == b.image) im = w;
-        if (!im || !im->gpu_owned) continue;
-        VkImageSubresourceRange r = b.subresourceRange;
+    std::vector<std::pair<Image*, VkImage>> shown = cleared;  // slots that show their image from this submission on
+    for (auto [im, image] : cleared) {
+        VkImageSubresourceRange r = {all_aspects(im), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         if (im->depth) {
             VkClearDepthStencilValue z{0.0f, 0};
-            vk::vkCmdClearDepthStencilImage(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r);
+            vk::vkCmdClearDepthStencilImage(cb, image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r);
         } else {
             VkClearColorValue c{};
-            vk::vkCmdClearColorImage(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
+            vk::vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
         }
     }
     if (!ups.empty()) {
-        memory::Block staging;
-        if (!memory::make_block(total, false, staging)) {
-            KL_WARN("gpu", "no staging memory for %llu MiB of texture uploads", (unsigned long long)(total >> 20));
-            std::lock_guard g(g_lock);
-            for (auto& u : ups) u.im->dirty = true, g_pending.push_back(u.im);
-            return;
-        }
         std::vector<VkBufferImageCopy> regions;
         for (auto& u : ups) {
             Image* im = u.im;
@@ -876,15 +1177,30 @@ void prepare(VkCommandBuffer cb) {
                 }
             }
             if (!regions.empty())
-                vk::vkCmdCopyBufferToImage(cb, staging.buffer, im->image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(regions.size()), regions.data());
+                vk::vkCmdCopyBufferToImage(cb, staging.buffer, u.image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(regions.size()), regions.data());
+            shown.push_back({im, u.image});
             stats::add(stats::TextureUploads);
         }
-        memory::free_block(staging);  // retired after this submission
+        staging_put(staging);  // used again after this submission
     }
     barrier(cb, {}, true);
+    {
+        std::lock_guard g(g_lock);
+        // Only if it is still the same image (not evicted or replaced while this was recorded).
+        for (auto [im, image] : shown)
+            if (!im->dead && im->image == image && !im->slot_live && im->slot) im->slot_live = true, write_image_slot(im);
+        g_upload[queue & 1] = value;
+    }
+    return true;
+}
+
+uint64_t upload_value(int queue) {
+    std::lock_guard g(g_lock);
+    return g_upload[queue & 1];
 }
 
 Facts facts(Image* i) {
+    std::lock_guard g(g_lock);
     return {i->image, i->fmt.vk, i->width, i->height, i->layers, i->mips, i->depth, i->stencil, i->rt};
 }
 
@@ -898,6 +1214,7 @@ VkImageView target_view(Image* im, uint32_t dxgi, uint32_t mip, uint32_t layer, 
     mip = std::min(mip, im->mips - 1);
     layer = std::min(layer, im->layers - 1);
     if (out) *out = f;
+    if (!im->image) return VK_NULL_HANDLE;
     uint64_t key = uint64_t(f) << 32 | mip << 16 | layer;
     auto it = im->targets.find(key);
     if (it != im->targets.end()) return it->second;
@@ -926,12 +1243,16 @@ void touch(uint64_t address) {
     if (it == g_images.end()) return;
     Image* im = it->second;
     im->last_used = g_frame.load();
+    if (!im->image) make_resident(im);  // first use since it was described or evicted
     if (im->aliased && !im->in_recent) {
         im->in_recent = true;
         g_recent.push_back(im);
     }
 }
-void frame_done() { ++g_frame; }
+void frame_done() {
+    ++g_frame;
+    stats::set(stats::MemoryImports, memory::stats().imports);
+}
 
 VkFormat vk_format(uint32_t dxgi) { return format_of(dxgi).vk; }
 
@@ -940,6 +1261,7 @@ const char* describe(uint64_t address) {
     auto it = g_images.find(address);
     if (it == g_images.end()) return "unknown";
     Image* im = it->second;
+    if (!im->image) return "not resident";
     return im->gpu_owned ? "GPU-made" : im->dirty ? "waiting for upload" : "uploaded";
 }
 bool is_depth_format(uint32_t dxgi) { return depth_format(format_of(dxgi).vk); }
