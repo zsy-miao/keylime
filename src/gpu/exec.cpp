@@ -679,7 +679,9 @@ void save_cache(bool force = false) {
 }
 void save_used(bool force = false);
 std::atomic<bool> g_precompiling{false};  // `keylime precompile` is running
-void job(std::function<void()> f, bool urgent = false) {
+// `front`: ahead of other urgent work (graphics variants build in milliseconds; quick compute builds
+// can take seconds on a cold cache).
+void job(std::function<void()> f, bool urgent = false, bool front = false) {
     stats::add(stats::Compiling);
     static std::once_flag once;
     std::call_once(once, [] {
@@ -714,7 +716,8 @@ void job(std::function<void()> f, bool urgent = false) {
     });
     {
         std::lock_guard g(g_jobs_lock);
-        if (urgent) g_urgent.push_back(std::move(f));
+        if (urgent && front) g_urgent.push_front(std::move(f));
+        else if (urgent) g_urgent.push_back(std::move(f));
         else g_jobs.push_back(std::move(f));
         stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size());
     }
@@ -1111,7 +1114,7 @@ uint64_t request_variant(Compiled* k, pipeline::State* st, const Attachments& a,
         if (it == k->variants.end()) {
             k->variants[key] = VK_NULL_HANDLE;
             k->pending.insert(key);
-            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, urgent);
+            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, urgent, urgent);
         }
     }
     return key;

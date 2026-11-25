@@ -51,8 +51,15 @@ struct T {
     std::vector<Id> interface;
     std::map<uint8_t, Id> vs_inputs, vs_outputs, ps_inputs, ps_outputs;  // by row / mrt
     Id sampled_images = 0, samplers = 0, storage_images = 0, p_uc_image = 0, p_uc_sampler = 0, t_image2d = 0, t_simage2d = 0, t_storage2d = 0;
-    // registers (Function vars, made on first use)
-    Id s[SGPRS] = {}, v[VGPRS] = {}, scc = 0, pc = 0, lane = 0, lane_bit = 0;
+    // registers (Function vars, made on first use); v[1] holds the upper half's lanes in wide mode
+    Id s[SGPRS] = {}, v[2][VGPRS] = {}, scc = 0, pc = 0, lane = 0, lane_bit = 0;
+    // Wide mode (wave64 compute): one invocation runs console lanes `lane` and `lane + 32`, so a
+    // whole console wave is one 32-lane host subgroup and EXEC_HI, VCC_HI, v_readlane 32-63,
+    // prefix sums across the halves and ds_bpermute are exact. Vector instructions are emitted
+    // once per half (`h`), each with its own VGPRs and its own half of every lane mask.
+    bool wide = false;
+    int h = 0;
+    Id sg_id = 0;
     std::unordered_map<Id, uint32_t> consts;
     std::vector<Inst> insts;
     std::map<uint32_t, uint32_t> block_of;
@@ -63,7 +70,7 @@ struct T {
     std::string error;
 
     const Options* opt = nullptr;
-    T(const Program& prog, Translation& o, const Options* op) : p(prog), out(o), opt(op) {}
+    T(const Program& prog, Translation& o, const Options* op) : p(prog), out(o), opt(op) { wide = prog.wave64 && prog.stage == HwStage::Cs; }
     uint32_t ps_location(uint8_t row) const {
         if (opt) {
             auto it = opt->ps_location.find(row);
@@ -129,15 +136,35 @@ struct T {
         if (!s[i]) s[i] = b.local(p_fn_u32, u(0)), registers.insert(s[i]);
         return s[i];
     }
-    Id vreg(uint16_t i) {
-        if (!v[i & 0xff]) v[i & 0xff] = b.local(p_fn_u32, u(0)), registers.insert(v[i & 0xff]);
-        return v[i & 0xff];
+    Id vreg(uint16_t i) { return vreg_of(h, i); }
+    Id vreg_of(int half, uint16_t i) {
+        Id& r = v[half & 1][i & 0xff];
+        if (!r) r = b.local(p_fn_u32, u(0)), registers.insert(r);
+        return r;
+    }
+    // A lane-mask SGPR as this half sees it: the pair's upper dword for the upper half.
+    Id mask_reg(uint16_t lo) { return get_s(wide && lo != SNULL ? uint16_t(lo + h) : lo); }
+    Id mask_src(const Operand& o) {
+        if (wide && o.valid && !o.vgpr() && (o.code <= 105 || o.code == VCC_LO || o.code == EXEC_LO)) return get_s(uint16_t(o.code + h));
+        return raw(o);
+    }
+    // Runs `f` as if emitting for half `half` (wide mode reads of the other half's lanes).
+    template <class F>
+    auto as_half(int half, F f) {
+        int was = h;
+        h = half;
+        auto r = f();
+        h = was;
+        return r;
     }
     Id get_s(uint16_t i) { return i == SNULL ? u(0) : load(sreg(i), t_u32); }
     void set_s(uint16_t i, Id x) {
-        if (i == EXEC_LO) ++exec_gen;
+        if (i == EXEC_LO || i == EXEC_HI) ++exec_gen;
         if (i != SNULL && i < SGPRS) store(sreg(i), x);
     }
+    // Both dwords of a lane mask ORed: zero when no lane of the 64 is set (the upper one stays 0 for wave32).
+    // (wave32 code may use vcc_hi as a plain SGPR, so only wave64 programs read the upper dword.)
+    Id mask64(uint16_t lo) { return p.wave64 ? bor(get_s(lo), get_s(uint16_t(lo + 1))) : get_s(lo); }
     Id get_scc() { return load(scc, t_bool); }
     void set_scc(Id c) { store(scc, c); }
     Id get_v(uint16_t i) { return load(vreg(i), t_u32); }
@@ -159,8 +186,8 @@ struct T {
         }
         if (c == 255) return u(o.literal);
         if (c == 253) return b2u(get_scc());
-        if (c == 251) return b2u(b.op(spv::OpIEqual, t_bool, {get_s(VCC_LO), u(0)}));  // vccz
-        if (c == 252) return b2u(b.op(spv::OpIEqual, t_bool, {get_s(EXEC_LO), u(0)}));  // execz
+        if (c == 251) return b2u(b.op(spv::OpIEqual, t_bool, {mask64(VCC_LO), u(0)}));  // vccz
+        if (c == 252) return b2u(b.op(spv::OpIEqual, t_bool, {mask64(EXEC_LO), u(0)}));  // execz
         return u(0);
     }
     Id fmods(Id x, const Operand& o) {
@@ -210,12 +237,12 @@ struct T {
     Id pack_half(Id lo, Id hi) { return ext(GLSLstd450PackHalf2x16, t_u32, {b.op(spv::OpCompositeConstruct, t_v2f, {lo, hi})}); }
 
     // Lane state.
-    Id act_value = 0;
-    uint32_t act_block = ~0u, act_gen = ~0u, exec_gen = 0;
+    Id act_value[2] = {};
+    uint32_t act_block[2] = {~0u, ~0u}, act_gen[2] = {~0u, ~0u}, exec_gen = 0;
     Id active() {
-        if (act_gen == exec_gen && act_block == b.labels) return act_value;
-        act_gen = exec_gen, act_block = b.labels;
-        return act_value = mask_bit(get_s(EXEC_LO));
+        if (act_gen[h] == exec_gen && act_block[h] == b.labels) return act_value[h];
+        act_gen[h] = exec_gen, act_block[h] = b.labels;
+        return act_value[h] = mask_bit(mask_reg(EXEC_LO));
     }
     void set_v(uint16_t i, Id x) {
         Id old = get_v(i);
@@ -241,6 +268,7 @@ struct T {
     // A per-lane condition into a wave mask register (VOPC semantics: inactive lanes read 0).
     void set_mask(uint16_t sdst, Id cond) {
         Id m = ballot(b.op(spv::OpLogicalAnd, t_bool, {cond, active()}));
+        if (wide) return set_s(sdst == SNULL ? sdst : uint16_t(sdst + h), m);
         set_s(sdst, m);
         if (sdst != SNULL && p.wave64) set_s(uint16_t(sdst + 1), u(0));
     }
@@ -472,6 +500,7 @@ struct T {
             b.capability(spv::CapabilityGroupNonUniform);
             local_id = input(b.t_vec(t_u32, 3), spv::BuiltInLocalInvocationId);
             group_id = input(b.t_vec(t_u32, 3), spv::BuiltInWorkgroupId);
+            if (wide) sg_id = input(t_u32, spv::BuiltInSubgroupId);
             if (p.lds_bytes) {
                 Id arr = b.t_array(t_u32, (p.lds_bytes + 3) / 4);
                 lds = b.variable(b.t_ptr(spv::StorageClassWorkgroup, arr), spv::StorageClassWorkgroup);
@@ -647,9 +676,24 @@ struct T {
                 }
             }
         } else if (p.stage == HwStage::Cs) {
-            Id lid = load(local_id, b.t_vec(t_u32, 3));
             uint32_t tid_comps = ((p.cs_rsrc2 >> 11) & 3) + 1;  // TIDIG_COMP_CNT
-            for (uint32_t k = 0; k < tid_comps && k < 3; ++k) store(vreg(uint16_t(k)), b.op(spv::OpCompositeExtract, t_u32, {lid, k}));
+            if (wide) {
+                // Console wave w = host subgroup w; its lanes `lane` and `lane + 32` here. The
+                // thread's index in the console group gives its x/y/z; lanes past the group's
+                // size are not in EXEC.
+                uint32_t X = std::max(p.cs_threads[0], 1u), Y = std::max(p.cs_threads[1], 1u), Z = std::max(p.cs_threads[2], 1u);
+                Id wave = load(sg_id, t_u32);
+                for (int hh = 0; hh < 2; ++hh) {
+                    Id li = iadd(iadd(b.op(spv::OpIMul, t_u32, {wave, u(64)}), u(uint32_t(32 * hh))), lane);
+                    Id xyz[3] = {b.op(spv::OpUMod, t_u32, {li, u(X)}), b.op(spv::OpUMod, t_u32, {b.op(spv::OpUDiv, t_u32, {li, u(X)}), u(Y)}),
+                                 b.op(spv::OpUDiv, t_u32, {li, u(X * Y)})};
+                    for (uint32_t k = 0; k < tid_comps && k < 3; ++k) store(vreg_of(hh, uint16_t(k)), xyz[k]);
+                    set_s(uint16_t(EXEC_LO + hh), ballot(b.op(spv::OpULessThan, t_bool, {li, u(X * Y * Z)})));
+                }
+            } else {
+                Id lid = load(local_id, b.t_vec(t_u32, 3));
+                for (uint32_t k = 0; k < tid_comps && k < 3; ++k) store(vreg(uint16_t(k)), b.op(spv::OpCompositeExtract, t_u32, {lid, k}));
+            }
             uint32_t user = (p.cs_rsrc2 >> 1) & 0x1f;
             uint16_t at = uint16_t(user);
             Id gid = load(group_id, b.t_vec(t_u32, 3));
@@ -695,6 +739,21 @@ struct T {
     void vres_f(const Inst& i, Id x) { set_v(i.dst.vgpr_index(), tou(fclamp(omod(x, i.omod), i.clamp))); }
     void vres_u(const Inst& i, Id x) { set_v(i.dst.vgpr_index(), x); }
 
+    // v_cmp_class: whether the float's class is one the mask names (bit 0 signaling NaN, 1 quiet
+    // NaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf).
+    Id fclass(Id bits, Id mask, const Operand& o) {
+        if (o.abs) bits = band(bits, u(0x7fffffff));
+        if (o.neg) bits = bxor(bits, u(0x80000000));
+        Id e = band(shr(bits, u(23)), u(0xff)), m = band(bits, u(0x7fffff));
+        Id neg = ne0(shr(bits, u(31)));
+        auto eq = [&](Id a, uint32_t k) { return b.op(spv::OpIEqual, t_bool, {a, u(k)}); };
+        Id e_max = eq(e, 255), e_zero = eq(e, 0), m_zero = eq(m, 0);
+        auto side = [&](uint32_t nk, uint32_t pk) { return sel(t_u32, neg, u(nk), u(pk)); };
+        Id idx = sel(t_u32, e_max, sel(t_u32, m_zero, side(2, 9), sel(t_u32, ne0(band(m, u(0x400000))), u(1), u(0))),
+                     sel(t_u32, e_zero, sel(t_u32, m_zero, side(5, 6), side(4, 7)), side(3, 8)));
+        return ne0(band(shr(mask, idx), u(1)));
+    }
+
     bool vcmp(const Inst& i, std::string_view n) {
         // v_cmp{x}_<op>_<type>
         bool x = n.rfind("v_cmpx_", 0) == 0;
@@ -716,7 +775,7 @@ struct T {
             else
                 for (auto& [nm, o] : ops)
                     if (op == nm) c = b.op(o, t_bool, {a, z});
-            if (op == "class") return false;
+            if (op == "class") c = fclass(raw(i.src[0]), raw(i.src[1]), i.src[0]);
         } else if (ty == "u32" || ty == "i32") {
             Id a = raw(i.src[0]), z = raw(i.src[1]);
             bool s = ty == "i32";
@@ -763,8 +822,8 @@ struct T {
         if (!c) return false;
         if (x) {
             Id m = ballot(b.op(spv::OpLogicalAnd, t_bool, {c, active()}));
-            set_s(EXEC_LO, m);
-            if (i.enc == Enc::VOP3 && i.sdst.valid) set_s(i.sdst.code, m);
+            set_s(uint16_t(EXEC_LO + (wide ? h : 0)), m);
+            if (i.enc == Enc::VOP3 && i.sdst.valid) set_s(uint16_t(i.sdst.code + (wide ? h : 0)), m);
         } else {
             uint16_t sd = i.enc == Enc::VOP3 ? i.sdst.code : VCC_LO;
             set_mask(sd, c);
@@ -815,7 +874,7 @@ struct T {
             }
             // Row / bank masks: lanes of masked-off rows or banks keep their destination.
             if (i.dpp_row_mask != 0xf || i.dpp_bank_mask != 0xf) {
-                Id row_on = ne0(band(shr(u(i.dpp_row_mask), shr(lane, u(4))), u(1)));
+                Id row_on = ne0(band(shr(u(i.dpp_row_mask), iadd(shr(lane, u(4)), u(uint32_t(2 * h)))), u(1)));
                 Id bank_on = ne0(band(shr(u(i.dpp_bank_mask), band(shr(lane, u(2)), u(3))), u(1)));
                 dpp_write = b.op(spv::OpLogicalAnd, t_bool, {row_on, bank_on});
             }
@@ -943,6 +1002,11 @@ struct T {
             if (n == "s_brev_b32") return sres(b.op(spv::OpBitReverse, t_u32, {S0()}));
             if (n == "s_bcnt1_i32_b32") { Id r = b.op(spv::OpBitCount, t_u32, {S0()}); sres(r); return set_scc(ne0(r)); }
             if (n == "s_ff1_i32_b32") return sres(tou(ext(GLSLstd450FindILsb, t_i32, {S0()})));
+            if (n == "s_ff1_i32_b64") {
+                Id lo = get_s(i.src[0].code), hi = get_s(uint16_t(i.src[0].code + 1));
+                Id lsb_lo = tou(ext(GLSLstd450FindILsb, t_i32, {lo})), lsb_hi = tou(ext(GLSLstd450FindILsb, t_i32, {hi}));
+                return sres(sel(t_u32, ne0(lo), lsb_lo, sel(t_u32, ne0(hi), iadd(lsb_hi, u(32)), u(~0u))));
+            }
             if (n == "s_flbit_i32_b32") {
                 Id m = ext(GLSLstd450FindUMsb, t_i32, {S0()});
                 return sres(sel(t_u32, b.op(spv::OpSLessThan, t_bool, {m, b.c_i32(0)}), u(~0u), isub(u(31), tou(m))));
@@ -1154,7 +1218,7 @@ struct T {
         if (n == "v_pack_b32_f16") return vres_u(i, bor(band(S0(), u(0xffff)), shl(S1(), u(16))));
         if (n == "v_cvt_pk_u16_u32") return vres_u(i, bor(band(S0(), u(0xffff)), shl(S1(), u(16))));
         if (n == "v_cndmask_b32") {
-            Id mask = i.enc == Enc::VOP3 ? raw(i.src[2]) : get_s(VCC_LO);
+            Id mask = i.enc == Enc::VOP3 ? mask_src(i.src[2]) : mask_reg(VCC_LO);
             Id a = S0(), z = S1();
             if (i.enc == Enc::VOP3) {  // float modifiers apply to the selected values
                 if (i.src[0].abs || i.src[0].neg) a = tou(F0());
@@ -1241,7 +1305,7 @@ struct T {
         if (n == "v_add_co_ci_u32" || n == "v_sub_co_ci_u32" || n == "v_subrev_co_ci_u32") {
             Id a = S0(), z = S1();
             if (n == "v_subrev_co_ci_u32") std::swap(a, z);
-            Id cin_mask = i.enc == Enc::VOP3 ? raw(i.src[2]) : get_s(VCC_LO);
+            Id cin_mask = i.enc == Enc::VOP3 ? mask_src(i.src[2]) : mask_reg(VCC_LO);
             Id cin = b2u(mask_bit(cin_mask));
             bool add = n == "v_add_co_ci_u32";
             Id r = add ? iadd(iadd(a, z), cin) : isub(isub(a, z), cin);
@@ -1253,30 +1317,47 @@ struct T {
             set_mask(i.enc == Enc::VOP3 ? i.sdst.code : VCC_LO, carry);
             return;
         }
+        // (Wide mode emits these three once: they read or write both halves themselves.)
+        auto shuffle = [&](Id x, Id from) { return b.op(spv::OpGroupNonUniformShuffle, t_u32, {u(spv::ScopeSubgroup), x, from}); };
         if (n == "v_readfirstlane_b32") {
             // The first lane in EXEC (every invocation runs every block, so the subgroup's
             // first invocation is not the first active lane).
+            auto first_of = [&](Id e) { return sel(t_u32, ne0(e), tou(ext(GLSLstd450FindILsb, t_i32, {e})), u(0)); };
             Id e = get_s(EXEC_LO);
-            Id first = sel(t_u32, ne0(e), tou(ext(GLSLstd450FindILsb, t_i32, {e})), u(0));
-            Id x = b.op(spv::OpGroupNonUniformShuffle, t_u32, {u(spv::ScopeSubgroup), S0(), first});
+            Id x = shuffle(as_half(0, S0), first_of(e));
+            if (wide) x = sel(t_u32, ne0(e), x, shuffle(as_half(1, S0), first_of(get_s(EXEC_HI))));
             return set_s(i.dst.vgpr() ? i.dst.vgpr_index() : i.dst.code, x);  // dst is an SGPR (encoded in vdst)
         }
         if (n == "v_readlane_b32") {
-            Id x = b.op(spv::OpGroupNonUniformShuffle, t_u32, {u(spv::ScopeSubgroup), S0(), band(S1(), u(31))});
+            Id at = S1();
+            Id x = shuffle(as_half(0, S0), band(at, u(31)));
+            if (wide) x = sel(t_u32, ne0(band(at, u(32))), shuffle(as_half(1, S0), band(at, u(31))), x);
             uint16_t d = i.enc == Enc::VOP3 ? uint16_t(i.dst.code - 256) : i.dst.code;
             return set_s(d, x);
         }
         if (n == "v_writelane_b32") {
-            Id is = b.op(spv::OpIEqual, t_bool, {lane, band(S1(), u(31))});
-            Id old = get_v(i.dst.vgpr_index());
-            store(vreg(i.dst.vgpr_index()), sel(t_u32, is, S0(), old));
+            Id at = S1(), val = S0();
+            for (int hh = 0; hh < (wide ? 2 : 1); ++hh) {
+                Id is = b.op(spv::OpIEqual, t_bool, {lane, band(at, u(31))});
+                if (wide) is = b.op(spv::OpLogicalAnd, t_bool, {is, b.op(spv::OpIEqual, t_bool, {band(shr(at, u(5)), u(1)), u(uint32_t(hh))})});
+                Id r = vreg_of(hh, i.dst.vgpr_index());
+                store(r, sel(t_u32, is, val, load(r, t_u32)));
+            }
             return;
         }
         if (n == "v_mbcnt_lo_u32_b32") {
             Id below = isub(shl(u(1), lane), u(1));
+            if (wide && h == 1) return vres_u(i, iadd(b.op(spv::OpBitCount, t_u32, {S0()}), S1()));  // every low lane is below
             return vres_u(i, iadd(b.op(spv::OpBitCount, t_u32, {band(S0(), below)}), S1()));
         }
-        if (n == "v_mbcnt_hi_u32_b32") return vres_u(i, ms_half ? iadd(shl(ms_half, u(5)), S1()) : S1());
+        if (n == "v_mbcnt_hi_u32_b32") {
+            if (wide) {
+                if (h == 0) return vres_u(i, S1());
+                Id below = isub(shl(u(1), lane), u(1));
+                return vres_u(i, iadd(b.op(spv::OpBitCount, t_u32, {band(S0(), below)}), S1()));
+            }
+            return vres_u(i, ms_half ? iadd(shl(ms_half, u(5)), S1()) : S1());
+        }
         if (n == "v_permlanex16_b32" || n == "v_permlane16_b32") {
             // Lane select from two 32-bit selectors (4 bits per lane of the 16-lane row).
             Id sel_lo = S1(), sel_hi = S2();
@@ -1358,6 +1439,155 @@ struct T {
             };
             return vres_u(i, pack_half(lanes(0), lanes(1)));
         }
+        // ---- mixed precision: each source f32, or the low or high f16 of a dword (op_sel_hi says
+        // f16, op_sel which half); neg_lo negates, neg_hi takes the absolute value ----
+        if (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16" || n == "v_mad_mix_f32" || n == "v_mad_mixlo_f16" || n == "v_mad_mixhi_f16") {
+            static const float fl[] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f, 0.15915494f};
+            auto mix = [&](int k) {
+                const Operand& o = i.src[k];
+                Id x;
+                if ((i.opsel_hi >> k) & 1) {
+                    if (o.code >= 240 && o.code <= 248) x = f(fl[o.code - 240]);  // inline constants are the value itself
+                    else x = half(ov[k] ? ov[k] : raw(o), (i.opsel >> k) & 1);
+                } else {
+                    x = tof(ov[k] ? ov[k] : raw(o));
+                }
+                if ((i.neg_hi >> k) & 1) x = ext(GLSLstd450FAbs, t_f32, {x});
+                if (o.neg) x = b.op(spv::OpFNegate, t_f32, {x});
+                return x;
+            };
+            Id r = ext(GLSLstd450Fma, t_f32, {mix(0), mix(1), mix(2)});
+            if (i.clamp) r = ext(GLSLstd450FClamp, t_f32, {r, f(0), f(1)});
+            if (n.find("mix_f32") != std::string_view::npos) return vres_u(i, tou(r));
+            Id old = get_v(i.dst.vgpr_index());
+            Id hv = band(pack_half(r, f(0)), u(0xffff));
+            bool hi = n.find("mixhi") != std::string_view::npos;
+            return vres_u(i, hi ? bor(band(old, u(0xffff)), shl(hv, u(16))) : bor(band(old, u(0xffff0000)), hv));
+        }
+        // ---- 16-bit float arithmetic: low (or op_sel) halves in, the low (or op_sel[3]) half out,
+        // the other half kept ----
+        if (n == "v_add_f16" || n == "v_sub_f16" || n == "v_subrev_f16" || n == "v_mul_f16" || n == "v_fma_f16" || n == "v_fmac_f16" ||
+            n == "v_mad_f16" || n == "v_mac_f16" || n == "v_rcp_f16" || n == "v_sqrt_f16" || n == "v_rsq_f16" || n == "v_ldexp_f16" ||
+            n == "v_floor_f16" || n == "v_ceil_f16" || n == "v_trunc_f16" || n == "v_fract_f16" || n == "v_rndne_f16" || n == "v_exp_f16" ||
+            n == "v_log_f16" || n == "v_sin_f16" || n == "v_cos_f16") {
+            auto hs = [&](int k) {
+                Id x = half(ov[k] ? ov[k] : raw(i.src[k]), (i.opsel >> k) & 1);
+                if (i.src[k].abs) x = ext(GLSLstd450FAbs, t_f32, {x});
+                if (i.src[k].neg) x = b.op(spv::OpFNegate, t_f32, {x});
+                return x;
+            };
+            Id old = get_v(i.dst.vgpr_index());
+            bool dst_hi = (i.opsel & 8) != 0;
+            Id r;
+            if (n == "v_add_f16") r = b.op(spv::OpFAdd, t_f32, {hs(0), hs(1)});
+            else if (n == "v_sub_f16") r = b.op(spv::OpFSub, t_f32, {hs(0), hs(1)});
+            else if (n == "v_subrev_f16") r = b.op(spv::OpFSub, t_f32, {hs(1), hs(0)});
+            else if (n == "v_mul_f16") r = b.op(spv::OpFMul, t_f32, {hs(0), hs(1)});
+            else if (n == "v_fma_f16" || n == "v_mad_f16") r = ext(GLSLstd450Fma, t_f32, {hs(0), hs(1), hs(2)});
+            else if (n == "v_fmac_f16" || n == "v_mac_f16") r = ext(GLSLstd450Fma, t_f32, {hs(0), hs(1), half(old, dst_hi)});
+            else if (n == "v_rcp_f16") r = b.op(spv::OpFDiv, t_f32, {f(1), hs(0)});
+            else if (n == "v_sqrt_f16") r = ext(GLSLstd450Sqrt, t_f32, {hs(0)});
+            else if (n == "v_rsq_f16") r = ext(GLSLstd450InverseSqrt, t_f32, {hs(0)});
+            else if (n == "v_ldexp_f16") r = ext(GLSLstd450Ldexp, t_f32, {hs(0), bc(t_i32, b.op(spv::OpBitFieldSExtract, t_i32, {bc(t_i32, S1()), u(0), u(16)}))});
+            else if (n == "v_floor_f16") r = ext(GLSLstd450Floor, t_f32, {hs(0)});
+            else if (n == "v_ceil_f16") r = ext(GLSLstd450Ceil, t_f32, {hs(0)});
+            else if (n == "v_trunc_f16") r = ext(GLSLstd450Trunc, t_f32, {hs(0)});
+            else if (n == "v_fract_f16") r = ext(GLSLstd450Fract, t_f32, {hs(0)});
+            else if (n == "v_rndne_f16") r = ext(GLSLstd450RoundEven, t_f32, {hs(0)});
+            else if (n == "v_exp_f16") r = ext(GLSLstd450Exp2, t_f32, {hs(0)});
+            else if (n == "v_log_f16") r = ext(GLSLstd450Log2, t_f32, {hs(0)});
+            else if (n == "v_sin_f16") r = ext(GLSLstd450Sin, t_f32, {b.op(spv::OpFMul, t_f32, {hs(0), f(6.2831853f)})});
+            else r = ext(GLSLstd450Cos, t_f32, {b.op(spv::OpFMul, t_f32, {hs(0), f(6.2831853f)})});
+            if (i.clamp) r = ext(GLSLstd450FClamp, t_f32, {r, f(0), f(1)});
+            Id hv = band(pack_half(r, f(0)), u(0xffff));
+            return vres_u(i, dst_hi ? bor(band(old, u(0xffff)), shl(hv, u(16))) : bor(band(old, u(0xffff0000)), hv));
+        }
+        if (n == "v_lshrrev_b16" || n == "v_lshlrev_b16" || n == "v_ashrrev_i16" || n == "v_add_u16" || n == "v_sub_u16" || n == "v_mul_lo_u16") {
+            Id a = band(S0(), u(0xffff)), z = band(S1(), u(0xffff)), r;
+            if (n == "v_lshrrev_b16") r = shr(z, band(a, u(15)));
+            else if (n == "v_lshlrev_b16") r = shl(z, band(a, u(15)));
+            else if (n == "v_ashrrev_i16") r = tou(b.op(spv::OpShiftRightArithmetic, t_i32, {b.op(spv::OpBitFieldSExtract, t_i32, {bc(t_i32, z), u(0), u(16)}), band(a, u(15))}));
+            else if (n == "v_add_u16") r = iadd(a, z);
+            else if (n == "v_sub_u16") r = isub(a, z);
+            else r = b.op(spv::OpIMul, t_u32, {a, z});
+            Id old = get_v(i.dst.vgpr_index());
+            return vres_u(i, (i.opsel & 8) ? bor(band(old, u(0xffff)), shl(r, u(16))) : bor(band(old, u(0xffff0000)), band(r, u(0xffff))));
+        }
+        // ---- cube map coordinates: face id, s and t on the face, twice the major axis ----
+        if (n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32") {
+            Id x = F0(), y = F1(), z = F2();
+            auto fabs_ = [&](Id a) { return ext(GLSLstd450FAbs, t_f32, {a}); };
+            auto neg = [&](Id a) { return b.op(spv::OpFNegate, t_f32, {a}); };
+            auto lt0 = [&](Id a) { return b.op(spv::OpFOrdLessThan, t_bool, {a, f(0)}); };
+            auto ge = [&](Id a, Id c) { return b.op(spv::OpFOrdGreaterThanEqual, t_bool, {a, c}); };
+            Id ax = fabs_(x), ay = fabs_(y), az = fabs_(z);
+            Id zmaj = b.op(spv::OpLogicalAnd, t_bool, {ge(az, ax), ge(az, ay)});
+            Id ymaj = b.op(spv::OpLogicalAnd, t_bool, {b.op(spv::OpLogicalNot, t_bool, {zmaj}), ge(ay, ax)});
+            auto pick = [&](Id zv, Id yv, Id xv) { return sel(t_f32, zmaj, zv, sel(t_f32, ymaj, yv, xv)); };
+            Id r;
+            if (n == "v_cubeid_f32")
+                r = pick(sel(t_f32, lt0(z), f(5), f(4)), sel(t_f32, lt0(y), f(3), f(2)), sel(t_f32, lt0(x), f(1), f(0)));
+            else if (n == "v_cubesc_f32")
+                r = pick(sel(t_f32, lt0(z), neg(x), x), x, sel(t_f32, lt0(x), z, neg(z)));
+            else if (n == "v_cubetc_f32")
+                r = pick(neg(y), sel(t_f32, lt0(y), neg(z), z), neg(y));
+            else
+                r = b.op(spv::OpFMul, t_f32, {f(2), pick(z, y, x)});
+            return vres_f(i, r);
+        }
+        // ---- VGPR indexed by M0 ----
+        if (n == "v_movrels_b32" || n == "v_movreld_b32" || n == "v_movrelsd_b32") {
+            Id m0 = get_s(M0);
+            uint32_t base_s = i.src[0].vgpr() ? i.src[0].vgpr_index() : 0, base_d = i.dst.vgpr_index();
+            uint32_t limit = std::max<uint32_t>(p.vgprs, 1);
+            if (n == "v_movreld_b32") {  // VGPR[dst + M0] = src0
+                Id val = S0(), act = active();
+                for (uint32_t k = 0; base_d + k < limit && base_d + k < VGPRS; ++k) {
+                    Id r = vreg(uint16_t(base_d + k));
+                    Id hit = b.op(spv::OpLogicalAnd, t_bool, {act, b.op(spv::OpIEqual, t_bool, {m0, u(k)})});
+                    store(r, sel(t_u32, hit, val, load(r, t_u32)));
+                }
+                return;
+            }
+            Id x = u(0);  // VGPR[src0 + M0]
+            for (uint32_t k = 0; base_s + k < limit && base_s + k < VGPRS; ++k)
+                x = sel(t_u32, b.op(spv::OpIEqual, t_bool, {m0, u(k)}), get_v(uint16_t(base_s + k)), x);
+            if (n == "v_movrels_b32") return vres_u(i, x);
+            Id act = active();  // movrelsd: VGPR[dst + M0] = VGPR[src0 + M0]
+            for (uint32_t k = 0; base_d + k < limit && base_d + k < VGPRS; ++k) {
+                Id r = vreg(uint16_t(base_d + k));
+                Id hit = b.op(spv::OpLogicalAnd, t_bool, {act, b.op(spv::OpIEqual, t_bool, {m0, u(k)})});
+                store(r, sel(t_u32, hit, x, load(r, t_u32)));
+            }
+            return;
+        }
+        if (n == "v_swap_b32") {
+            uint16_t a = i.dst.vgpr_index(), z = i.src[0].vgpr_index();
+            Id va = get_v(a), vz = get_v(z), act = active();
+            store(vreg(a), sel(t_u32, act, vz, va));
+            store(vreg(z), sel(t_u32, act, va, vz));
+            return;
+        }
+        if (n == "v_cvt_pk_u8_f32") {
+            Id byte = b.op(spv::OpConvertFToU, t_u32, {ext(GLSLstd450FClamp, t_f32, {ext(GLSLstd450RoundEven, t_f32, {F0()}), f(0), f(255)})});
+            Id sh = shl(band(S1(), u(3)), u(3));
+            return vres_u(i, bor(band(S2(), bnot(shl(u(0xff), sh))), shl(byte, sh)));
+        }
+        // ---- 16-bit interpolation (attribute in src0: bits 0-5, channel in bits 6-7). The host
+        // interpolates the attribute row as floats; p1ll is the first half of the pair. ----
+        if (n == "v_interp_p1ll_f16" || n == "v_interp_p1lv_f16") return vres_u(i, u(0));
+        if (n == "v_interp_p2_f16") {
+            uint32_t attr = i.src[0].code & 63, chan = (i.src[0].code >> 6) & 3;
+            auto it = ps_inputs.find(uint8_t(attr));
+            if (it == ps_inputs.end()) return unsupported(i);
+            // A compressed export (f16 pairs) arrives here unpacked into four floats: channel c's
+            // low and high halves are the row's components 2c and 2c + 1.
+            uint32_t comp = std::min<uint32_t>(2 * chan + (i.opsel & 1), 3);
+            Id val = b.op(spv::OpCompositeExtract, t_f32, {load(it->second, t_v4f), comp});
+            Id old = get_v(i.dst.vgpr_index());
+            Id hv = band(pack_half(val, f(0)), u(0xffff));
+            return vres_u(i, (i.opsel & 8) ? bor(band(old, u(0xffff)), shl(hv, u(16))) : bor(band(old, u(0xffff0000)), hv));
+        }
         if (n == "v_cmp_class_f32") return unsupported(i);
         return unsupported(i);
     }
@@ -1422,7 +1652,8 @@ struct T {
         if (i.enc == Enc::GLOBAL || i.enc == Enc::FLAT) {
             bool load_op = n.find("load") != std::string_view::npos, store_op = n.find("store") != std::string_view::npos;
             bool atomic = n.find("_atomic_") != std::string_view::npos;
-            if (!atomic && (!(load_op || store_op) || n.find("dword") == std::string_view::npos)) return unsupported(i);
+            bool small = n.find("byte") != std::string_view::npos || n.find("short") != std::string_view::npos;
+            if (!atomic && (!(load_op || store_op) || (n.find("dword") == std::string_view::npos && !small))) return unsupported(i);
             Id addr;
             if (i.enc == Enc::GLOBAL && i.saddr != 0x7d && i.saddr != 0x7f) {
                 Operand sa;
@@ -1435,6 +1666,22 @@ struct T {
             }
             addr = add64s(addr, u(uint32_t(i.mem_offset)));
             if (atomic) return buffer_atomic(i, n, addr, b.c_bool(true), i.vdata);
+            if (small) {  // 8 / 16 bits: through the aligned dword
+                bool is_byte = n.find("byte") != std::string_view::npos;
+                bool sext = n.find("sbyte") != std::string_view::npos || n.find("sshort") != std::string_view::npos;
+                uint32_t width = is_byte ? 8 : 16;
+                Id aligned = b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64(~3ull)});
+                Id shift = shl(b.op(spv::OpUConvert, t_u32, {b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64(3)})}), u(3));
+                Id word = mem_load(aligned);
+                if (load_op) {
+                    Id v_ = sext ? tou(b.op(spv::OpBitFieldSExtract, t_i32, {bc(t_i32, word), shift, u(width)}))
+                                 : b.op(spv::OpBitFieldUExtract, t_u32, {word, shift, u(width)});
+                    return set_v(i.dst.vgpr_index(), v_);
+                }
+                Id merged = b.op(spv::OpBitFieldInsert, t_u32, {word, get_v(i.vdata), shift, u(width)});
+                mem_store_n(aligned, active(), {merged});
+                return;
+            }
             uint16_t data = load_op ? i.dst.vgpr_index() : i.vdata;
             if (load_op) {
                 auto words = mem_load_n(addr, count);
@@ -1480,29 +1727,57 @@ struct T {
                 return;
             }
         }
-        if (i.enc == Enc::DS && lds && (n == "ds_add_u32" || n == "ds_add_rtn_u32" || n == "ds_sub_u32" || n == "ds_or_b32" ||
-                                         n == "ds_and_b32" || n == "ds_max_u32" || n == "ds_min_u32" || n == "ds_xor_b32" ||
-                                         n == "ds_write_b16" || n == "ds_write_b8")) {
+        if (i.enc == Enc::DS && lds && (n == "ds_write_b16" || n == "ds_write_b8")) {
             Id addr = iadd(get_v(i.vaddr), u(uint32_t(i.mem_offset & 0xffff)));
             Id ptr = b.op(spv::OpAccessChain, lds_ptr, {lds, ext(GLSLstd450UMin, t_u32, {shr(addr, u(2)), u((p.lds_bytes + 3) / 4 - 1)})});
-            if (n == "ds_write_b16" || n == "ds_write_b8") {
-                Id shift = shl(band(addr, u(3)), u(3));
-                Id merged = b.op(spv::OpBitFieldInsert, t_u32, {load(ptr, t_u32), get_v(i.data0), shift, u(n == "ds_write_b16" ? 16 : 8)});
-                store(ptr, sel(t_u32, active(), merged, load(ptr, t_u32)));
-                return;
-            }
-            spv::Op op = n.find("add") != std::string_view::npos ? spv::OpAtomicIAdd : n.find("sub") != std::string_view::npos ? spv::OpAtomicISub
-                       : n.find("_or_") != std::string_view::npos ? spv::OpAtomicOr : n.find("_and_") != std::string_view::npos ? spv::OpAtomicAnd
-                       : n.find("xor") != std::string_view::npos ? spv::OpAtomicXor : n.find("max") != std::string_view::npos ? spv::OpAtomicUMax : spv::OpAtomicUMin;
-            Id val = sel(t_u32, active(), get_v(i.data0), n.find("_and_") != std::string_view::npos ? u(~0u) : n.find("min") != std::string_view::npos ? u(~0u) : u(0));
-            if (op == spv::OpAtomicUMax) val = sel(t_u32, active(), get_v(i.data0), u(0));
-            Id old = b.op(op, t_u32, {ptr, u(spv::ScopeWorkgroup), u(0), val});
-            if (n == "ds_add_rtn_u32") set_v(i.dst.vgpr_index(), old);
+            Id shift = shl(band(addr, u(3)), u(3));
+            Id merged = b.op(spv::OpBitFieldInsert, t_u32, {load(ptr, t_u32), get_v(i.data0), shift, u(n == "ds_write_b16" ? 16 : 8)});
+            store(ptr, sel(t_u32, active(), merged, load(ptr, t_u32)));
             return;
         }
+        // LDS atomics: ds_<op>[_rtn]_<u32|i32|b32>; inactive lanes leave memory alone.
+        if (i.enc == Enc::DS && lds && n.size() > 7 && (n.substr(n.size() - 4) == "_u32" || n.substr(n.size() - 4) == "_i32" || n.substr(n.size() - 4) == "_b32")) {
+            std::string_view body = n.substr(3, n.size() - 7);
+            bool rtn = body.size() > 4 && body.substr(body.size() - 4) == "_rtn";
+            if (rtn) body = body.substr(0, body.size() - 4);
+            bool sg = n.substr(n.size() - 4) == "_i32";
+            spv::Op op = body == "add" ? spv::OpAtomicIAdd : body == "sub" ? spv::OpAtomicISub : body == "or" ? spv::OpAtomicOr
+                       : body == "and" ? spv::OpAtomicAnd : body == "xor" ? spv::OpAtomicXor
+                       : body == "max" ? (sg ? spv::OpAtomicSMax : spv::OpAtomicUMax) : body == "min" ? (sg ? spv::OpAtomicSMin : spv::OpAtomicUMin)
+                       : body == "wrxchg" ? spv::OpAtomicExchange : body == "inc" ? spv::OpAtomicIIncrement : spv::OpNop;
+            if (op != spv::OpNop && op != spv::OpAtomicIIncrement) {
+                Id addr = iadd(get_v(i.vaddr), u(uint32_t(i.mem_offset & 0xffff)));
+                Id ptr = b.op(spv::OpAccessChain, lds_ptr, {lds, ext(GLSLstd450UMin, t_u32, {shr(addr, u(2)), u((p.lds_bytes + 3) / 4 - 1)})});
+                Id act = active(), val = get_v(i.data0), old;
+                if (op == spv::OpAtomicExchange) {
+                    Id res = b.local(p_fn_u32, u(0));
+                    store(res, load(ptr, t_u32));
+                    if_then(act, [&] { store(res, b.op(spv::OpAtomicExchange, t_u32, {ptr, u(spv::ScopeWorkgroup), u(0), val})); });
+                    old = load(res, t_u32);
+                } else {
+                    Id neutral = body == "and" || (body == "min" && !sg) ? u(~0u) : body == "min" ? u(0x7fffffff) : body == "max" && sg ? u(0x80000000) : u(0);
+                    old = b.op(op, t_u32, {ptr, u(spv::ScopeWorkgroup), u(0), sel(t_u32, act, val, neutral)});
+                }
+                if (rtn) set_v(i.dst.vgpr_index(), old);
+                return;
+            }
+        }
         if (i.enc == Enc::DS && n == "ds_bpermute_b32") {
-            Id from = band(shr(iadd(get_v(i.vaddr), u(uint32_t(i.mem_offset & 0xffff))), u(2)), u(31));
-            return set_v(i.dst.vgpr_index(), b.op(spv::OpGroupNonUniformShuffle, t_u32, {u(spv::ScopeSubgroup), get_v(i.data0), from}));
+            auto shuf = [&](Id x, Id from) { return b.op(spv::OpGroupNonUniformShuffle, t_u32, {u(spv::ScopeSubgroup), x, from}); };
+            if (!wide) {
+                Id from = band(shr(iadd(get_v(i.vaddr), u(uint32_t(i.mem_offset & 0xffff))), u(2)), u(31));
+                return set_v(i.dst.vgpr_index(), shuf(get_v(i.data0), from));
+            }
+            // Wide (emitted once): every lane's result from both halves' sources, then the writes.
+            Id src[2] = {as_half(0, [&] { return get_v(i.data0); }), as_half(1, [&] { return get_v(i.data0); })};
+            Id res[2];
+            for (int hh = 0; hh < 2; ++hh) {
+                Id idx = as_half(hh, [&] { return band(shr(iadd(get_v(i.vaddr), u(uint32_t(i.mem_offset & 0xffff))), u(2)), u(63)); });
+                Id from = band(idx, u(31));
+                res[hh] = sel(t_u32, ne0(band(idx, u(32))), shuf(src[1], from), shuf(src[0], from));
+            }
+            for (int hh = 0; hh < 2; ++hh) as_half(hh, [&] { set_v(i.dst.vgpr_index(), res[hh]); return 0; });
+            return;
         }
         if (i.enc == Enc::DS && n == "ds_swizzle_b32") {
             // offset bit 15: quad-perm mode (offset[7:0] = 4 x 2-bit lanes); else bitmask mode (and/or/xor on 5 bits).
@@ -1534,6 +1809,14 @@ struct T {
         Id v_ = get_v(data);
         Id old;
         auto is = [&](const char* k) { return n.find(k) != std::string_view::npos; };
+        if (is("cmpswap")) {
+            // data = new value, data + 1 = the value memory must hold; returns the old value.
+            Id cmp = get_v(uint16_t(data + 1));
+            Id res = b.local(p_fn_u32, u(0));
+            if_then(go, [&] { store(res, b.op(spv::OpAtomicCompareExchange, t_u32, {ptr, u(spv::ScopeDevice), u(0), u(0), v_, cmp})); });
+            if (i.glc) set_v(data, load(res, t_u32));
+            return;
+        }
         if (is("fmin") || is("fmax")) {
             // Float min/max: compare-and-swap loop.
             bool mn = is("fmin");
@@ -1834,10 +2117,10 @@ struct T {
                 Id c = 0;
                 if (n == "s_cbranch_scc0") c = b.op(spv::OpLogicalNot, t_bool, {get_scc()});
                 else if (n == "s_cbranch_scc1") c = get_scc();
-                else if (n == "s_cbranch_vccz") c = b.op(spv::OpIEqual, t_bool, {get_s(VCC_LO), u(0)});
-                else if (n == "s_cbranch_vccnz") c = ne0(get_s(VCC_LO));
-                else if (n == "s_cbranch_execz") c = b.op(spv::OpIEqual, t_bool, {get_s(EXEC_LO), u(0)});
-                else if (n == "s_cbranch_execnz") c = ne0(get_s(EXEC_LO));
+                else if (n == "s_cbranch_vccz") c = b.op(spv::OpIEqual, t_bool, {mask64(VCC_LO), u(0)});
+                else if (n == "s_cbranch_vccnz") c = ne0(mask64(VCC_LO));
+                else if (n == "s_cbranch_execz") c = b.op(spv::OpIEqual, t_bool, {mask64(EXEC_LO), u(0)});
+                else if (n == "s_cbranch_execnz") c = ne0(mask64(EXEC_LO));
                 else {
                     unsupported(i);
                     c = b.c_bool(false);
@@ -2010,12 +2293,34 @@ struct T {
         }
         if (p.stage == HwStage::Cs) {
             for (int k = 0; k < 3; ++k) out.local_size[k] = p.cs_threads[k] ? p.cs_threads[k] : 1;
+            if (wide) {  // half as many invocations, each running two lanes, in whole 32-lane waves
+                uint32_t threads = out.local_size[0] * out.local_size[1] * out.local_size[2];
+                out.local_size[0] = (threads + 63) / 64 * 32, out.local_size[1] = out.local_size[2] = 1;
+            }
             b.mode(fn, spv::ExecutionModeLocalSize, {out.local_size[0], out.local_size[1], out.local_size[2]});
         }
         return true;
     }
 
     void emit(const Inst& i) {
+        if (wide && vector_inst(i)) {
+            std::string_view n = i.name;
+            bool once = n == "v_readfirstlane_b32" || n == "v_readlane_b32" || n == "v_writelane_b32" || n == "ds_bpermute_b32";
+            for (h = 0; h < (once ? 1 : 2); ++h) emit_one(i);
+            h = 0;
+            return;
+        }
+        emit_one(i);
+    }
+    static bool vector_inst(const Inst& i) {
+        switch (i.enc) {
+            case Enc::VOP2: case Enc::VOP1: case Enc::VOPC: case Enc::VOP3: case Enc::VOP3P: case Enc::VINTRP: case Enc::DS:
+            case Enc::MUBUF: case Enc::MTBUF: case Enc::MIMG: case Enc::FLAT: case Enc::GLOBAL: case Enc::SCRATCH: case Enc::EXP:
+                return true;
+            default: return false;
+        }
+    }
+    void emit_one(const Inst& i) {
         switch (i.enc) {
             case Enc::MUBUF: case Enc::MTBUF: case Enc::GLOBAL: case Enc::FLAT: case Enc::SCRATCH: case Enc::DS: case Enc::MIMG:
                 return vmem(i);
