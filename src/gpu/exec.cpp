@@ -2053,7 +2053,9 @@ struct Builder {
         uint32_t index = 0;
         s.each([&](Op op, const uint8_t* p, uint32_t size) {
             auto get = [&](auto& v) { memcpy(&v, p, std::min<size_t>(sizeof v, size)); };
-            checkpoint(cb, 8, uint64_t(op), index++);  // every command: a lost GPU names the one it was on
+            static const bool every = [] { char v[8]{}; return GetEnvironmentVariableA("KEYLIME_CHECKPOINTS", v, 8) && !strcmp(v, "all"); }();
+            if (every) checkpoint(cb, 8, uint64_t(op), index);  // KEYLIME_CHECKPOINTS=all: every command
+            ++index;
             switch (op) {
                 case Op::SetPipeline: {
                     uint64_t v;
@@ -2388,7 +2390,11 @@ int precompile(const char* dir) {
     return 0;
 }
 
-int queue_for(uint32_t kind) { return kind == 2 ? COMPUTE : GRAPHICS; }
+// KEYLIME_ONE_QUEUE=1: compute lists run on the graphics queue too (in submission order).
+int queue_for(uint32_t kind) {
+    static const bool one = [] { char v[4]{}; return GetEnvironmentVariableA("KEYLIME_ONE_QUEUE", v, 4) && v[0] == '1'; }();
+    return kind == 2 && !one ? COMPUTE : GRAPHICS;
+}
 VkQueue vk_queue(int q) { return g_q[q & 1].q; }
 
 // Texture uploads and first-use layouts for what was just recorded go in a submission of their

@@ -2199,6 +2199,11 @@ struct T {
             Id again = b.op(spv::OpLogicalAnd, t_bool, {pc_in(r.lo, r.hi), b.op(spv::OpULessThan, t_bool, {t, u(trip_limit())})});
             b.op_void(spv::OpBranchConditional, {again, header, merge});
             b.label(merge);
+            // A loop stopped by its cap ends the program (as VIctory's forks do): carrying on let an
+            // outer loop enter it again with a fresh count, so nested caps multiplied (8192 x 8192
+            // trips) and a loop spinning on bad data held the GPU until Windows reset it.
+            Id capped = b.op(spv::OpUGreaterThanEqual, t_bool, {load(trips, t_u32), u(trip_limit())});
+            store(pc, sel(t_u32, capped, u(end_block), load(pc, t_u32)));
         });
         r.active = false;
     }
