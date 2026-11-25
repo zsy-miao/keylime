@@ -16,13 +16,15 @@
 #include "gpu/texture.h"
 #include "hle/xmem.h"
 #include "log.h"
+#include "shader/translate.h"
 #include "stats.h"
 
 namespace kl::gpu::images {
 namespace {
 
-constexpr uint32_t IMAGE_SLOTS = 65536, SAMPLER_SLOTS = 4096, STORAGE_SLOTS = 16384;
-constexpr uint32_t TABLE_ENTRIES = 1u << 17;  // power of two; entries of 16 bytes after a 16-byte header
+constexpr uint32_t MAX_IMAGE_SLOTS = 262144, SAMPLER_SLOTS = 4096, STORAGE_SLOTS = 16384;
+constexpr uint32_t TABLE_ENTRIES = 1u << 20;  // power of two; entries of 16 bytes after a 16-byte header
+uint32_t IMAGE_SLOTS = MAX_IMAGE_SLOTS;        // the device may allow fewer
 constexpr uint64_t CHUNK = 256ull << 20;
 constexpr uint64_t PAGE4K = 4096;
 uint64_t lo4k(uint64_t a) { return a & ~(PAGE4K - 1); }
@@ -336,15 +338,12 @@ uint64_t g_resident = 0;
 uint64_t g_upload[2] = {0, 0};  // per host queue: the submission that carries its latest uploads
 
 // ----------------------------------------------------------- the table ----
-uint32_t hash(uint32_t lo, uint32_t hi) {  // must match the translator's slot_of
-    uint32_t x = lo * 0x9e3779b1u ^ hi * 0x85ebca6bu;
-    return (x ^ (x >> 15)) & (TABLE_ENTRIES - 1);
-}
+uint32_t hash(uint32_t lo, uint32_t hi) { return shader::texture_hash(lo, hi) & (TABLE_ENTRIES - 1); }
 
 bool table_put(uint32_t lo, uint32_t hi, uint32_t slot) {
     auto* e = reinterpret_cast<volatile uint32_t*>(g_table.map + 16);
     uint32_t h = hash(lo, hi);
-    for (uint32_t p = 0; p < 8; ++p) {
+    for (uint32_t p = 0; p < shader::TEXTURE_TABLE_PROBES; ++p) {
         uint32_t i = (h + p) & (TABLE_ENTRIES - 1);
         volatile uint32_t* w = e + 4 * i;
         bool empty = w[0] == 0 && w[1] == 0 && w[2] == 0;
@@ -808,6 +807,14 @@ bool start() {
         g_families = {q.graphics_family};
         for (uint32_t f : {q.compute_family, q.transfer_family})
             if (std::find(g_families.begin(), g_families.end(), f) == g_families.end()) g_families.push_back(f);
+    }
+    {
+        VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceProperties2 pr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        pr.pNext = &p12;
+        vk::vkGetPhysicalDeviceProperties2(h.physical, &pr);
+        uint32_t limit = std::min(p12.maxDescriptorSetUpdateAfterBindSampledImages, p12.maxPerStageDescriptorUpdateAfterBindSampledImages);
+        IMAGE_SLOTS = std::max(65536u, std::min(MAX_IMAGE_SLOTS, limit));
     }
     // Bindless set: all slots partially bound, updatable while in use.
     VkDescriptorSetLayoutBinding b[3] = {
