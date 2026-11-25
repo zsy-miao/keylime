@@ -396,9 +396,14 @@ void kick_held() {
     if (!g_pending.empty()) pump();
 }
 
+// More urgent pipeline builds queued than the workers clear in a few seconds.
+std::atomic<uint64_t> g_backlog_at{32};
+bool backlogged() { return stats::g_counters[stats::CompileUrgent].load(std::memory_order_relaxed) > g_backlog_at.load(std::memory_order_relaxed); }
+
 // Opens each queue's gates in order, once the memory compares as asked (D3D12 comparison
 // functions, as VIctory's forks and XCL read them) or a fence is reached; past a bound the gate
-// opens anyway: what should write it may have been dropped, and the GPU must not stall for it.
+// opens anyway: what should write it may have been dropped, and the GPU must not stall for it
+// (sooner during a build backlog, when draws and dispatches are being skipped).
 void gatekeeper(HostQueue& h) {
     for (;;) {
         Gate g;
@@ -412,7 +417,7 @@ void gatekeeper(HostQueue& h) {
             if (g.w.compare < 32 && !(seen.fetch_or(1u << g.w.compare) & (1u << g.w.compare)))
                 KL_INFO("gpu", "GPU waits on memory with comparison %llu run (polled on the CPU)", (unsigned long long)g.w.compare);
         }
-        auto limit = std::chrono::milliseconds(g.sem ? 3000 : 250);
+        auto limit = std::chrono::milliseconds(g.sem ? 3000 : backlogged() ? 30 : 250);
         auto t0 = std::chrono::steady_clock::now();
         bool late = false;
         while (!gate_met(g)) {
@@ -430,9 +435,9 @@ void gatekeeper(HostQueue& h) {
                     } else {
                         bool ok;
                         uint64_t v = read_value(g.w, ok);
-                        KL_WARN("gpu", "a GPU wait on memory %llx (comparison %llu, %u bytes, value %llx, wanted %llx) gave up after 250 ms",
+                        KL_WARN("gpu", "a GPU wait on memory %llx (comparison %llu, %u bytes, value %llx, wanted %llx) gave up after %lld ms",
                                 (unsigned long long)g.w.address, (unsigned long long)g.w.compare, g.w.bytes, (unsigned long long)v,
-                                (unsigned long long)g.w.reference);
+                                (unsigned long long)g.w.reference, (long long)limit.count());
                     }
                 }
                 break;
@@ -742,6 +747,28 @@ void job(std::function<void()> f, bool urgent = false, bool front = false, bool 
         constexpr unsigned STRICT_URGENT = 4;
         static unsigned borrowed = 0;
         const unsigned BORROW = std::max(2u, cores / 4);
+        g_backlog_at = 2 * URGENT_ONLY;
+        // During a backlog a few more workers take urgent builds at lowest priority (the title mostly waits then).
+        for (unsigned i = 0; i < (g_precompiling ? 0 : cores / 6); ++i)
+            std::thread([] {
+                SetThreadDescription(GetCurrentThread(), L"keylime-compile-burst");
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                for (;;) {
+                    std::function<void()> f;
+                    {
+                        std::unique_lock g(g_jobs_lock);
+                        g_jobs_cv.wait(g, [] { return g_urgent.size() > g_backlog_at; });
+                        f = std::move(g_urgent.front());
+                        g_urgent.pop_front();
+                        queue_gauges();
+                    }
+                    f();
+                    stats::g_counters[stats::Compiling].fetch_sub(1);
+                    notify();
+                    save_cache();
+                    save_used();
+                }
+            }).detach();
         for (unsigned i = 0; i < n + URGENT_ONLY; ++i)
             std::thread([urgent_only = i >= n, strict = i >= n + URGENT_ONLY - std::min(STRICT_URGENT, URGENT_ONLY), BORROW] {
                 SetThreadDescription(GetCurrentThread(), strict ? L"keylime-compile-strict" : urgent_only ? L"keylime-compile-urgent" : L"keylime-compile");
@@ -789,11 +816,14 @@ void job(std::function<void()> f, bool urgent = false, bool front = false, bool 
     g_jobs_cv.notify_all();
 }
 // Per shown frame, one window shared by all waiting threads: KEYLIME_DRAW_WAIT_MS (4000), KEYLIME_DISPATCH_WAIT_MS (12000).
+// With more urgent builds queued than the workers clear in a few seconds, a wait rarely ends in
+// time, so frames wait only KEYLIME_BACKLOG_DRAW_WAIT_MS (10) and KEYLIME_BACKLOG_DISPATCH_WAIT_MS (30).
 uint64_t budget_ms(const char* name, uint64_t fallback) {
     char v[16]{};
     return GetEnvironmentVariableA(name, v, 16) ? uint64_t(atoi(v)) : fallback;
 }
 const uint64_t BUDGET_US[2] = {budget_ms("KEYLIME_DRAW_WAIT_MS", 4000) * 1000, budget_ms("KEYLIME_DISPATCH_WAIT_MS", 12000) * 1000};
+const uint64_t BACKLOG_US[2] = {budget_ms("KEYLIME_BACKLOG_DRAW_WAIT_MS", 10) * 1000, budget_ms("KEYLIME_BACKLOG_DISPATCH_WAIT_MS", 30) * 1000};
 struct FrameWait {
     std::mutex m;
     uint64_t frame = ~0ull, spent_us = 0;
@@ -813,9 +843,9 @@ bool wait_budget(F done, int kind) {
     {
         std::lock_guard g(w.m);
         if (w.frame != frame) w.frame = frame, w.spent_us = 0, w.waiting = 0;
-        uint64_t used = w.spent_us + (w.waiting ? us_since(w.since) : 0);
-        if (used >= BUDGET_US[kind]) return false;
-        left = BUDGET_US[kind] - used;
+        uint64_t used = w.spent_us + (w.waiting ? us_since(w.since) : 0), budget = backlogged() ? BACKLOG_US[kind] : BUDGET_US[kind];
+        if (used >= budget) return false;
+        left = budget - used;
         if (!w.waiting++) w.since = clock::now();
     }
     auto t0 = clock::now();
@@ -836,8 +866,10 @@ bool wait_budget(F done, int kind) {
 void dropped(const char* what) {
     static std::atomic<bool> told{false};
     if (!told.exchange(true))
-        KL_INFO("gpu", "draws whose pipeline is not ready within %llu ms a frame, and dispatches past %llu ms a frame, are skipped meanwhile",
-                (unsigned long long)(BUDGET_US[0] / 1000), (unsigned long long)(BUDGET_US[1] / 1000));
+        KL_INFO("gpu", "draws whose pipeline is not ready within %llu ms a frame, and dispatches past %llu ms a frame, are skipped meanwhile "
+                       "(%llu and %llu ms while more than %llu urgent builds are queued)",
+                (unsigned long long)(BUDGET_US[0] / 1000), (unsigned long long)(BUDGET_US[1] / 1000), (unsigned long long)(BACKLOG_US[0] / 1000),
+                (unsigned long long)(BACKLOG_US[1] / 1000), (unsigned long long)g_backlog_at.load());
     stats::add(stats::WaitingOnCompile);
     if (what[1] != 'r') stats::add(stats::DispatchesSkipped);
 }

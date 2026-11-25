@@ -229,6 +229,8 @@ starts the cache over.
 | `KEYLIME_STORE_GUARD=0` | Don't skip shader stores outside GPU memory |
 | `KEYLIME_DRAW_WAIT_MS=4000` | How long a frame waits for draw pipelines still compiling before skipping those draws |
 | `KEYLIME_DISPATCH_WAIT_MS=12000` | The same for compute dispatches |
+| `KEYLIME_BACKLOG_DRAW_WAIT_MS=10` | The draw wait while more urgent builds are queued than the workers clear in a few seconds |
+| `KEYLIME_BACKLOG_DISPATCH_WAIT_MS=30` | The same for compute dispatches |
 | `KEYLIME_WATCHDOG=1` | Let the game's GPU watchdog end the game |
 | `KEYLIME_VALIDATION=1` | Vulkan validation layers |
 
