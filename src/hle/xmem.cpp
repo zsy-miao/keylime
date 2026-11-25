@@ -468,7 +468,12 @@ bool write_physical_locked(const uint64_t* pages, size_t page_count, size_t offs
         size_t at = offset + done, pi = at / kPage, within = at % kPage;
         if (pi >= page_count) return false;
         auto f = g_phys.pages.find(pages[pi]);
-        if (f == g_phys.pages.end()) return false;
+        if (f == g_phys.pages.end()) {
+            static std::atomic<int> n{0};
+            if (n++ < 4) KL_WARN("xmem", "a write to physical page %llx (entry %zu of %zu) fails: no allocation holds that page",
+                                 (unsigned long long)pages[pi], pi, page_count);
+            return false;
+        }
         // one view per run of consecutive slices
         const Slice first = f->second;
         size_t run = 1;
