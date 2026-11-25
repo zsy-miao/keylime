@@ -219,14 +219,18 @@ void full_barrier(VkCommandBuffer cb) {
 
 // ------------------------------------------------------------ pipelines ----
 struct Compiled {
-    std::atomic<bool> ready{false};  // built (or failed) by a compile worker
+    std::atomic<bool> claimed{false};     // a thread has started translating
+    std::atomic<bool> translated{false};  // shaders translated (or failed): `ok` and the modules are set
+    std::atomic<bool> ready{false};       // nothing more will be built (compute: the optimized pipeline is in, or failed)
     bool ok = false;
     shader::Container vsc, psc, csc;
     const shader::Program *vs = nullptr, *ps = nullptr, *cs = nullptr;
     VkShaderModule vsm = VK_NULL_HANDLE, psm = VK_NULL_HANDLE, csm = VK_NULL_HANDLE;
     std::vector<VkVertexInputAttributeDescription> attrs;
     std::vector<VkVertexInputBindingDescription> binds;
-    VkPipeline compute = VK_NULL_HANDLE;
+    std::atomic<VkPipeline> compute{VK_NULL_HANDLE};
+    std::atomic<VkPipeline> fast{VK_NULL_HANDLE};  // unoptimized, built by a dispatch that could not wait
+    std::atomic<bool> fast_claimed{false};
     std::unordered_map<uint64_t, VkPipeline> variants;  // under the state's lock
     std::unordered_set<uint64_t> pending;                // variants a worker is building
     bool writes_color = false;
@@ -265,12 +269,18 @@ VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64
 }
 
 // Pipelines are built by workers: one driver compile can take many seconds, and the queue
-// thread (the title's) must not stop for it. The recorder waits a little, then skips the
-// draw or dispatch until the pipeline is there.
+// thread (the title's) must not stop for it. A first use translates the shaders itself if no
+// worker has started on them (translating is quick; the driver's compile is the slow part).
+// Draws whose pipeline is not built yet are skipped; dispatches never are: they wait for a
+// quick unoptimized build while the optimized one is made in the background.
 std::mutex g_jobs_lock, g_done_lock;
 std::condition_variable g_jobs_cv, g_done_cv;
 std::deque<std::function<void()>> g_jobs;
-void job(std::function<void()> f) {
+void notify() {
+    { std::lock_guard g(g_done_lock); }
+    g_done_cv.notify_all();
+}
+void job(std::function<void()> f, bool urgent = false) {
     stats::add(stats::Compiling);
     static std::once_flag once;
     std::call_once(once, [] {
@@ -289,15 +299,14 @@ void job(std::function<void()> f) {
                     }
                     f();
                     stats::g_counters[stats::Compiling].fetch_sub(1);
-                    stats::add(stats::PipelinesBuilt);
-                    { std::lock_guard g(g_done_lock); }
-                    g_done_cv.notify_all();
+                    notify();
                 }
             }).detach();
     });
     {
         std::lock_guard g(g_jobs_lock);
-        g_jobs.push_back(std::move(f));
+        if (urgent) g_jobs.push_front(std::move(f));
+        else g_jobs.push_back(std::move(f));
     }
     g_jobs_cv.notify_one();
 }
@@ -311,30 +320,103 @@ bool wait_briefly(F done) {
     std::unique_lock g(g_done_lock);
     return g_done_cv.wait_until(g, t_wait_until, done);
 }
+template <class F>
+void wait_for(F done) {
+    std::unique_lock g(g_done_lock);
+    while (!done()) g_done_cv.wait_for(g, std::chrono::milliseconds(20));
+}
 
-void build(pipeline::State* st, Compiled* k);
-Compiled* compile(pipeline::State* st) {
-    Compiled* k;
-    {
-        std::lock_guard g(st->lock);
-        k = static_cast<Compiled*>(st->host);
-        if (!k) {
-            k = new Compiled();
-            st->host = k;
-            job([st, k] {
-                auto t0 = std::chrono::steady_clock::now();
-                build(st, k);
-                double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                if (sec > 2) KL_WARN("gpu", "a %s pipeline took %.1f s to compile", st->compute ? "compute" : "graphics", sec);
-                k->ready.store(true, std::memory_order_release);
-            });
-        }
+void shaders(pipeline::State* st, Compiled* k);
+VkPipeline compute_pipeline(Compiled* k, bool fast);
+void optimize(Compiled* k);
+
+// The first thread to claim a pipeline translates its shaders; compute pipelines then get
+// their optimized build.
+void translate_claimed(pipeline::State* st, Compiled* k, bool queue_optimize) {
+    shaders(st, k);
+    k->translated.store(true, std::memory_order_release);
+    if (!st->compute || !k->ok) k->ready.store(true, std::memory_order_release);
+    notify();
+    if (st->compute && k->ok) {
+        if (queue_optimize) job([k] { optimize(k); }, true);
+        else optimize(k);
     }
-    wait_briefly([k] { return k->ready.load(std::memory_order_acquire); });
+}
+
+Compiled* obtain(pipeline::State* st) {
+    std::lock_guard g(st->lock);
+    auto* k = static_cast<Compiled*>(st->host);
+    if (!k) {
+        k = new Compiled();
+        st->host = k;
+        job([st, k] {
+            if (!k->claimed.exchange(true)) translate_claimed(st, k, false);
+        });
+    }
     return k;
 }
 
-void build(pipeline::State* st, Compiled* k) {
+// The pipeline's shaders; `steal`: translated on this thread if no worker has started on them.
+Compiled* compile(pipeline::State* st, bool steal) {
+    Compiled* k = obtain(st);
+    if (steal && !k->claimed.exchange(true)) translate_claimed(st, k, true);
+    return k;
+}
+
+void optimize(Compiled* k) {
+    auto t0 = std::chrono::steady_clock::now();
+    VkPipeline p = compute_pipeline(k, false);
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (sec > 2) KL_WARN("gpu", "a compute pipeline took %.1f s to compile", sec);
+    stats::add(stats::PipelinesBuilt);
+    if (p) {
+        k->compute.store(p, std::memory_order_release);
+        if (VkPipeline f = k->fast.exchange(VK_NULL_HANDLE)) retire([f] { vk::vkDestroyPipeline(dev(), f, nullptr); });
+    }
+    k->ready.store(true, std::memory_order_release);
+    notify();
+}
+
+// A compute pipeline to run now: the optimized one if it is built, else a quick unoptimized
+// build made here. Null only if the pipeline cannot be built at all.
+VkPipeline runnable(pipeline::State* st) {
+    Compiled* k = compile(st, true);
+    wait_for([k] { return k->translated.load(std::memory_order_acquire); });
+    if (!k->ok) return VK_NULL_HANDLE;
+    if (VkPipeline p = k->compute.load(std::memory_order_acquire)) return p;
+    stats::add(stats::WaitingOnCompile);
+    if (!k->fast_claimed.exchange(true)) {
+        auto t0 = std::chrono::steady_clock::now();
+        VkPipeline p = compute_pipeline(k, true);
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (sec > 0.5) KL_WARN("gpu", "a dispatch waited %.2f s for its unoptimized compute pipeline", sec);
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) KL_INFO("gpu", "dispatches whose pipeline is still compiling now run an unoptimized build meanwhile");
+        if (!k->compute.load(std::memory_order_acquire)) k->fast.store(p, std::memory_order_release);
+        else if (p) retire([p] { vk::vkDestroyPipeline(dev(), p, nullptr); });
+        notify();
+    }
+    wait_for([k] { return k->compute.load() || k->fast.load() || k->ready.load(); });
+    VkPipeline p = k->compute.load(std::memory_order_acquire);
+    return p ? p : k->fast.load(std::memory_order_acquire);
+}
+
+VkPipeline compute_pipeline(Compiled* k, bool fast) {
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.flags = fast ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, k->csm, "main", nullptr};
+    ci.layout = g_layout;
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult r = vk::vkCreateComputePipelines(dev(), VK_NULL_HANDLE, 1, &ci, nullptr, &p);
+    if (r != VK_SUCCESS) {
+        static int n = 0;
+        if (n++ < 16) KL_WARN("gpu", "compute pipeline not built by the driver%s: %s", fast ? " (unoptimized)" : "", vk::result_text(r));
+        return VK_NULL_HANDLE;
+    }
+    return p;
+}
+
+void shaders(pipeline::State* st, Compiled* k) {
     const pipeline::Shader *vs = nullptr, *ps = nullptr, *cs = nullptr;
     for (auto& s : st->shaders) {
         if (s.stage == 0) vs = &s;
@@ -349,15 +431,7 @@ void build(pipeline::State* st, Compiled* k) {
         }
         shader::Translation t;
         k->csm = module(*k->cs, {}, cs->hash, t);
-        if (!k->csm) return;
-        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, k->csm, "main", nullptr};
-        ci.layout = g_layout;
-        if (vk::vkCreateComputePipelines(dev(), VK_NULL_HANDLE, 1, &ci, nullptr, &k->compute) != VK_SUCCESS) {
-            KL_WARN("gpu", "compute pipeline %016llx not built by the driver", (unsigned long long)cs->hash);
-            return;
-        }
-        k->ok = true;
+        k->ok = k->csm != VK_NULL_HANDLE;
         return;
     }
     if (!vs || !shader::parse(vs->code.data(), vs->code.size(), k->vsc, err) || !(k->vs = find(k->vsc, shader::HwStage::Vs))) {
@@ -478,7 +552,7 @@ VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
         if (it == k->variants.end()) {
             k->variants[key] = VK_NULL_HANDLE;
             k->pending.insert(key);
-            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); });
+            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, true);
         }
     }
     VkPipeline out = VK_NULL_HANDLE;
@@ -594,6 +668,7 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
         if (n++ < 16) KL_WARN("gpu", "graphics pipeline not built by the driver: %s", vk::result_text(res));
         p = VK_NULL_HANDLE;
     }
+    stats::add(stats::PipelinesBuilt);
     finish(p);
 }
 
@@ -863,8 +938,8 @@ struct Builder {
     bool draw_setup(bool indexed) {
         pipeline::State* st = bind[1].pso;
         if (!st || st->compute) return false;
-        Compiled* k = compile(st);
-        if (!k->ready.load(std::memory_order_acquire)) {
+        Compiled* k = compile(st, false);
+        if (!wait_briefly([k] { return k->translated.load(std::memory_order_acquire); })) {
             once("draws whose pipeline is still compiling are skipped meanwhile");
             stats::add(stats::WaitingOnCompile);
             return false;
@@ -941,15 +1016,14 @@ struct Builder {
     void dispatch(const cmd::Dispatch& d) {
         pipeline::State* st = bind[0].pso;
         if (!st || !st->compute) return;
-        Compiled* k = compile(st);
-        if (!k->ready.load(std::memory_order_acquire)) {
-            once("dispatches whose pipeline is still compiling are skipped meanwhile");
-            stats::add(stats::WaitingOnCompile);
+        VkPipeline p = runnable(st);
+        if (!p) {
+            once("a dispatch whose pipeline could not be built was dropped");
             return;
         }
-        if (!k->ok) return;
+        Compiled* k = static_cast<Compiled*>(st->host);
         end_rendering();
-        if (k->compute != bound) vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->compute), bound = k->compute;
+        if (p != bound) vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p), bound = p;
         if (!set_bound[0]) {
             VkDescriptorSet s = images::set();
             vk::vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, &s, 0, nullptr);
