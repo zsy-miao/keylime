@@ -1,254 +1,300 @@
-# keylime
+<h1 align="center">🍋‍🟩 keylime</h1>
 
-**keylime** is an experimental runtime, written from scratch in C++20, that runs
-Xbox Series (Scarlett) game code natively on Windows PCs. Its first target is
-GTA VI's Xbox build.
+<p align="center">
+  <b>Xbox Series game code, running natively on Windows — on Vulkan.</b><br>
+  A from-scratch C++20 runtime. First target: <b>GTA VI</b> (Xbox Series build).
+</p>
 
-It is not an emulator of the CPU: the console's x86-64 code runs directly on
-the host CPU. keylime provides everything around it: the loader, the console
-system libraries, and a GPU layer that drives **Vulkan**, with a translator
-from the console's RDNA 2 machine code to **SPIR-V**.
+<p align="center">
+  <img alt="language" src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white">
+  <img alt="graphics" src="https://img.shields.io/badge/graphics-Vulkan%201.3-AC162C?logo=vulkan&logoColor=white">
+  <img alt="shaders" src="https://img.shields.io/badge/shaders-RDNA%202%20%E2%86%92%20SPIR--V-7c3aed">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4?logo=windows&logoColor=white">
+  <img alt="licence" src="https://img.shields.io/badge/licence-GPL--3.0-green">
+</p>
 
-> keylime contains **no game files, keys or console SDK code**. You need your
-> own copy of the game. Nothing here downloads or distributes game content.
+<p align="center">
+  <a href="#where-we-are">Where we are</a> •
+  <a href="#how-it-works">How it works</a> •
+  <a href="#building">Building</a> •
+  <a href="#running">Running</a> •
+  <a href="#troubleshooting">Troubleshooting</a> •
+  <a href="#other-projects">Other projects</a> •
+  <a href="#credits-and-licence">Credits</a>
+</p>
 
-## Progress
+> [!IMPORTANT]
+> keylime contains **no game files, keys or console SDK code**. You need your own copy of the game.
+> Nothing here downloads or distributes game content.
 
-The real retail GTA VI exe boots natively, reaches the main menu with all
-audio working, and keylime renders its frames on Vulkan.
+---
 
-**Now:** the game gets into the opening cutscene. Its music, voices, sound
-effects, skip prompt and title text all work, but the picture ran at about
-2 fps and the scene itself didn't draw. The log showed three causes: every
-frame waited up to half a second for pipelines still compiling, the NVIDIA
-driver took up to 45 s to optimize some translated compute shaders, and most
-of the scene is drawn with mesh shaders, which keylime skipped. What changed,
-waiting for a test run:
+## Where we are
 
-- Shader control flow is translated to structured ifs, if/elses and loops
-  wherever the program allows (each shader's share of blocks still run by
-  number is in the log), so the driver compiles much less.
-- A frame waits at most 4 ms in total for draw pipelines; past that, those
-  draws are left out of the frame. Dispatches always wait for their pipeline
-  (a quick unoptimized build first), because the game reads what they write.
-- Translated SPIR-V is kept in `cache\spirv` (keyed by the shader and the
-  translator build), on top of the driver's `cache\pipelines.bin`. A first
-  run after an update compiles as it goes; later runs start every pipeline
-  listed in `cache\used-pipelines.txt` as soon as the game creates it.
-- Mesh shaders run: the console's NGG mesh programs translate to
-  `VK_EXT_mesh_shader`, `DispatchMesh` and `ExecuteIndirect` mesh commands
-  (type 10) run on the GPU. Mesh pipelines with an amplification shader are
-  still skipped.
-- Every 2 s the log has a `frame:` line (ms per frame, worst frame, GPU busy
-  time, CPU recording time, time waiting for pipelines, work run and skipped
-  per frame) and a `compile:` line (shaders translated or from the disk
-  cache, driver build times, the compile queue, precompile progress). A
-  `precompile:` line says how many of the listed pipelines are built.
+<table>
+<tr>
+<td width="33%" valign="top">
 
-Earlier, for the freeze before the opening cutscene: the driver deadlocked.
-A submission waited on a semaphore that only the host signals later (a GPU
-wait on memory), NVIDIA's Windows driver blocked inside vkQueueSubmit2 on it,
-and from then on everything else blocked in the driver too. What changed:
+### ✅ Working
+- Retail exe boots natively
+- Intro, main menu, loading screen
+- **Locked 30 fps** through the menus
+- All audio (XMA, Opus, DSP)
+- DirectStorage streaming + BCPack
+- Frames render on Vulkan
 
-- A submission goes to the driver only once everything it waits on has been
-  signalled or handed to the driver; until then keylime holds it, in queue
-  order, and sends it the moment the gate opens or the fence is signalled.
-- Fences the game reads are polled (every quarter millisecond) instead of
-  waited on in the driver.
-- cache\used-pipelines.txt is written every second as new pipelines are used,
-  and again on a hang report or a crash. Up to 16 compile workers (was 8).
-- Shader loops stop after 512 trips in pixel shaders, 1024 in vertex shaders
-  and 8192 in compute (was 262,144 for the whole program). A loop reading a
-  count the host hasn't written yet could keep the GPU busy for seconds per
-  draw; VIctory's forks found the same thing losing the card early in the
-  opening cutscene.
-- GPU memory waits use the D3D12 comparison codes (1 never .. 8 always) with
-  the 32-bit wait's mask, as the other projects read them. A queue wait on a
-  fence nobody has signalled yet opens after 3 s, a repeated fence signal
-  stays off the GPU, and a CPU fence wait gives up after 15 s.
-- `ExecuteIndirect` type 105 (the console's single-pass dispatch) runs, and
-  each `ExecuteIndirect` has a total work budget.
-- Media Foundation sees host paths for files on G: and T:.
-- With no frame for 5 s the log gets every thread's stack, what each queue
-  waits on (with the memory value), the compile backlog, pending fence
-  signals and the last queue events. A lost device ends the run with one line.
+</td>
+<td width="33%" valign="top">
 
-Earlier, for world loading after the menu:
+### 🚧 In progress
+- **Opening cutscene**: audio plays,
+  picture doesn't draw yet
+- Shader compile time on first use
+- Precompiled shader cache
+- Mesh shaders (amplification
+  shaders still skipped)
 
-- The NVIDIA driver could take 2 to 26 s to compile one translated compute
-  shader. Done on the title's submit thread, that stalled the GPU long enough
-  for the game's own GPU watchdog to abort ("GPU Loc Sig", a deliberate write
-  to address 0 with code `0x4D8BD421`). Skipping compute dispatches instead
-  made the game read a bogus address and hit an `int3`
-  (`game_scarlett_master.exe+0x4da6315`).
-- The submit thread never compiles. A first use queues the pipeline ahead of
-  the rest and waits for it within a budget of 0.5 s per frame over all
-  threads; past it, draws and dispatches whose pipeline isn't ready are
-  dropped. Compute pipelines get a quick unoptimized build first.
-- Pipelines a run used are listed in `cache\used-pipelines.txt`; the next run
-  starts building those as soon as the game creates them, so the first run
-  after a change still drops some work and later runs should drop less.
-- Translated shaders are cheaper for the driver: structured loops and
-  branches instead of a dispatcher loop, and only the user SGPRs in use are
-  loaded. Driver compiles are kept across runs in `cache\pipelines.bin`.
-- `ExecuteIndirect` runs for Draw, DrawIndexed and Dispatch signatures
-  (counted too), and GPU waits on memory hold later work until the value
-  matches (polled on the CPU, 250 ms timeout). Indirect arguments are
-  checked on the GPU first: a command past the count or with sizes no frame
-  would use (memory a dropped dispatch never wrote) becomes empty.
-- The bindless texture table has 1M entries and a better hash (it ran out of
-  room at about 42k images), and up to 262144 image slots.
-- Multi-argument `ExecuteIndirect` signatures are still skipped.
+</td>
+<td width="33%" valign="top">
 
-- [x] Retail exe boots natively: archives stream through DirectStorage
-      (thousands of requests, 260+ MB), main loop holds 30 fps
-- [x] Gets through the intro and the main menu
-- [x] All audio works (XMA, Opus, DSP)
-- [x] All 320 sampled shaders translate GFX10 → SPIR-V directly, pass
-      `spirv-val` and build as NVIDIA pipelines
-- [x] The game's command lists run on the host GPU: about 650 draws and 60
-      dispatches every 2 s with none skipped, 2,052 images, 600+ frames
-      presented to the swap chain (one test run)
-- [x] Title memory imported zero-copy behind a GPU page table; textures as
-      Vulkan images (addrlib detiling, bindless hash table); rect/quad lists
-      through a geometry shader
-- [x] The game's frames render on Vulkan and present to the window
-- [x] BCPack-compressed textures decode in the DirectStorage path
-- [x] `xgameruntime` areas (user, store, save, async, networking, package,
-      storage, system and more) emulated well enough to reach the menu
-- [x] Get through world loading after the menu into the opening cutscene
-- [ ] Cutscene at 15+ fps with the scene drawn (see above)
+### ❌ Not yet
+- Gameplay
+- Multi-argument `ExecuteIndirect`
+- Amplification shaders
+- Depth export from pixel shaders
+
+</td>
+</tr>
+</table>
+
+### Milestones
+
+```mermaid
+flowchart LR
+    A[Boot] --> B[Intro & menu] --> C[World loading] --> D[Opening cutscene] --> E[Gameplay]
+    style A fill:#16a34a,color:#fff,stroke:#15803d
+    style B fill:#16a34a,color:#fff,stroke:#15803d
+    style C fill:#16a34a,color:#fff,stroke:#15803d
+    style D fill:#d97706,color:#fff,stroke:#b45309
+    style E fill:#6b7280,color:#fff,stroke:#4b5563
+```
+
+- [x] Retail exe boots natively; archives stream through DirectStorage
+- [x] Intro and main menu with all audio
+- [x] World loading after the menu, into the opening cutscene
 - [x] `ExecuteIndirect` (single-argument signatures) and GPU memory waits
 - [x] Mesh shader dispatches without an amplification shader
+- [ ] Opening cutscene drawn at 15+ fps
 - [ ] Amplification shaders, multi-argument `ExecuteIndirect`
+- [ ] Gameplay
 
-## Status
+### What we're fighting right now
+
+| Problem | What happens | Status |
+|---|---|---|
+| **New shaders at the cutscene** | ~3,000 compute pipelines appear at once; each must be translated and compiled by the driver before the game can continue | Urgent compile queue, compiles start when a list is recorded, `keylime precompile`, background builds throttled — compiles went from 35–60 s to ~1 s each |
+| **Translated shaders are big** | ~50× more SPIR-V than console code; NVIDIA spends ~25 CPU-seconds per big shader | Control flow is now fully structured (was "run by number"); shrinking the output is next |
+| **Wrong data from some compute shaders** | Stores to addresses gigabytes past any buffer; GPU counters the game waits on are never written; the game traps on bad data (`int3`) | Stores outside GPU memory are skipped and logged; root cause being traced |
+| **Game's GPU watchdog** | Ends the game when GPU work takes ~25 s | Its thread is parked instead (`KEYLIME_WATCHDOG=1` to disable) |
+
+### Component status
 
 | Area | State |
 |---|---|
-| Loader (PE mapping, static TLS redirect, import binding) | working |
-| Kernel / files (`G:` package, `T:` temp) / memory (`xmem`, physical pages) | working |
-| DirectStorage (worker pool, zlib, BCPack) | working |
-| GameInput (XInput pads + keyboard as a pad) | working |
-| `xgameruntime` (XUser, XStore, XGameSave, XAsync, other areas) | working far enough for the menus; some methods are stubs |
-| Audio: AcpHal XMA decoder, Opus (`xapu`), DSP (`chad`) | working: all audio plays in the menus (reverb is dry) |
-| XG texture layouts (AMD addrlib) | working |
-| GPU objects: device, DXGI, queues, fences, lists, heaps, resources, views, pipelines | working; the game's main loop runs at 30 fps |
-| Shader containers + GFX10 decoder | working (320/320 sampled shaders decode) |
-| GFX10 → SPIR-V translator | working (320/320 sampled shaders pass `spirv-val`) |
-| Executing the game's command lists and rendering its frames on Vulkan | working through the main menu; the opening cutscene runs with its audio, drawing it is in progress |
+| Loader (PE mapping, static TLS redirect, import binding) | 🟢 working |
+| Kernel, files (`G:` package, `T:` temp), memory (`xmem`, physical pages) | 🟢 working |
+| DirectStorage (worker pool, zlib, BCPack) | 🟢 working |
+| GameInput (XInput pads, keyboard as a pad) | 🟢 working |
+| Audio: AcpHal XMA, Opus (`xapu`), DSP (`chad`) | 🟢 working (reverb is dry) |
+| `xgameruntime` (XUser, XStore, XGameSave, XAsync, …) | 🟡 enough for the menus; some stubs |
+| XG texture layouts (AMD addrlib) | 🟢 working |
+| GPU objects: device, queues, fences, lists, heaps, resources, views, pipelines | 🟢 working |
+| GFX10 decoder and GFX10 → SPIR-V translator | 🟡 every shader seen so far translates; some compute results are wrong |
+| Running the game's command lists on Vulkan | 🟡 menus fully; cutscene runs but doesn't draw |
 
-## How keylime differs from other approaches
+---
 
-Several projects are trying to get GTA VI's Xbox build running on PC. keylime
-sits in the same family as VIctory and XCL (the console's own x86-64 code runs
-natively, with the system libraries and GPU replaced around it), but it takes
-a different graphics path: everything else here that says what it targets goes
-through Direct3D 12 and DXIL, while keylime drives Vulkan and emits SPIR-V
-itself.
+## How it works
 
-| Project | Approach | Scope | Graphics path |
-|---|---|---|---|
-| **keylime** | native runtime, C++20, written from scratch | GTA VI first | Vulkan; RDNA 2 machine code → SPIR-V directly |
-| [VIctory](https://github.com/Marvisak/VIctory) | compatibility layer, Rust | GTA VI only | RDNA 2 machine code → DXIL, compiled by DXC |
-| [hyphennn's fork](https://github.com/fxceless/victory-fork) | VIctory plus its own rendering and speed fixes | GTA VI only | same as VIctory |
-| [XCL](https://github.com/xcl-dev/xcl) | Wine-style compatibility layer | any Xbox Series game | RDNA 2 programs → HLSL → DXIL |
-| [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) | static recompilation: code and shaders turned into Windows C++ ahead of time | any Xbox Series game | DXIL |
-| [TuxBox](https://github.com/brcly/TuxBox) | native-first layer for unpacked games, mostly tested on Linux via Proton | any Xbox Series game | not stated |
-| [xbox-emulator](https://github.com/omonkeyz/xbox-emulator) | Rust runtime running dumped builds as Windows processes (continues TomBox) | any Xbox Series game | not stated |
-| [ScarlettX](https://github.com/Freminet/ScarlettX) | clean-room HLE emulator of the Scarlett OS and GDK runtime | any Xbox Series game | not stated |
-| [OpenScarlett CE](https://github.com/OpenCommunityEdition/OpenScarlett) | AGPL C++ layer that swaps console DLLs for PC ones | any Xbox Series game | Direct3D 12 |
+We don't emulate the CPU. The console's x86-64 code runs directly on the host CPU; keylime supplies
+everything around it — the loader, the console system libraries, and a GPU layer on Vulkan with our
+own translator from the console's RDNA 2 machine code to SPIR-V.
 
-What that means in practice:
-
-- **No DXC round trip.** Only 52 of 320 sampled GTA VI shaders carry DXIL
-  bitcode, so every layer has to translate the GFX10 machine code. keylime
-  writes SPIR-V straight from it instead of going through HLSL or DXIL, which
-  keeps driver compiles fast (VIctory's DXIL path takes 30-325 s for big
-  compute shaders).
-- **The console's memory model, kept.** Shaders read raw 64-bit pointers and
-  real RDNA 2 descriptor words, as on the hardware, instead of VIctory's
-  descriptor heaps mirrored to host heaps every frame.
-- **GTA VI first.** Like VIctory, keylime targets one game rather than every
-  Xbox Series title. It builds on VIctory's reverse-engineered interface
-  layouts (see [Credits](#credits-and-licence)) but not on its GPU path.
-
-Where it stands: keylime is behind the leading projects. The game boots, its
-frames render on Vulkan and it reaches the main menu with audio, but it crashes
-after that and isn't playable yet (see
-[Progress](#progress)). The other
-projects' progress is their own reporting, mostly unverified.
+```mermaid
+flowchart TB
+    subgraph Game["game_scarlett_master.exe (runs natively)"]
+        G1[Game code]
+    end
+    subgraph keylime
+        L[Loader<br/>PE mapping · TLS · imports]
+        H[Console libraries<br/>kernel · files · xmem · DirectStorage<br/>GameInput · xgameruntime · audio]
+        D[D3D12.X on Vulkan<br/>command lists · resources · fences]
+        T[Shader translator<br/>RDNA 2 GFX10 → SPIR-V]
+        C[(Shader caches<br/>cache/spirv · pipelines.bin)]
+    end
+    V[Vulkan driver → GPU]
+    G1 --> H
+    G1 --> D
+    L --> G1
+    D --> T --> C --> V
+    D --> V
+```
 
 ### Design choices
 
 | | keylime |
 |---|---|
-| Graphics API | Vulkan 1.3/1.4 |
-| Shader output | SPIR-V emitted directly (no DXC / DXIL round trip, fast driver compiles) |
-| Queues | asynchronous: timeline semaphores, no wait after each submission |
-| Memory | a GPU-side page table maps console addresses to wherever a page lives (host memory or VRAM / Resizable BAR), which is also how pages migrate |
-| Descriptors | real RDNA 2 descriptor words in descriptor memory; images and samplers are found through a GPU-side hash table into bindless arrays, with no per-frame mirroring |
-| wave64 on 32-lane GPUs | compute: one invocation runs two lanes exactly (planned) |
-| Frame pacing | high-resolution waitable timers |
+| Graphics API | Vulkan 1.3 / 1.4 |
+| Shaders | SPIR-V written directly from GFX10 machine code — no HLSL or DXIL round trip |
+| Memory | Title memory imported zero-copy behind a GPU page table (console addresses → wherever the page lives) |
+| Descriptors | Real RDNA 2 descriptor words; images and samplers found through a GPU hash table into bindless arrays |
+| Queues | Asynchronous, timeline semaphores, no wait after each submission |
+| Shader compiles | Never on the game's threads; urgent queue for what a draw or dispatch waits on; two-level disk cache |
+| Frame pacing | High-resolution waitable timers |
 
-See [`docs/translator.md`](docs/translator.md) and
-[`docs/rdna2-descriptors.md`](docs/rdna2-descriptors.md).
+More detail: [`docs/translator.md`](docs/translator.md) · [`docs/rdna2-descriptors.md`](docs/rdna2-descriptors.md)
+
+### Shader pipeline
+
+```mermaid
+flowchart LR
+    A[Console shader<br/>GFX10 code] --> B[Decode] --> C[Structure control flow<br/>ifs · loops · parts] --> D[SPIR-V] --> E{In cache?}
+    E -- yes --> F[Ready instantly]
+    E -- no --> G[Quick build ~1 s] --> F
+    G -.background.-> H[Optimized build] -.swap in.-> F
+```
+
+---
 
 ## Building
 
-Requirements: Windows 10/11 x64, Visual Studio 2022 (or Build Tools) with the C++ workload
-(CMake and Ninja ship with it), and a GPU driver with Vulkan 1.3.
+**Needs:** Windows 10/11 x64 · Visual Studio 2022 (or Build Tools) with the C++ workload (CMake and
+Ninja ship with it) · a GPU driver with Vulkan 1.3.
 
-    powershell -File tools\build.ps1
+```powershell
+powershell -File tools\build.ps1
+```
 
 ## Running
 
-    tools\play.ps1                      opens a live log console and starts the game
-    build\keylime.exe run <dir>\game_scarlett_master.exe --execute
-    build\keylime.exe imports <exe>     map and bind only; lists unimplemented functions
-    build\keylime.exe shader <dir|file> [--dis]   parse/disassemble console shader containers
+```powershell
+tools\play.ps1                                              # live log console + the game
+build\keylime.exe run <dir>\game_scarlett_master.exe --execute
+```
 
-Logs go to `logs\keylime.log`; set `KEYLIME_TRACE=1` for detailed logging.
-A debug panel in the top-left corner shows fps, a frame-time graph, GPU work,
-shader compiles, VRAM and streaming; F3 toggles it (`KEYLIME_OVERLAY=0` starts it hidden).
-Crash diagnostics: every distinct fault is logged once, an unhandled crash writes
-`logs\crash.dmp`, and if no frame is shown for 6 s every thread's stack goes to
-`logs\stacks.txt` (also `KEYLIME_STACKS_AT=<seconds>`).
-Shader stores to title memory that no GPU resource or heap covers are skipped and the
-first ones are logged with the shader's hash ("stored to ..., where no GPU resource or heap
-lies"); `KEYLIME_STORE_GUARD=0` turns that guard off.
-Keyboard stands in for a controller: Enter = A, Backspace = B, Esc = Menu, Tab = View,
-arrows = D-pad, WASD / IJKL = sticks, Q / E = shoulders, Z / C = triggers.
+| Command | What it does |
+|---|---|
+| `keylime run <exe> --execute` | Run the game |
+| `keylime precompile <dir>` | Build every compute shader dumped in `<dir>` into the caches, on all cores |
+| `keylime imports <exe>` | Map and bind only; list unimplemented functions |
+| `keylime shader <dir\|file> [--dis]` | Parse or disassemble console shader containers |
+| `keylime shader <dir> --spirv` | Translate shaders and build them as driver pipelines |
+
+### Controls
+
+A keyboard stands in for a controller (any XInput pad works too).
+
+| Key | Pad | Key | Pad |
+|---|---|---|---|
+| Enter | A | Backspace | B |
+| Esc | Menu | Tab | View |
+| Arrows | D-pad | WASD / IJKL | Left / right stick |
+| Q / E | Shoulders | Z / C | Triggers |
+
+**F3** toggles the debug panel (fps, frame-time graph, GPU work, shader compiles, VRAM, streaming).
+
+### Shader cache
+
+The first time the game uses a shader, it has to be translated and compiled — that's what makes a
+first run stutter. To build the cache ahead of time:
+
+```powershell
+$env:KEYLIME_DUMP_SHADERS = "D:\keylime\logs\dump"   # 1. play once: every shader is saved here
+build\keylime.exe precompile D:\keylime\logs\dump     # 2. build them all on every core
+```
+
+Later runs load them from `cache\spirv` and `cache\pipelines.bin`. A change to the translator
+starts the cache over.
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `KEYLIME_TRACE=1` | Detailed logging |
+| `KEYLIME_OVERLAY=0` | Start with the debug panel hidden |
+| `KEYLIME_DUMP_SHADERS=<dir>` | Save every shader the game uses (for `precompile`) |
+| `KEYLIME_KEYS=14:RETURN,30:A` | Scripted key presses at those seconds (testing without a person) |
+| `KEYLIME_SNAPSHOTS=<dir>` | Save some shown frames as BMP files |
+| `KEYLIME_STACKS_AT=<s>` | Log every thread's stack at that second |
+| `KEYLIME_STORE_GUARD=0` | Don't skip shader stores outside GPU memory |
+| `KEYLIME_WATCHDOG=1` | Let the game's GPU watchdog end the game |
+| `KEYLIME_VALIDATION=1` | Vulkan validation layers |
+
+## Troubleshooting
+
+| File | What's in it |
+|---|---|
+| `logs\keylime.log` | Full log; every 2 s a `frame:` line (ms per frame, GPU busy, pipeline waits, work run and skipped) and a `compile:` line |
+| `logs\crash.dmp` | Minidump of an unhandled crash (each distinct fault is also logged once) |
+| `logs\stacks.txt` | Every thread's stack when no frame is shown for 5 s and 20 s, plus what each GPU queue waits on |
+| `cache\used-pipelines.txt` | Pipelines used so far; the next run starts them as soon as the game creates them |
+
+---
+
+## Other projects
+
+Several projects are working on GTA VI's Xbox build on PC. keylime is in the same family as VIctory
+and XCL — the console's own x86-64 code runs natively, with the system libraries and GPU replaced
+around it — but we take a different graphics path: we drive Vulkan and write SPIR-V ourselves, where
+the others go through Direct3D 12 and DXIL.
+
+| Project | Approach | Scope | Graphics path |
+|---|---|---|---|
+| **keylime** | Native runtime, C++20, from scratch | GTA VI first | Vulkan; RDNA 2 → SPIR-V directly |
+| [VIctory](https://github.com/Marvisak/VIctory) | Compatibility layer, Rust | GTA VI | RDNA 2 → DXIL via DXC |
+| [victory-fork](https://github.com/fxceless/victory-fork) | VIctory plus rendering and speed fixes | GTA VI | Same as VIctory |
+| [ztrx](https://github.com/Zettrox/ztrx) | VIctory-based | GTA VI | Same as VIctory |
+| [XCL](https://github.com/xcl-dev/xcl) | Wine-style compatibility layer | Any Xbox Series game | RDNA 2 → HLSL → DXIL |
+| [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) | Static recompilation to C++ | Any Xbox Series game | DXIL |
+| [TuxBox](https://github.com/brcly/TuxBox) | Native-first layer, tested on Linux via Proton | Any Xbox Series game | Not stated |
+| [xbox-emulator](https://github.com/omonkeyz/xbox-emulator) | Rust runtime (continues TomBox) | Any Xbox Series game | Not stated |
+| [ScarlettX](https://github.com/Freminet/ScarlettX) | Clean-room HLE of the Scarlett OS and GDK | Any Xbox Series game | Not stated |
+| [OpenScarlett CE](https://github.com/OpenCommunityEdition/OpenScarlett) | AGPL layer swapping console DLLs for PC ones | Any Xbox Series game | Direct3D 12 |
+
+Other projects' progress is their own reporting.
+
+---
 
 ## Layout
 
-    src/loader.*, src/pe.*     mapping and binding the game's images
-    src/hle/                   console system libraries (kernel, files, xmem, dstorage, gameinput, xg)
-    src/hle/xgr/               xgameruntime (user, store, saves, async, other areas)
-    src/formats/               BCPack decoder
-    src/audio/                 AcpHal (XMA), xapu (Opus), chad (DSP)
-    src/gpu/                   D3D12.X objects on Vulkan
-    src/shader/                containers, GFX10 decoder, SPIR-V builder and translator
-    third_party/               miniz, libopus, AMD addrlib, Vulkan and SPIR-V headers
+```
+src/loader.*, src/pe.*     mapping and binding the game's images
+src/hle/                   console system libraries (kernel, files, xmem, dstorage, gameinput, xg)
+src/hle/xgr/               xgameruntime (user, store, saves, async, other areas)
+src/formats/               BCPack decoder
+src/audio/                 AcpHal (XMA), xapu (Opus), chad (DSP)
+src/gpu/                   D3D12.X objects on Vulkan, command execution, pipeline compiles
+src/shader/                containers, GFX10 decoder, control-flow structuring, SPIR-V translator
+third_party/               miniz, libopus, AMD addrlib, Vulkan and SPIR-V headers
+tools/                     build.ps1, play.ps1
+```
 
 ## Credits and licence
 
 keylime is licensed under the **GNU GPL v3.0 or later** (see `LICENSE`).
 
-- Many console interface layouts (object slot maps, structure shapes, file
-  formats) were reverse engineered by the [VIctory](https://github.com/Marvisak/VIctory)
-  project (GPL-3.0); keylime reuses that knowledge and ports some of its code
-  (noted in the files concerned).
-- Ideas from [ztrx](https://github.com/Zettrox/ztrx) and
-  [victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) and
-  [XCL](https://github.com/xcl-dev/xcl) (GPL-2.0) are reimplemented here, not
-  copied: per-stage shader loop caps, the wait comparison codes and mask,
-  type 105 as a dispatch, and an indirect work budget.
+- Many console interface layouts (object slot maps, structure shapes, file formats) were reverse
+  engineered by [VIctory](https://github.com/Marvisak/VIctory) (GPL-3.0); we reuse that knowledge
+  and port some of its code (noted in the files concerned).
+- Ideas from [ztrx](https://github.com/Zettrox/ztrx), [victory-fork](https://github.com/fxceless/victory-fork)
+  (GPL-3.0) and [XCL](https://github.com/xcl-dev/xcl) (GPL-2.0) are reimplemented here, not copied:
+  per-stage shader loop caps, the wait comparison codes and mask, type 105 as a dispatch, an
+  indirect work budget, and parking the game's GPU watchdog.
 - The XMA decoder follows FFmpeg's `wmaprodec.c` (LGPL-2.1-or-later) via VIctory.
-- Third-party code keeps its own licence: miniz (MIT), libopus (BSD-3-Clause),
-  AMD addrlib from Mesa (MIT), Khronos Vulkan / SPIR-V headers (Apache-2.0 / MIT),
-  GFX10 opcode tables from Mesa's ACO (MIT) and register layouts from Mesa (MIT).
+- Third-party code keeps its own licence: miniz (MIT), libopus (BSD-3-Clause), AMD addrlib from Mesa
+  (MIT), Khronos Vulkan / SPIR-V headers (Apache-2.0 / MIT), GFX10 opcode tables from Mesa's ACO
+  (MIT) and register layouts from Mesa (MIT).
 
 keylime is written with the help of Claude, Anthropic's AI model.
 
-This project is not affiliated with Microsoft, Rockstar Games or Take-Two Interactive.
+<sub>Not affiliated with Microsoft, Rockstar Games or Take-Two Interactive.</sub>
