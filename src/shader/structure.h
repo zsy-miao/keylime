@@ -19,5 +19,6 @@ struct Node {
 };
 
 std::vector<Node> plan(const std::vector<Term>& terms, const std::vector<Region>& regions);
+const char* build_stamp();
 
 }  // namespace kl::shader::cfg

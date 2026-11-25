@@ -479,6 +479,7 @@ struct Compiled {
     std::atomic<VkPipeline> compute{VK_NULL_HANDLE};
     std::atomic<VkPipeline> fast{VK_NULL_HANDLE};  // unoptimized, built by a dispatch that could not wait
     std::atomic<bool> fast_claimed{false};
+    std::atomic<bool> early{false}, counted{false};
     std::unordered_map<uint64_t, VkPipeline> variants;  // under the state's lock
     std::unordered_set<uint64_t> pending;                // variants a worker is building
     bool writes_color = false;
@@ -501,8 +502,101 @@ bool icase_equal(const std::string& a, const std::string& b) {
     return true;
 }
 
+uint64_t module_key(const shader::Program& p, const shader::Options& o, uint64_t hash) {
+    uint64_t h = shader::translator_build() ^ hash;
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
+    mix(uint64_t(p.stage));
+    mix(o.sgpr_offset);
+    for (auto& [a, b] : o.ps_location) mix(uint64_t(a) << 8 | b);
+    return h;
+}
+
+std::string spirv_path(uint64_t key) {
+    char b[64];
+    snprintf(b, sizeof b, "cache\\spirv\\%016llx.bin", (unsigned long long)key);
+    return b;
+}
+
+constexpr uint32_t SPIRV_MAGIC = 0x3156534b;
+
+bool load_spirv(uint64_t key, shader::Translation& t) {
+    FILE* f = fopen(spirv_path(key).c_str(), "rb");
+    if (!f) return false;
+    bool ok = true;
+    auto u32 = [&] {
+        uint32_t v = 0;
+        ok = ok && fread(&v, 4, 1, f) == 1;
+        return v;
+    };
+    auto bytes = [&](std::vector<uint8_t>& v) {
+        uint32_t n = u32();
+        if (!ok || n > 4096) return void(ok = false);
+        v.resize(n);
+        ok = ok && (!n || fread(v.data(), 1, n, f) == n);
+    };
+    if (u32() != SPIRV_MAGIC) ok = false;
+    uint32_t words = u32();
+    if (ok && words && words < (64u << 20)) {
+        t.spirv.resize(words);
+        ok = fread(t.spirv.data(), 4, words, f) == words;
+    } else {
+        ok = false;
+    }
+    for (auto& l : t.local_size) l = u32();
+    bytes(t.vs_input_rows);
+    bytes(t.vs_output_rows);
+    bytes(t.ps_input_rows);
+    uint32_t flags = u32();
+    t.mrt_mask = uint8_t(flags), t.writes_depth = flags & 0x100, t.discards = flags & 0x200;
+    t.blocks = u32();
+    t.guarded_blocks = u32();
+    fclose(f);
+    return ok && t.spirv[0] == 0x07230203;
+}
+
+void save_spirv(uint64_t key, const shader::Translation& t) {
+    CreateDirectoryA("cache", nullptr);
+    CreateDirectoryA("cache\\spirv", nullptr);
+    std::string path = spirv_path(key), tmp = path + "." + std::to_string(GetCurrentThreadId()) + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    auto u32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
+    auto bytes = [&](const std::vector<uint8_t>& v) {
+        u32(uint32_t(v.size()));
+        if (!v.empty()) fwrite(v.data(), 1, v.size(), f);
+    };
+    u32(SPIRV_MAGIC);
+    u32(uint32_t(t.spirv.size()));
+    fwrite(t.spirv.data(), 4, t.spirv.size(), f);
+    for (auto l : t.local_size) u32(l);
+    bytes(t.vs_input_rows);
+    bytes(t.vs_output_rows);
+    bytes(t.ps_input_rows);
+    u32(t.mrt_mask | (t.writes_depth ? 0x100 : 0) | (t.discards ? 0x200 : 0));
+    u32(t.blocks);
+    u32(t.guarded_blocks);
+    bool ok = fclose(f) == 0;
+    if (ok) MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileA(tmp.c_str());
+}
+
+VkShaderModule make_module(const shader::Translation& t) {
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = t.spirv.size() * 4;
+    mi.pCode = t.spirv.data();
+    VkShaderModule m = VK_NULL_HANDLE;
+    KL_VK_CHECK(vk::vkCreateShaderModule(dev(), &mi, nullptr, &m));
+    return m;
+}
+
 VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64_t hash, shader::Translation& t) {
     std::string err;
+    uint64_t key = module_key(p, o, hash);
+    if (load_spirv(key, t)) {
+        stats::add(stats::ShadersCached);
+        return make_module(t);
+    }
+    t = shader::Translation{};
     auto t0 = std::chrono::steady_clock::now();
     bool translated = shader::translate(p, t, err, &o);
     stats::add(stats::TranslateUs, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()));
@@ -515,12 +609,8 @@ VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64
         if (n++ < 32) KL_WARN("gpu", "shader %016llx (%s) not translated: %s", (unsigned long long)hash, shader::stage_name(p.stage), err.c_str());
         return VK_NULL_HANDLE;
     }
-    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    mi.codeSize = t.spirv.size() * 4;
-    mi.pCode = t.spirv.data();
-    VkShaderModule m = VK_NULL_HANDLE;
-    KL_VK_CHECK(vk::vkCreateShaderModule(dev(), &mi, nullptr, &m));
-    return m;
+    save_spirv(key, t);
+    return make_module(t);
 }
 
 // Pipelines are built by workers: one driver compile can take many seconds, and the queue
@@ -650,6 +740,15 @@ constexpr const char* USED_FILE = "cache\\used-pipelines.txt";
 std::mutex g_used_lock;
 std::unordered_set<uint64_t> g_used_before, g_used_now;
 std::atomic<uint64_t> g_used_added{0}, g_started_early{0};
+std::chrono::steady_clock::time_point g_run_start = std::chrono::steady_clock::now();
+void precompiled(Compiled* k) {
+    if (!k->early.load() || k->counted.exchange(true)) return;
+    stats::add(stats::PrecompileDone);
+    uint64_t done = stats::g_counters[stats::PrecompileDone].load(), listed = stats::g_counters[stats::PrecompileListed].load();
+    if (done == listed || done % 1000 == 0)
+        KL_INFO("gpu", "precompile: %llu of the %llu pipelines used in earlier runs are built, %.0f s after start", (unsigned long long)done,
+                (unsigned long long)listed, std::chrono::duration<double>(std::chrono::steady_clock::now() - g_run_start).count());
+}
 uint64_t pipeline_key(const pipeline::State* st) {
     uint64_t h = st->compute ? 0x9e3779b97f4a7c15ull : 0xcbf29ce484222325ull;
     for (auto& s : st->shaders) h = (h ^ s.hash ^ (uint64_t(s.stage) << 56)) * 0x100000001b3ull;
@@ -662,6 +761,7 @@ void open_used() {
         fclose(f);
     }
     KL_INFO("gpu", "pipelines: %zu used in earlier runs (%s) start as soon as the game creates them", g_used_before.size(), USED_FILE);
+    stats::set(stats::PrecompileListed, g_used_before.size());
 }
 void note_used(Compiled* k) {
     if (k->used.exchange(true)) return;
@@ -702,7 +802,7 @@ void shaders(pipeline::State* st, Compiled* k);
 VkPipeline compute_pipeline(Compiled* k, bool fast);
 void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs);
 void optimize(Compiled* k);
-void prebuild(pipeline::State* st, Compiled* k);
+bool prebuild(pipeline::State* st, Compiled* k);
 
 // A worker translates the shaders; a compute pipeline a dispatch waits for gets a quick
 // unoptimized build first, then the optimized one (queued behind what draws wait for).
@@ -711,6 +811,7 @@ void translate_claimed(pipeline::State* st, Compiled* k, bool first_use) {
     shaders(st, k);
     k->translated.store(true, std::memory_order_release);
     if (!st->compute || !k->ok) k->ready.store(true, std::memory_order_release);
+    if (!k->ok) precompiled(k);
     notify();
     if (st->compute && k->ok) {
         if (first_use) {
@@ -720,7 +821,7 @@ void translate_claimed(pipeline::State* st, Compiled* k, bool first_use) {
             optimize(k);
         }
     } else if (k->ok) {
-        prebuild(st, k);
+        if (!prebuild(st, k)) precompiled(k);
     }
 }
 
@@ -764,6 +865,7 @@ void optimize(Compiled* k) {
         if (VkPipeline f = k->fast.exchange(VK_NULL_HANDLE)) retire([f] { vk::vkDestroyPipeline(dev(), f, nullptr); });
     }
     k->ready.store(true, std::memory_order_release);
+    precompiled(k);
     notify();
 }
 
@@ -972,9 +1074,12 @@ VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
 void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, uint64_t key) {
     int expand = topo == RECTLIST ? 0 : topo == QUADLIST ? 1 : -1;
     auto finish = [&](VkPipeline p) {
-        std::lock_guard g(st->lock);
-        k->variants[key] = p;
-        k->pending.erase(key);
+        {
+            std::lock_guard g(st->lock);
+            k->variants[key] = p;
+            k->pending.erase(key);
+        }
+        precompiled(k);
     };
     VkPipelineShaderStageCreateInfo stages[3];
     uint32_t nstages = 0;
@@ -1081,9 +1186,9 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
 
 // The variant the pipeline declares (its render target and depth formats, a list of its
 // topology type), built ahead so the first draw likely finds it ready.
-void prebuild(pipeline::State* st, Compiled* k) {
+bool prebuild(pipeline::State* st, Compiled* k) {
     static const uint32_t topo_of[] = {0, 1, 2, 4};
-    if (st->topology_type == 0 || st->topology_type > 3) return;
+    if (st->topology_type == 0 || st->topology_type > 3) return false;
     Attachments a;
     a.count = std::min(st->rt_count, 8u);
     for (uint32_t i = 0; i < a.count; ++i) a.color[i] = images::vk_format(st->rt_formats[i]);
@@ -1093,6 +1198,7 @@ void prebuild(pipeline::State* st, Compiled* k) {
         a.stencil = a.depth == VK_FORMAT_D16_UNORM_S8_UINT || a.depth == VK_FORMAT_D24_UNORM_S8_UINT || a.depth == VK_FORMAT_D32_SFLOAT_S8_UINT;
     }
     request_variant(k, st, a, topo_of[st->topology_type], false);
+    return true;
 }
 
 // --------------------------------------------------------------- builder ----
@@ -2056,7 +2162,7 @@ void prepare(pipeline::State* st) {
     }
     if (!early) return;
     ++g_started_early;
-    obtain(st, false);
+    obtain(st, false)->early = true;
 }
 
 int queue_for(uint32_t kind) { return kind == 2 ? COMPUTE : GRAPHICS; }

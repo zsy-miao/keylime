@@ -108,6 +108,8 @@ bool vop_extension(Inst& i, const uint8_t* code, size_t size) {
 
 }  // namespace
 
+const char* build_stamp() { return __DATE__ " " __TIME__; }
+
 bool decode(const uint8_t* code, size_t size, uint32_t at, Inst& i) {
     if (at + 4 > size) return false;
     i = Inst{};

@@ -73,4 +73,6 @@ std::string operand_text(const Operand& o);
 bool branch_target(const Inst& i, uint32_t& target);
 bool ends_program(const Inst& i);  // s_endpgm*
 
+const char* build_stamp();
+
 }  // namespace kl::shader::gfx10

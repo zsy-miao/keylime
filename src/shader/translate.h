@@ -37,6 +37,7 @@ struct Options {
 };
 
 bool translate(const Program& p, Translation& out, std::string& error, const Options* opt = nullptr);
+uint64_t translator_build();
 
 // The texture table's hash and probe count: the host fills the table with these and the
 // translated shaders look keys up with the same ones.

@@ -173,6 +173,8 @@ struct Planner {
 
 }  // namespace
 
+const char* build_stamp() { return __DATE__ " " __TIME__; }
+
 std::vector<Node> plan(const std::vector<Term>& terms, const std::vector<Region>& regions) {
     uint32_t n = uint32_t(terms.size());
     std::vector<Node> out;

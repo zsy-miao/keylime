@@ -1839,6 +1839,13 @@ struct T {
 
 }  // namespace
 
+uint64_t translator_build() {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char* s : {__DATE__ " " __TIME__, cfg::build_stamp(), gfx10::build_stamp()})
+        for (; *s; ++s) h = (h ^ uint8_t(*s)) * 0x100000001b3ull;
+    return h;
+}
+
 bool translate(const Program& p, Translation& out, std::string& error, const Options* opt) {
     if (p.stage != HwStage::Vs && p.stage != HwStage::Ps && p.stage != HwStage::Cs) {
         error = std::string("stage ") + stage_name(p.stage) + " not translated yet";
