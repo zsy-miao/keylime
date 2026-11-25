@@ -96,7 +96,24 @@ VkDevice dev() { return host::get().device; }
 uint64_t completed(HostQueue& h) {
     uint64_t v = 0;
     if (h.timeline) vk::vkGetSemaphoreCounterValue(dev(), h.timeline, &v);
+    // NVIDIA's timelines read all ones after a GPU reset (Windows TDR) without an error code.
+    if (v == ~0ull) device_lost("reading a queue's progress (all ones: the GPU was reset)");
     return v;
+}
+// NV checkpoints: each draw and dispatch tags the command buffer with what it runs (kind in the
+// top byte, the pipeline key below), so a lost device can name the command it was on.
+struct Mark {
+    uint64_t key;
+    uint32_t kind, x, y, z;  // group counts (0 for indirect)
+};
+constexpr uint32_t MARKS = 1u << 16;
+Mark g_marks[MARKS];
+std::atomic<uint32_t> g_mark_next{0};
+void checkpoint(VkCommandBuffer cb, uint32_t kind, uint64_t key, uint32_t x = 0, uint32_t y = 0, uint32_t z = 0) {
+    if (!host::get().caps.checkpoints || !vk::vkCmdSetCheckpointNV) return;
+    uint32_t at = g_mark_next++ % MARKS;
+    g_marks[at] = {key, kind, x, y, z};
+    vk::vkCmdSetCheckpointNV(cb, reinterpret_cast<void*>(uint64_t(at) + 1));
 }
 
 // A CPU copy that survives memory the title has not mapped (yet).
@@ -482,6 +499,7 @@ struct Compiled {
     std::atomic<bool> early{false}, counted{false};
     std::unordered_map<uint64_t, VkPipeline> variants;  // under the state's lock
     std::unordered_set<uint64_t> pending;                // variants a worker is building
+    std::unordered_set<uint64_t> urgent_variants;        // variants an urgent job was queued for
     bool writes_color = false, mesh = false;
     uint32_t code_kb = 0, spirv_kb = 0, blocks = 0, guarded = 0;
     std::string plan_note;
@@ -866,7 +884,7 @@ void translate_claimed(pipeline::State* st, Compiled* k, bool first_use) {
 void queue_translation(pipeline::State* st, Compiled* k, bool first_use) {
     job([st, k, first_use] {
         if (!k->claimed.exchange(true)) translate_claimed(st, k, first_use);
-    }, first_use);
+    }, first_use, first_use && !st->compute);  // a draw's shaders translate in milliseconds: ahead of quick compute builds
 }
 
 // `first_use`: a draw or dispatch wants it now (ahead of early starts).
@@ -1114,7 +1132,12 @@ uint64_t request_variant(Compiled* k, pipeline::State* st, const Attachments& a,
         if (it == k->variants.end()) {
             k->variants[key] = VK_NULL_HANDLE;
             k->pending.insert(key);
+            if (urgent) k->urgent_variants.insert(key);
             job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, urgent, urgent);
+        } else if (urgent && k->pending.count(key) && k->urgent_variants.insert(key).second) {
+            // An early start asked for it at low priority (behind thousands of background builds): a
+            // draw waits now, so it gets an urgent build of its own; the first one done is kept.
+            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, true, true);
         }
     }
     return key;
@@ -1132,10 +1155,18 @@ VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
 }
 
 void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, uint64_t key) {
+    {
+        std::lock_guard g(st->lock);
+        if (!k->pending.count(key)) return;  // the other (urgent or early) build got there first
+    }
     int expand = topo == RECTLIST ? 0 : topo == QUADLIST ? 1 : -1;
     auto finish = [&](VkPipeline p) {
         {
             std::lock_guard g(st->lock);
+            if (!k->pending.count(key)) {  // built twice: keep the first
+                if (p) retire([p] { vk::vkDestroyPipeline(dev(), p, nullptr); });
+                return;
+            }
             k->variants[key] = p;
             k->pending.erase(key);
         }
@@ -1661,8 +1692,18 @@ struct Builder {
         return k;
     }
 
+    void mark(uint32_t kind, uint32_t x = 0, uint32_t y = 0, uint32_t z = 0) {
+        const pipeline::State* st = bind[kind == 1 ? 0 : 1].pso;
+        checkpoint(cb, kind, st ? pipeline_key(st) : 0, x, y, z);
+    }
     void dispatch(const cmd::Dispatch& d) {
         if (!dispatch_setup()) return;
+        mark(1, d.x, d.y, d.z);
+        if (uint64_t(d.x) * d.y * d.z > (1ull << 22)) {
+            static std::atomic<int> n{0};
+            if (n++ < 8) KL_WARN("gpu", "a dispatch of %u x %u x %u groups (pipeline %016llx)", d.x, d.y, d.z,
+                                 (unsigned long long)pipeline_key(bind[0].pso));
+        }
         vk::vkCmdDispatch(cb, d.x, d.y, d.z);
         stats::add(stats::DispatchesRun);
     }
@@ -1685,6 +1726,7 @@ struct Builder {
             stats::add(stats::DrawsSkipped);
             return;
         }
+        mark(3);
         vk::vkCmdDrawMeshTasksEXT(cb, x, y, z);
         stats::add(stats::DrawsRun);
     }
@@ -1745,6 +1787,7 @@ struct Builder {
         full_barrier(cb);
         if (type == 2) {
             if (!dispatch_setup()) return;
+            mark(1);
             for (uint32_t i = 0; i < max; ++i) vk::vkCmdDispatchIndirect(cb, db, doff + VkDeviceSize(i) * 12);
             stats::add(stats::DispatchesRun, max);
             return;
@@ -1753,6 +1796,7 @@ struct Builder {
             stats::add(stats::DrawsSkipped);
             return;
         }
+        mark(type == 3 ? 3 : 2);
         if (type == 3) vk::vkCmdDrawMeshTasksIndirectEXT(cb, db, doff, max, 12);
         else if (type == 0) vk::vkCmdDrawIndirect(cb, db, doff, max, 16);
         else vk::vkCmdDrawIndexedIndirect(cb, db, doff, max, 20);
@@ -2070,6 +2114,7 @@ struct Builder {
                     cmd::Draw d;
                     get(d);
                     if (draw_setup(false)) {
+                        mark(2);
                         vk::vkCmdDraw(cb, d.count, d.instances, d.first, d.first_instance);
                         stats::add(stats::DrawsRun);
                     } else {
@@ -2081,6 +2126,7 @@ struct Builder {
                     cmd::DrawIndexed d;
                     get(d);
                     if (draw_setup(true)) {
+                        mark(2);
                         vk::vkCmdDrawIndexed(cb, d.count, d.instances, d.first, d.base, d.first_instance);
                         stats::add(stats::DrawsRun);
                     } else {
@@ -2471,6 +2517,22 @@ void device_lost(const char* where) {
     static std::atomic<bool> once{false};
     if (!once.exchange(true)) {
         KL_ERROR("gpu", "the GPU stopped (Vulkan device lost while %s): a shader or command hung the GPU, so this run ends here", where);
+        if (host::get().caps.checkpoints && vk::vkGetQueueCheckpointDataNV)
+            for (int qi = 0; qi < 2; ++qi) {
+                if (!g_q[qi].q) continue;
+                uint32_t n = 0;
+                vk::vkGetQueueCheckpointDataNV(g_q[qi].q, &n, nullptr);
+                std::vector<VkCheckpointDataNV> cp(n, {VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+                vk::vkGetQueueCheckpointDataNV(g_q[qi].q, &n, cp.data());
+                static const char* kinds[] = {"?", "dispatch", "draw", "mesh draw"};
+                for (uint32_t k = 0; k < n; ++k) {
+                    uint64_t m = reinterpret_cast<uint64_t>(cp[k].pCheckpointMarker);
+                    if (!m || m > MARKS) continue;
+                    const Mark& mk = g_marks[m - 1];
+                    KL_ERROR("gpu", "  queue %d last checkpoint at stage %x: %s of pipeline %016llx, %u x %u x %u groups%s", qi, cp[k].stage,
+                             kinds[mk.kind < 4 ? mk.kind : 0], (unsigned long long)mk.key, mk.x, mk.y, mk.z, mk.x ? "" : " (indirect or draw)");
+                }
+            }
         dump_state();
         TerminateProcess(GetCurrentProcess(), 0xDEAD0005);
     }

@@ -41,6 +41,13 @@ bool is_fence(const Iid* iid) {
 }
 
 void reached(Fence* f, uint64_t v) {
+    // All ones is how D3D12 says "device removed": the title's fence waits end the game on it
+    // (game_scarlett_master.exe+0x4fb0c31 -> its fatal error). Never publish it from a read.
+    if (v == ~0ull) {
+        static std::atomic<int> n{0};
+        if (n++ < 4) KL_ERROR("gpu", "fence %p read back as all ones (device-removed value): not passed to the title", (void*)f);
+        return;
+    }
     std::lock_guard g(f->lock);
     uint64_t cur = f->value.load();
     if (v > cur) f->value.store(v, std::memory_order_release);
@@ -77,6 +84,11 @@ uint64_t counter(Fence* f) {
     uint64_t now = 0;
     VkResult r = vk::vkGetSemaphoreCounterValue(host::get().device, f->sem, &now);
     if (r == VK_ERROR_DEVICE_LOST) exec::device_lost("reading a fence");
+    if (r != VK_SUCCESS) {
+        static std::atomic<int> n{0};
+        if (n++ < 4) KL_ERROR("gpu", "reading fence %p failed: %s", (void*)f, vk::result_text(r));
+        return 0;
+    }
     return now;
 }
 
@@ -229,6 +241,10 @@ void watch(Fence* f, uint64_t value) {
 }
 
 void signal_cpu(Fence* f, uint64_t value) {
+    if (value == ~0ull) {
+        static std::atomic<int> n{0};
+        if (n++ < 4) KL_WARN("gpu", "the title signalled fence %p with all ones from the CPU", (void*)f);
+    }
     bool raise = false;
     {
         std::lock_guard g(f->lock);

@@ -136,6 +136,7 @@ bool start() {
     h.caps.descriptor_buffer = has(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     h.caps.host_import_alignment = hostp.minImportedHostPointerAlignment;
     h.caps.memory_budget = has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    h.caps.checkpoints = has(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 
     KL_INFO("vk", "GPU %s (driver %u.%u, Vulkan %u.%u.%u), subgroup %u lanes", h.name.c_str(),
             (h.props.driverVersion >> 22) & 0x3ff, (h.props.driverVersion >> 14) & 0xff, VK_API_VERSION_MAJOR(h.props.apiVersion),
@@ -204,6 +205,7 @@ bool start() {
     if (h.caps.mesh_shader) dext.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     if (h.caps.host_memory_import) dext.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (h.caps.memory_budget) dext.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (h.caps.checkpoints) dext.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);  // which command a lost GPU was on
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = uint32_t(qci.size());

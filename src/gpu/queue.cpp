@@ -8,6 +8,7 @@
 // GetTimestampFrequency 0x80, GetDesc 0xd0, page-mapping batch 0xe8,
 // PresentX 0xf0, Signal2X 0x100, ExecuteCommandListsX 0x108. Newer titles
 // (device created as ID3D12Device11) have every slot from 0x70 two later.
+#include <intrin.h>
 #include <mutex>
 #include <vector>
 
@@ -62,6 +63,11 @@ void WINAPI marker(Queue*) {}
 HRESULT WINAPI signal(Queue* q, void* fobj, uint64_t value) {
     auto* f = fence::from(fobj);
     if (!f) return E_INVALIDARG;
+    if (value >= (1ull << 62)) {
+        static std::atomic<int> n{0};
+        if (n++ < 6)
+            KL_WARN("gpu", "a queue signals fence %p with %llx (called from %p)", fobj, (unsigned long long)value, _ReturnAddress());
+    }
     if (fence::raise(f, value)) {
         exec::signal(q->host, fence::semaphore(f), value);
     } else {
@@ -73,7 +79,13 @@ HRESULT WINAPI signal(Queue* q, void* fobj, uint64_t value) {
     fence::watch(f, value);
     return S_OK;
 }
-HRESULT WINAPI signal2_x(Queue* q, void* f, uint64_t value, const uint8_t*, const uint8_t*) { return signal(q, f, value); }
+HRESULT WINAPI signal2_x(Queue* q, void* f, uint64_t value, const uint8_t* a, const uint8_t* b) {
+    if (value >= (1ull << 62)) {
+        static std::atomic<int> n{0};
+        if (n++ < 6) KL_WARN("gpu", "signal2_x: fence %p value %llx, args %p %p (called from %p)", f, (unsigned long long)value, a, b, _ReturnAddress());
+    }
+    return signal(q, f, value);
+}
 HRESULT WINAPI wait(Queue* q, void* fobj, uint64_t value) {
     auto* f = fence::from(fobj);
     if (!f) return E_INVALIDARG;

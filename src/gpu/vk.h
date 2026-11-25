@@ -30,7 +30,8 @@
     X(vkQueuePresentKHR) X(vkGetMemoryHostPointerPropertiesEXT)                              X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateComputePipelines)              X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets)     X(vkUpdateDescriptorSets) X(vkCreateSampler) X(vkDestroySampler) X(vkCmdBindPipeline)                      X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdDraw) X(vkCmdDrawIndexed)        X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdSetViewport) X(vkCmdSetScissor)     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetPrimitiveTopology) X(vkCmdSetBlendConstants)                X(vkCmdSetStencilReference) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdClearDepthStencilImage)                           X(vkCmdCopyImageToBuffer) X(vkCmdClearAttachments) X(vkResetCommandBuffer) X(vkCmdDrawIndirect)                         X(vkCmdDrawIndexedIndirect) X(vkCmdDispatchIndirect)            \
     X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCreatePipelineCache) X(vkGetPipelineCacheData)          \
     X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults)                              \
-    X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT)
+    X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT) \
+    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV)
 
 namespace kl::vk {
 #define KL_VK_DECLARE(name) extern PFN_##name name;

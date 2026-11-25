@@ -1018,36 +1018,52 @@ struct T {
             if (n == "s_pack_hh_b32_b16") return sres(bor(shr(S0(), u(16)), band(S1(), u(0xffff0000))));
             if (n.find("_saveexec_b32") != std::string_view::npos || n.find("_saveexec_b64") != std::string_view::npos ||
                 n.find("_wrexec_b32") != std::string_view::npos || n.find("_wrexec_b64") != std::string_view::npos) {
-                Id e = get_s(EXEC_LO), s0v = S0(), r;
                 bool wrexec = n.find("wrexec") != std::string_view::npos;
-                if (n.rfind("s_and_", 0) == 0) r = band(s0v, e);
-                else if (n.rfind("s_or_", 0) == 0) r = bor(s0v, e);
-                else if (n.rfind("s_xor_", 0) == 0) r = bxor(s0v, e);
-                else if (n.rfind("s_andn2_", 0) == 0) r = band(s0v, bnot(e));
-                else if (n.rfind("s_orn2_", 0) == 0) r = bor(s0v, bnot(e));
-                else if (n.rfind("s_andn1_", 0) == 0) r = band(bnot(s0v), e);
-                else if (n.rfind("s_nand_", 0) == 0) r = bnot(band(s0v, e));
-                else if (n.rfind("s_nor_", 0) == 0) r = bnot(bor(s0v, e));
-                else if (n.rfind("s_xnor_", 0) == 0) r = bnot(bxor(s0v, e));
-                else if (n.rfind("s_orn1_", 0) == 0) r = bor(bnot(s0v), e);
-                else return unsupported(i);
+                // 64-bit forms on a wave64 program work on both dwords (EXEC_HI is real there).
+                bool both = n.find("_b64") != std::string_view::npos && p.wave64;
+                auto combine = [&](Id s0v, Id e) -> Id {
+                    if (n.rfind("s_and_", 0) == 0) return band(s0v, e);
+                    if (n.rfind("s_or_", 0) == 0) return bor(s0v, e);
+                    if (n.rfind("s_xor_", 0) == 0) return bxor(s0v, e);
+                    if (n.rfind("s_andn2_", 0) == 0) return band(s0v, bnot(e));
+                    if (n.rfind("s_orn2_", 0) == 0) return bor(s0v, bnot(e));
+                    if (n.rfind("s_andn1_", 0) == 0) return band(bnot(s0v), e);
+                    if (n.rfind("s_nand_", 0) == 0) return bnot(band(s0v, e));
+                    if (n.rfind("s_nor_", 0) == 0) return bnot(bor(s0v, e));
+                    if (n.rfind("s_xnor_", 0) == 0) return bnot(bxor(s0v, e));
+                    if (n.rfind("s_orn1_", 0) == 0) return bor(bnot(s0v), e);
+                    return 0;
+                };
+                Id e_lo = get_s(EXEC_LO), e_hi = both ? get_s(EXEC_HI) : u(0);
+                Id s_lo = S0(), s_hi = both ? (i.src[0].code <= 105 || i.src[0].code == VCC_LO || i.src[0].code == EXEC_LO
+                                                   ? get_s(uint16_t(i.src[0].code + 1))
+                                                   : (i.src[0].code >= 193 && i.src[0].code <= 208 ? u(~0u) : u(0)))
+                                            : u(0);
+                Id r_lo = combine(s_lo, e_lo);
+                if (!r_lo) return unsupported(i);
+                Id r_hi = both ? combine(s_hi, e_hi) : u(0);
                 if (!wrexec) {
-                    sres(e);
-                    if (n.find("_b64") != std::string_view::npos) set_s(uint16_t(sd + 1), u(0));
+                    sres(e_lo);
+                    if (n.find("_b64") != std::string_view::npos) set_s(uint16_t(sd + 1), e_hi);
+                } else {
+                    sres(r_lo);
+                    if (both) set_s(uint16_t(sd + 1), r_hi);
                 }
-                else sres(r);
-                set_s(EXEC_LO, r);
-                return set_scc(ne0(r));
+                set_s(EXEC_LO, r_lo);
+                if (both) set_s(EXEC_HI, r_hi);
+                return set_scc(ne0(bor(r_lo, r_hi)));
             }
             if (n == "s_wqm_b32" || n == "s_wqm_b64") {
                 // Any lane of a quad -> the whole quad.
-                Id x = S0();
-                Id q = bor(bor(x, shr(x, u(1))), bor(shr(x, u(2)), shr(x, u(3))));
-                q = band(q, u(0x11111111));
-                q = b.op(spv::OpIMul, t_u32, {q, u(0xf)});
+                auto wqm = [&](Id x) {
+                    Id q = bor(bor(x, shr(x, u(1))), bor(shr(x, u(2)), shr(x, u(3))));
+                    return b.op(spv::OpIMul, t_u32, {band(q, u(0x11111111)), u(0xf)});
+                };
+                Id q = wqm(S0()), qh = u(0);
+                if (n == "s_wqm_b64" && p.wave64) qh = wqm(get_s(uint16_t(i.src[0].code + 1)));
                 sres(q);
-                if (n == "s_wqm_b64") set_s(uint16_t(sd + 1), u(0));
-                return set_scc(ne0(q));
+                if (n == "s_wqm_b64") set_s(uint16_t(sd + 1), qh);
+                return set_scc(ne0(bor(q, qh)));
             }
             if (n == "s_getpc_b64") return set_s64(sd, b.c_u64(uint64_t(i.offset + 4)));
             if (n == "s_swappc_b64" && p.stage == HwStage::Vs) {
@@ -2150,6 +2166,9 @@ struct T {
         r.active = true;
         if_then(pc_in(r.lo, r.hi), [&] {
             Id header = b.id(), body_ = b.id(), cont = b.id(), merge = b.id();
+            // Each loop counts its own trips: with one shared counter an inner loop reset the
+            // outer one's on every pass, so an outer loop around an inner one had no cap at all.
+            Id trips = b.local(p_fn_u32, u(0));
             store(trips, u(0));
             b.op_void(spv::OpBranch, {header});
             b.label(header);
