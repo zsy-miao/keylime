@@ -22,7 +22,11 @@
 namespace kl::gpu::images {
 namespace {
 
-constexpr uint32_t MAX_IMAGE_SLOTS = 262144, SAMPLER_SLOTS = 4096, STORAGE_SLOTS = 16384;
+constexpr uint32_t MAX_IMAGE_SLOTS = 262144, SAMPLER_SLOTS = 4096;
+// Storage images are indexed by the image's slot, so there are as many storage descriptors as
+// image slots: with 16384 an image_store to an image past slot 16383 read past the end of the
+// descriptor array, which hung the GPU (the opening cutscene has 50k+ images).
+#define STORAGE_SLOTS IMAGE_SLOTS
 constexpr uint32_t TABLE_ENTRIES = 1u << 20;  // power of two; entries of 16 bytes after a 16-byte header
 uint32_t IMAGE_SLOTS = MAX_IMAGE_SLOTS;        // the device may allow fewer
 constexpr uint64_t CHUNK = 256ull << 20;

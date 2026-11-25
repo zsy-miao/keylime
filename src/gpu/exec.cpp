@@ -106,7 +106,7 @@ struct Mark {
     uint64_t key;
     uint32_t kind, x, y, z;  // group counts (0 for indirect)
 };
-constexpr uint32_t MARKS = 1u << 16;
+constexpr uint32_t MARKS = 1u << 20;
 Mark g_marks[MARKS];
 std::atomic<uint32_t> g_mark_next{0};
 void checkpoint(VkCommandBuffer cb, uint32_t kind, uint64_t key, uint32_t x = 0, uint32_t y = 0, uint32_t z = 0) {
@@ -646,7 +646,10 @@ std::condition_variable g_jobs_cv, g_done_cv;
 // g_urgent: what a draw or dispatch waits for now (first-use translations, quick compute
 // builds). Some workers take only those, so a backlog of optimized builds (30-90 s each for
 // big translated compute shaders) can never hold up a dispatch the title is waiting on.
-std::deque<std::function<void()>> g_jobs, g_urgent;
+// g_warm: early starts (translation and quick build of pipelines earlier runs used), taken by
+// every worker whenever nothing urgent waits, so they are ready before the scene needs them;
+// g_jobs: optimized builds, on two low-priority workers during play.
+std::deque<std::function<void()>> g_jobs, g_urgent, g_warm;
 void notify() {
     { std::lock_guard g(g_done_lock); }
     g_done_cv.notify_all();
@@ -685,21 +688,37 @@ void save_cache(bool force = false) {
     if (built == saved_at || (!force && now - last < std::chrono::seconds(30))) return;
     last = now, saved_at = built;
     size_t n = 0;
-    if (vk::vkGetPipelineCacheData(dev(), g_cache, &n, nullptr) != VK_SUCCESS || !n) return;
-    std::vector<uint8_t> data(n);
-    if (vk::vkGetPipelineCacheData(dev(), g_cache, &n, data.data()) != VK_SUCCESS) return;
-    CreateDirectoryA("cache", nullptr);
-    if (FILE* f = fopen("cache\\pipelines.tmp", "wb")) {
-        bool ok = fwrite(data.data(), 1, n, f) == n;
-        fclose(f);
-        if (ok) MoveFileExA("cache\\pipelines.tmp", CACHE_FILE, MOVEFILE_REPLACE_EXISTING);
+    static std::atomic<int> fails{0};
+    auto fail = [&](const char* what, long long detail) {
+        if (fails++ < 4) KL_WARN("gpu", "pipeline cache not saved: %s (%lld)", what, detail);
+    };
+    // Workers keep adding pipelines while this copies: room to spare, and again if it grew past it
+    // (VK_INCOMPLETE, which every save of the 3 GB cache hit before).
+    std::vector<uint8_t> data;
+    VkResult r = VK_INCOMPLETE;
+    for (int tries = 0; tries < 4 && r == VK_INCOMPLETE; ++tries) {
+        r = vk::vkGetPipelineCacheData(dev(), g_cache, &n, nullptr);
+        if (r != VK_SUCCESS || !n) return fail("size query", r);
+        n += n / 16 + (64 << 20);
+        data.resize(n);
+        r = vk::vkGetPipelineCacheData(dev(), g_cache, &n, data.data());
     }
+    if (r != VK_SUCCESS) return fail("data", r);
+    CreateDirectoryA("cache", nullptr);
+    FILE* f = fopen("cache\\pipelines.tmp", "wb");
+    if (!f) return fail("open cache\\pipelines.tmp", errno);
+    bool ok = fwrite(data.data(), 1, n, f) == n;
+    fclose(f);
+    if (!ok) return fail("write", (long long)n);
+    if (!MoveFileExA("cache\\pipelines.tmp", CACHE_FILE, MOVEFILE_REPLACE_EXISTING)) return fail("replace", GetLastError());
+    static std::atomic<int> told{0};
+    if (told++ < 3) KL_INFO("gpu", "pipeline cache saved: %zu KB", n >> 10);
 }
 void save_used(bool force = false);
 std::atomic<bool> g_precompiling{false};  // `keylime precompile` is running
 // `front`: ahead of other urgent work (graphics variants build in milliseconds; quick compute builds
 // can take seconds on a cold cache).
-void job(std::function<void()> f, bool urgent = false, bool front = false) {
+void job(std::function<void()> f, bool urgent = false, bool front = false, bool warm = false) {
     stats::add(stats::Compiling);
     static std::once_flag once;
     std::call_once(once, [] {
@@ -718,11 +737,11 @@ void job(std::function<void()> f, bool urgent = false, bool front = false) {
                     std::function<void()> f;
                     {
                         std::unique_lock g(g_jobs_lock);
-                        g_jobs_cv.wait(g, [urgent_only] { return !g_urgent.empty() || (!urgent_only && !g_jobs.empty()); });
-                        auto& from = !g_urgent.empty() ? g_urgent : g_jobs;
+                        g_jobs_cv.wait(g, [urgent_only] { return !g_urgent.empty() || !g_warm.empty() || (!urgent_only && !g_jobs.empty()); });
+                        auto& from = !g_urgent.empty() ? g_urgent : !g_warm.empty() ? g_warm : g_jobs;
                         f = std::move(from.front());
                         from.pop_front();
-                        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size());
+                        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size() + g_warm.size());
                     }
                     f();
                     stats::g_counters[stats::Compiling].fetch_sub(1);
@@ -736,8 +755,9 @@ void job(std::function<void()> f, bool urgent = false, bool front = false) {
         std::lock_guard g(g_jobs_lock);
         if (urgent && front) g_urgent.push_front(std::move(f));
         else if (urgent) g_urgent.push_back(std::move(f));
+        else if (warm) g_warm.push_back(std::move(f));
         else g_jobs.push_back(std::move(f));
-        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size());
+        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size() + g_warm.size());
     }
     // notify_one could wake an urgent-only worker for normal work and lose the wakeup.
     g_jobs_cv.notify_all();
@@ -884,7 +904,7 @@ void translate_claimed(pipeline::State* st, Compiled* k, bool first_use) {
 void queue_translation(pipeline::State* st, Compiled* k, bool first_use) {
     job([st, k, first_use] {
         if (!k->claimed.exchange(true)) translate_claimed(st, k, first_use);
-    }, first_use, first_use && !st->compute);  // a draw's shaders translate in milliseconds: ahead of quick compute builds
+    }, first_use, first_use && !st->compute, !first_use);  // a draw's shaders translate in milliseconds: ahead of quick compute builds
 }
 
 // `first_use`: a draw or dispatch wants it now (ahead of early starts).
@@ -1133,7 +1153,7 @@ uint64_t request_variant(Compiled* k, pipeline::State* st, const Attachments& a,
             k->variants[key] = VK_NULL_HANDLE;
             k->pending.insert(key);
             if (urgent) k->urgent_variants.insert(key);
-            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, urgent, urgent);
+            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, urgent, urgent, !urgent);  // early ones: warm tier
         } else if (urgent && k->pending.count(key) && k->urgent_variants.insert(key).second) {
             // An early start asked for it at low priority (behind thousands of background builds): a
             // draw waits now, so it gets an urgent build of its own; the first one done is kept.
@@ -1693,12 +1713,16 @@ struct Builder {
     }
 
     void mark(uint32_t kind, uint32_t x = 0, uint32_t y = 0, uint32_t z = 0) {
-        const pipeline::State* st = bind[kind == 1 ? 0 : 1].pso;
+        const pipeline::State* st = bind[kind == 1 || kind == 7 ? 0 : 1].pso;
         checkpoint(cb, kind, st ? pipeline_key(st) : 0, x, y, z);
     }
     void dispatch(const cmd::Dispatch& d) {
         if (!dispatch_setup()) return;
         mark(1, d.x, d.y, d.z);
+        struct After {  // a checkpoint behind the dispatch too: proves whether it finished
+            Builder* b;
+            ~After() { b->mark(7); }
+        } after{this};
         if (uint64_t(d.x) * d.y * d.z > (1ull << 22)) {
             static std::atomic<int> n{0};
             if (n++ < 8) KL_WARN("gpu", "a dispatch of %u x %u x %u groups (pipeline %016llx)", d.x, d.y, d.z,
@@ -1783,6 +1807,7 @@ struct Builder {
             uint32_t stride, max;
         } pc{device_of(ab, aoff), tight, counted ? device_of(cbuf, coff) : tight + uint64_t(max) * words * 4, stride, max};
         vk::vkCmdPushConstants(cb, g_layout, VK_SHADER_STAGE_ALL, 0, 32, &pc);
+        checkpoint(cb, 4, 0, (max + 63) / 64, 1, 1);  // keylime's indirect argument check
         vk::vkCmdDispatch(cb, (max + 63) / 64, 1, 1);
         full_barrier(cb);
         if (type == 2) {
@@ -1833,6 +1858,7 @@ struct Builder {
 
     void copy_memory(uint64_t dst, uint64_t src, uint64_t len) {
         if (!dst || !src || !len) return;
+        checkpoint(cb, 5, dst, uint32_t(len), 0, 0);
         VkBuffer db, sb;
         VkDeviceSize doff, soff;
         if (where(dst, len, db, doff) && where(src, len, sb, soff)) {
@@ -1854,6 +1880,7 @@ struct Builder {
 
     void copy_texture(const cmd::CopyTexture& t) {
         end_rendering();
+        checkpoint(cb, 6, 0);
         images::Image* di = t.dst.type == 0 ? images::of_resource(t.dst.resource) : nullptr;
         images::Image* si = t.src.type == 0 ? images::of_resource(t.src.resource) : nullptr;
         full_barrier(cb);
@@ -2023,8 +2050,10 @@ struct Builder {
     }
 
     void run(const Stream& s) {
+        uint32_t index = 0;
         s.each([&](Op op, const uint8_t* p, uint32_t size) {
             auto get = [&](auto& v) { memcpy(&v, p, std::min<size_t>(sizeof v, size)); };
+            checkpoint(cb, 8, uint64_t(op), index++);  // every command: a lost GPU names the one it was on
             switch (op) {
                 case Op::SetPipeline: {
                     uint64_t v;
@@ -2383,6 +2412,7 @@ void read_stamps(HostQueue& h, int qi) {
 }
 void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs) {
     Cb* pre = get_cb(h);
+    if (pre) checkpoint(pre->cb, 9, 0);
     if (pre && images::prepare(pre->cb, qi, h.submitted.load() + 1)) submit(h, {pre}, {}, {});
     else if (pre) cbs.insert(cbs.begin(), pre);  // empty: rides along
     std::vector<Semaphore> waits;
@@ -2494,7 +2524,7 @@ void dump_state() {
     size_t jobs;
     {
         std::lock_guard g(g_jobs_lock);
-        jobs = g_jobs.size() + g_urgent.size();
+        jobs = g_jobs.size() + g_urgent.size() + g_warm.size();
         if (!g_urgent.empty()) KL_INFO("hang", "pipelines: %zu urgent compile jobs queued", g_urgent.size());
     }
     KL_INFO("hang", "pipelines: %zu compile jobs queued, %llu compiling, %llu built, %llu draws or dispatches dropped waiting",
@@ -2517,6 +2547,23 @@ void device_lost(const char* where) {
     static std::atomic<bool> once{false};
     if (!once.exchange(true)) {
         KL_ERROR("gpu", "the GPU stopped (Vulkan device lost while %s): a shader or command hung the GPU, so this run ends here", where);
+        if (host::get().caps.device_fault && vk::vkGetDeviceFaultInfoEXT) {
+            VkDeviceFaultCountsEXT c{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+            if (vk::vkGetDeviceFaultInfoEXT(dev(), &c, nullptr) == VK_SUCCESS || true) {
+                std::vector<VkDeviceFaultAddressInfoEXT> addr(c.addressInfoCount);
+                std::vector<VkDeviceFaultVendorInfoEXT> vend(c.vendorInfoCount);
+                c.vendorBinarySize = 0;
+                VkDeviceFaultInfoEXT fi{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+                fi.pAddressInfos = addr.data(), fi.pVendorInfos = vend.data();
+                vk::vkGetDeviceFaultInfoEXT(dev(), &c, &fi);
+                KL_ERROR("gpu", "  device fault: %s (%u addresses, %u vendor records)", fi.description, c.addressInfoCount, c.vendorInfoCount);
+                static const char* types[] = {"none", "read", "write", "execute", "instruction pointer unknown", "instruction pointer invalid", "instruction pointer fault"};
+                for (auto& a : addr)
+                    KL_ERROR("gpu", "    %s at %016llx (+-%llx)", types[a.addressType < 7 ? a.addressType : 0], (unsigned long long)a.reportedAddress,
+                             (unsigned long long)a.addressPrecision);
+                for (auto& v : vend) KL_ERROR("gpu", "    vendor: %s (code %llx, data %llx)", v.description, (unsigned long long)v.vendorFaultCode, (unsigned long long)v.vendorFaultData);
+            }
+        }
         if (host::get().caps.checkpoints && vk::vkGetQueueCheckpointDataNV)
             for (int qi = 0; qi < 2; ++qi) {
                 if (!g_q[qi].q) continue;
@@ -2524,13 +2571,13 @@ void device_lost(const char* where) {
                 vk::vkGetQueueCheckpointDataNV(g_q[qi].q, &n, nullptr);
                 std::vector<VkCheckpointDataNV> cp(n, {VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
                 vk::vkGetQueueCheckpointDataNV(g_q[qi].q, &n, cp.data());
-                static const char* kinds[] = {"?", "dispatch", "draw", "mesh draw"};
+                static const char* kinds[] = {"?", "dispatch", "draw", "mesh draw", "indirect check", "memory copy", "texture copy", "after dispatch", "list command", "texture preparation"};
                 for (uint32_t k = 0; k < n; ++k) {
                     uint64_t m = reinterpret_cast<uint64_t>(cp[k].pCheckpointMarker);
                     if (!m || m > MARKS) continue;
                     const Mark& mk = g_marks[m - 1];
                     KL_ERROR("gpu", "  queue %d last checkpoint at stage %x: %s of pipeline %016llx, %u x %u x %u groups%s", qi, cp[k].stage,
-                             kinds[mk.kind < 4 ? mk.kind : 0], (unsigned long long)mk.key, mk.x, mk.y, mk.z, mk.x ? "" : " (indirect or draw)");
+                             kinds[mk.kind < 10 ? mk.kind : 0], (unsigned long long)mk.key, mk.x, mk.y, mk.z, mk.x ? "" : " (indirect or draw)");
                 }
             }
         dump_state();

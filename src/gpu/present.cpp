@@ -241,10 +241,10 @@ const char* snapshot_dir() {
     return on ? dir : nullptr;
 }
 bool snapshot_due(uint64_t frame) {
-    static const uint64_t at[] = {10, 60, 150, 300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000};
+    static const uint64_t at[] = {10, 60, 150, 300, 450, 600, 900, 1200};
     for (uint64_t a : at)
         if (a == frame) return true;
-    return false;
+    return frame > 1200 && frame % 60 == 0;  // the opening cutscene starts near frame 1400
 }
 void write_bmp(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h) {
     FILE* f = fopen(path, "wb");

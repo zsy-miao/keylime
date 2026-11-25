@@ -182,13 +182,19 @@ bool start() {
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceMeshShaderFeaturesEXT fmesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceFaultFeaturesEXT ffault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     f2.pNext = &f11;
     f11.pNext = &f12;
     f12.pNext = &f13;
-    if (h.caps.mesh_shader) f13.pNext = &fmesh;
+    void** tail = &f13.pNext;
+    if (h.caps.mesh_shader) *tail = &fmesh, tail = &fmesh.pNext;
+    bool want_fault = ext.count(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) != 0;
+    if (want_fault) *tail = &ffault, tail = &ffault.pNext;
     vk::vkGetPhysicalDeviceFeatures2(h.physical, &f2);
     h.caps.buffer_address = f12.bufferDeviceAddress;
     h.caps.int64_atomics = f12.shaderBufferInt64Atomics;
+    h.caps.device_fault = want_fault && ffault.deviceFault;
+    ffault.deviceFaultVendorBinary = VK_FALSE;
     h.caps.cache_control = f13.pipelineCreationCacheControl;
     if (!h.caps.buffer_address || !f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         KL_ERROR("vk", "the GPU lacks buffer device address / dynamic rendering / sync2 / timeline semaphores");
@@ -206,6 +212,7 @@ bool start() {
     if (h.caps.host_memory_import) dext.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (h.caps.memory_budget) dext.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (h.caps.checkpoints) dext.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);  // which command a lost GPU was on
+    if (h.caps.device_fault) dext.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);                  // and the address it faulted on
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = uint32_t(qci.size());
