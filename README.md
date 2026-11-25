@@ -17,13 +17,37 @@ from the console's RDNA 2 machine code to **SPIR-V**.
 The real retail GTA VI exe boots natively, reaches the main menu with all
 audio working, and keylime renders its frames on Vulkan.
 
-**Current blocker:** the game freezes right after the menu and loading
-screen, where the opening cutscene should start. The latest log showed why:
-the driver deadlocked. A submission waited on a semaphore that only the host
-signals later (a GPU wait on memory), NVIDIA's Windows driver blocked inside
-vkQueueSubmit2 on it, and from then on the host signal that would have freed
-it, the fence reads and the pipeline compiles all blocked in the driver too.
-What changed for that, waiting for a test run:
+**Now:** the game gets into the opening cutscene. Its music, voices, sound
+effects, skip prompt and title text all work, but the picture ran at about
+2 fps and the scene itself didn't draw. The log showed three causes: every
+frame waited up to half a second for pipelines still compiling, the NVIDIA
+driver took up to 45 s to optimize some translated compute shaders, and most
+of the scene is drawn with mesh shaders, which keylime skipped. What changed,
+waiting for a test run:
+
+- Shader control flow is translated to structured ifs, if/elses and loops
+  wherever the program allows (each shader's share of blocks still run by
+  number is in the log), so the driver compiles much less.
+- A frame waits at most 4 ms in total for draw pipelines and 150 ms for
+  compute; past that, the work waits for a later frame instead of the frame.
+- Translated SPIR-V is kept in `cache\spirv` (keyed by the shader and the
+  translator build), on top of the driver's `cache\pipelines.bin`. A first
+  run after an update compiles as it goes; later runs start every pipeline
+  listed in `cache\used-pipelines.txt` as soon as the game creates it.
+- Mesh shaders run: the console's NGG mesh programs translate to
+  `VK_EXT_mesh_shader`, `DispatchMesh` and `ExecuteIndirect` mesh commands
+  (type 10) run on the GPU. Mesh pipelines with an amplification shader are
+  still skipped.
+- Every 2 s the log has a `frame:` line (ms per frame, worst frame, GPU busy
+  time, CPU recording time, time waiting for pipelines, work run and skipped
+  per frame) and a `compile:` line (shaders translated or from the disk
+  cache, driver build times, the compile queue, precompile progress). A
+  `precompile:` line says how many of the listed pipelines are built.
+
+Earlier, for the freeze before the opening cutscene: the driver deadlocked.
+A submission waited on a semaphore that only the host signals later (a GPU
+wait on memory), NVIDIA's Windows driver blocked inside vkQueueSubmit2 on it,
+and from then on everything else blocked in the driver too. What changed:
 
 - A submission goes to the driver only once everything it waits on has been
   signalled or handed to the driver; until then keylime holds it, in queue
@@ -73,8 +97,7 @@ Earlier, for world loading after the menu:
   would use (memory a dropped dispatch never wrote) becomes empty.
 - The bindless texture table has 1M entries and a better hash (it ran out of
   room at about 42k images), and up to 262144 image slots.
-- Mesh shader dispatches and multi-argument `ExecuteIndirect` signatures are
-  still skipped.
+- Multi-argument `ExecuteIndirect` signatures are still skipped.
 
 - [x] Retail exe boots natively: archives stream through DirectStorage
       (thousands of requests, 260+ MB), main loop holds 30 fps
@@ -92,9 +115,11 @@ Earlier, for world loading after the menu:
 - [x] BCPack-compressed textures decode in the DirectStorage path
 - [x] `xgameruntime` areas (user, store, save, async, networking, package,
       storage, system and more) emulated well enough to reach the menu
-- [ ] Get through world loading after the menu (pipeline compile stalls, see above)
+- [x] Get through world loading after the menu into the opening cutscene
+- [ ] Cutscene at 15+ fps with the scene drawn (see above)
 - [x] `ExecuteIndirect` (single-argument signatures) and GPU memory waits
-- [ ] Mesh shader dispatches, multi-argument `ExecuteIndirect`
+- [x] Mesh shader dispatches without an amplification shader
+- [ ] Amplification shaders, multi-argument `ExecuteIndirect`
 
 ## Status
 
@@ -110,7 +135,7 @@ Earlier, for world loading after the menu:
 | GPU objects: device, DXGI, queues, fences, lists, heaps, resources, views, pipelines | working; the game's main loop runs at 30 fps |
 | Shader containers + GFX10 decoder | working (320/320 sampled shaders decode) |
 | GFX10 → SPIR-V translator | working (320/320 sampled shaders pass `spirv-val`) |
-| Executing the game's command lists and rendering its frames on Vulkan | working through the main menu; `ExecuteIndirect` not run yet |
+| Executing the game's command lists and rendering its frames on Vulkan | working through the main menu; the opening cutscene runs with its audio, drawing it is in progress |
 
 ## How keylime differs from other approaches
 
