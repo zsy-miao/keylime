@@ -640,9 +640,9 @@ constexpr const char* CACHE_FILE = "cache\\pipelines.bin";
 void open_cache() {
     std::vector<uint8_t> data;
     if (FILE* f = fopen(CACHE_FILE, "rb")) {
-        fseek(f, 0, SEEK_END);
-        long n = ftell(f);
-        fseek(f, 0, SEEK_SET);
+        _fseeki64(f, 0, SEEK_END);  // the cache can pass 2 GB: 64-bit offsets
+        long long n = _ftelli64(f);
+        _fseeki64(f, 0, SEEK_SET);
         if (n > 0) data.resize(size_t(n));
         if (!data.empty() && fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
         fclose(f);
@@ -678,16 +678,22 @@ void save_cache(bool force = false) {
     }
 }
 void save_used(bool force = false);
+std::atomic<bool> g_precompiling{false};  // `keylime precompile` is running
 void job(std::function<void()> f, bool urgent = false) {
     stats::add(stats::Compiling);
     static std::once_flag once;
     std::call_once(once, [] {
-        unsigned n = std::max(4u, std::min(16u, std::thread::hardware_concurrency() * 2 / 3));
-        constexpr unsigned URGENT_ONLY = 8;
+        // Background (optimized) builds take up to a minute of CPU each; during play they get 2
+        // low-priority workers so the quick builds a dispatch waits for keep the CPU (with 16
+        // of them, quick builds took 35-60 s in the opening cutscene). `keylime precompile`
+        // uses every core.
+        unsigned cores = std::max(4u, std::thread::hardware_concurrency());
+        unsigned n = g_precompiling ? std::min(16u, cores * 2 / 3) : 2;
+        const unsigned URGENT_ONLY = g_precompiling ? 8 : std::max(4u, std::min(16u, cores / 2));
         for (unsigned i = 0; i < n + URGENT_ONLY; ++i)
             std::thread([urgent_only = i >= n] {
                 SetThreadDescription(GetCurrentThread(), urgent_only ? L"keylime-compile-urgent" : L"keylime-compile");
-                SetThreadPriority(GetCurrentThread(), urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+                SetThreadPriority(GetCurrentThread(), urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_LOWEST);
                 for (;;) {
                     std::function<void()> f;
                     {
@@ -817,7 +823,6 @@ bool prebuild(pipeline::State* st, Compiled* k);
 // unoptimized build first, then the optimized one (queued behind what draws wait for).
 void fast_build(Compiled* k);
 VkPipeline compute_pipeline(Compiled* k, bool fast, bool only_cached);
-std::atomic<bool> g_precompiling{false};
 // The optimized pipeline if the driver's cache already holds it (no compile).
 bool cached_optimized(Compiled* k) {
     if (!host::get().caps.cache_control) return false;
