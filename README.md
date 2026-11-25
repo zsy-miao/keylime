@@ -27,11 +27,13 @@ shortly after. What changed, waiting for a test run:
   to address 0 with code `0x4D8BD421`). Skipping compute dispatches instead
   made the game read a bogus address and hit an `int3`
   (`game_scarlett_master.exe+0x4da6315`).
-- Compute dispatches are never skipped now: while the optimized pipeline is
-  compiling, a quick unoptimized build runs them. Only draws are still skipped
-  while their pipeline compiles.
-- Translating and compiling start when the game creates the pipeline, not at
-  first use, and graphics pipelines prebuild the variant they declare.
+- The submit thread never compiles. A first use queues the pipeline ahead of
+  the rest and waits for it within a budget of 0.5 s per frame over all
+  threads; past it, draws and dispatches whose pipeline isn't ready are
+  dropped. Compute pipelines get a quick unoptimized build first.
+- Pipelines a run used are listed in `cache\\used-pipelines.txt`; the next run
+  starts building those as soon as the game creates them, so the first run
+  after a change still drops some work and later runs should drop less.
 - Translated shaders are cheaper for the driver: structured loops and
   branches instead of a dispatcher loop, and only the user SGPRs in use are
   loaded. Driver compiles are kept across runs in `cache\pipelines.bin`.

@@ -284,6 +284,10 @@ void full_barrier(VkCommandBuffer cb) {
 
 // ------------------------------------------------------------ pipelines ----
 struct Compiled {
+    uint64_t key = 0;                     // the shaders' hashes: names the pipeline across runs
+    std::atomic<bool> used{false};        // drawn or dispatched with this run
+    std::atomic<bool> bumped{false};      // queued again ahead of early starts by a first use (once)
+    std::atomic<bool> fast_queued{false}; // a dispatch asked for the unoptimized build
     std::atomic<bool> claimed{false};     // a thread has started translating
     std::atomic<bool> translated{false};  // shaders translated (or failed): `ok` and the modules are set
     std::atomic<bool> ready{false};       // nothing more will be built (compute: the optimized pipeline is in, or failed)
@@ -334,10 +338,11 @@ VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64
 }
 
 // Pipelines are built by workers: one driver compile can take many seconds, and the queue
-// thread (the title's) must not stop for it. A first use translates the shaders itself if no
-// worker has started on them (translating is quick; the driver's compile is the slow part).
-// Draws whose pipeline is not built yet are skipped; dispatches never are: they wait for a
-// quick unoptimized build while the optimized one is made in the background.
+// thread (the title's) never makes one. A first use queues the pipeline ahead of the rest and
+// waits for it within a budget of 0.5 s per frame over all threads; past it, draws and
+// dispatches whose pipeline is not ready are dropped. A compute pipeline gets a quick
+// unoptimized build first, then the optimized one. Pipelines an earlier run used (listed in
+// cache\used-pipelines.txt) start building as soon as the title creates them.
 std::mutex g_jobs_lock, g_done_lock;
 std::condition_variable g_jobs_cv, g_done_cv;
 std::deque<std::function<void()>> g_jobs;
@@ -389,6 +394,7 @@ void save_cache() {
         if (ok) MoveFileExA("cache\\pipelines.tmp", CACHE_FILE, MOVEFILE_REPLACE_EXISTING);
     }
 }
+void save_used();
 void job(std::function<void()> f, bool urgent = false) {
     stats::add(stats::Compiling);
     static std::once_flag once;
@@ -410,6 +416,7 @@ void job(std::function<void()> f, bool urgent = false) {
                     stats::g_counters[stats::Compiling].fetch_sub(1);
                     notify();
                     save_cache();
+                    save_used();
                 }
             }).detach();
     });
@@ -420,20 +427,79 @@ void job(std::function<void()> f, bool urgent = false) {
     }
     g_jobs_cv.notify_one();
 }
-// One budget per submission: a burst of new pipelines (thousands when a level starts) must
-// not add up to seconds of waiting.
-thread_local std::chrono::steady_clock::time_point t_wait_until{};
+constexpr uint64_t BUDGET_US = 500000;
+std::atomic<uint64_t> g_budget_frame{~0ull}, g_waited_us{0};
 template <class F>
-bool wait_briefly(F done) {
+bool wait_budget(F done) {
     if (done()) return true;
-    if (std::chrono::steady_clock::now() >= t_wait_until) return false;
-    std::unique_lock g(g_done_lock);
-    return g_done_cv.wait_until(g, t_wait_until, done);
+    uint64_t frame = stats::g_counters[stats::FramesShown].load(std::memory_order_relaxed);
+    if (g_budget_frame.exchange(frame) != frame) g_waited_us.store(0);
+    uint64_t waited = g_waited_us.load();
+    if (waited >= BUDGET_US) return false;
+    auto t0 = std::chrono::steady_clock::now();
+    bool ok;
+    {
+        std::unique_lock g(g_done_lock);
+        ok = g_done_cv.wait_until(g, t0 + std::chrono::microseconds(BUDGET_US - waited), done);
+    }
+    g_waited_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    return ok;
 }
-template <class F>
-void wait_for(F done) {
-    std::unique_lock g(g_done_lock);
-    while (!done()) g_done_cv.wait_for(g, std::chrono::milliseconds(20));
+void dropped(const char* what) {
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+        KL_INFO("gpu", "draws and dispatches whose pipeline is not ready within the frame's 0.5 s wait budget are dropped meanwhile");
+    stats::add(stats::WaitingOnCompile);
+    if (*what == 'd') stats::add(stats::DrawsSkipped);
+}
+
+// Pipelines used in earlier runs, and those used in this one.
+constexpr const char* USED_FILE = "cache\\used-pipelines.txt";
+std::mutex g_used_lock;
+std::unordered_set<uint64_t> g_used_before, g_used_now;
+std::atomic<uint64_t> g_used_added{0}, g_started_early{0};
+uint64_t pipeline_key(const pipeline::State* st) {
+    uint64_t h = st->compute ? 0x9e3779b97f4a7c15ull : 0xcbf29ce484222325ull;
+    for (auto& s : st->shaders) h = (h ^ s.hash ^ (uint64_t(s.stage) << 56)) * 0x100000001b3ull;
+    return h;
+}
+void open_used() {
+    if (FILE* f = fopen(USED_FILE, "r")) {
+        unsigned long long k;
+        while (fscanf(f, "%llx", &k) == 1) g_used_before.insert(k);
+        fclose(f);
+    }
+    KL_INFO("gpu", "pipelines: %zu used in earlier runs (%s) start as soon as the game creates them", g_used_before.size(), USED_FILE);
+}
+void note_used(Compiled* k) {
+    if (k->used.exchange(true)) return;
+    std::lock_guard g(g_used_lock);
+    if (!g_used_before.count(k->key) && g_used_now.insert(k->key).second) ++g_used_added;
+}
+void save_used() {
+    static std::mutex m;
+    static auto last = std::chrono::steady_clock::now();
+    static uint64_t saved_at = 0;
+    std::unique_lock g(m, std::try_to_lock);
+    if (!g) return;
+    uint64_t added = g_used_added.load();
+    auto now = std::chrono::steady_clock::now();
+    if (added == saved_at || now - last < std::chrono::seconds(5)) return;
+    last = now, saved_at = added;
+    std::vector<uint64_t> keys;
+    {
+        std::lock_guard u(g_used_lock);
+        keys.assign(g_used_before.begin(), g_used_before.end());
+        keys.insert(keys.end(), g_used_now.begin(), g_used_now.end());
+    }
+    CreateDirectoryA("cache", nullptr);
+    if (FILE* f = fopen("cache\\used-pipelines.tmp", "w")) {
+        for (uint64_t k : keys) fprintf(f, "%016llx\n", (unsigned long long)k);
+        bool ok = fclose(f) == 0;
+        if (ok) MoveFileExA("cache\\used-pipelines.tmp", USED_FILE, MOVEFILE_REPLACE_EXISTING);
+    }
+    KL_INFO("gpu", "pipelines: %zu listed as used (%llu new this run, %llu started early)", keys.size(), (unsigned long long)added,
+            (unsigned long long)g_started_early.load());
 }
 
 void shaders(pipeline::State* st, Compiled* k);
@@ -442,38 +508,49 @@ void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs);
 void optimize(Compiled* k);
 void prebuild(pipeline::State* st, Compiled* k);
 
-// The first thread to claim a pipeline translates its shaders; compute pipelines then get
-// their optimized build.
-void translate_claimed(pipeline::State* st, Compiled* k, bool queue_optimize) {
+// A worker translates the shaders; a compute pipeline a dispatch waits for gets a quick
+// unoptimized build first, then the optimized one (queued behind what draws wait for).
+void fast_build(Compiled* k);
+void translate_claimed(pipeline::State* st, Compiled* k, bool first_use) {
     shaders(st, k);
     k->translated.store(true, std::memory_order_release);
     if (!st->compute || !k->ok) k->ready.store(true, std::memory_order_release);
     notify();
     if (st->compute && k->ok) {
-        if (queue_optimize) job([k] { optimize(k); }, true);
-        else optimize(k);
+        if (first_use) {
+            fast_build(k);
+            job([k] { optimize(k); });
+        } else {
+            optimize(k);
+        }
     } else if (k->ok) {
         prebuild(st, k);
     }
 }
 
-Compiled* obtain(pipeline::State* st) {
-    std::lock_guard g(st->lock);
-    auto* k = static_cast<Compiled*>(st->host);
-    if (!k) {
-        k = new Compiled();
-        st->host = k;
-        job([st, k] {
-            if (!k->claimed.exchange(true)) translate_claimed(st, k, false);
-        });
-    }
-    return k;
+void queue_translation(pipeline::State* st, Compiled* k, bool first_use) {
+    job([st, k, first_use] {
+        if (!k->claimed.exchange(true)) translate_claimed(st, k, first_use);
+    }, first_use);
 }
 
-// The pipeline's shaders; `steal`: translated on this thread if no worker has started on them.
-Compiled* compile(pipeline::State* st, bool steal) {
-    Compiled* k = obtain(st);
-    if (steal && !k->claimed.exchange(true)) translate_claimed(st, k, true);
+// `first_use`: a draw or dispatch wants it now (ahead of early starts).
+Compiled* obtain(pipeline::State* st, bool first_use) {
+    Compiled* k;
+    bool fresh = false;
+    {
+        std::lock_guard g(st->lock);
+        k = static_cast<Compiled*>(st->host);
+        if (!k) {
+            k = new Compiled();
+            k->key = pipeline_key(st);
+            st->host = k;
+            fresh = true;
+        }
+    }
+    if (fresh) queue_translation(st, k, first_use);
+    else if (first_use && !k->claimed.load() && !k->bumped.exchange(true)) queue_translation(st, k, true);
+    if (first_use) note_used(k);
     return k;
 }
 
@@ -491,26 +568,34 @@ void optimize(Compiled* k) {
     notify();
 }
 
-// A compute pipeline to run now: the optimized one if it is built, else a quick unoptimized
-// build made here. Null only if the pipeline cannot be built at all.
-VkPipeline runnable(pipeline::State* st) {
-    Compiled* k = compile(st, true);
-    wait_for([k] { return k->translated.load(std::memory_order_acquire); });
-    if (!k->ok) return VK_NULL_HANDLE;
-    if (VkPipeline p = k->compute.load(std::memory_order_acquire)) return p;
-    stats::add(stats::WaitingOnCompile);
-    if (!k->fast_claimed.exchange(true)) {
-        auto t0 = std::chrono::steady_clock::now();
-        VkPipeline p = compute_pipeline(k, true);
-        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (sec > 0.5) KL_WARN("gpu", "a dispatch waited %.2f s for its unoptimized compute pipeline", sec);
-        static std::atomic<bool> told{false};
-        if (!told.exchange(true)) KL_INFO("gpu", "dispatches whose pipeline is still compiling now run an unoptimized build meanwhile");
-        if (!k->compute.load(std::memory_order_acquire)) k->fast.store(p, std::memory_order_release);
-        else if (p) retire([p] { vk::vkDestroyPipeline(dev(), p, nullptr); });
-        notify();
+void fast_build(Compiled* k) {
+    if (k->fast_claimed.exchange(true) || k->compute.load(std::memory_order_acquire)) return;
+    auto t0 = std::chrono::steady_clock::now();
+    VkPipeline p = compute_pipeline(k, true);
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (sec > 0.5) KL_WARN("gpu", "an unoptimized compute pipeline took %.2f s to compile", sec);
+    if (!k->compute.load(std::memory_order_acquire)) k->fast.store(p, std::memory_order_release);
+    else if (p) retire([p] { vk::vkDestroyPipeline(dev(), p, nullptr); });
+    notify();
+}
+
+// A compute pipeline to run now, within the frame's wait budget: the optimized one, else the
+// unoptimized one. `pending`: not ready yet (rather than impossible to build).
+VkPipeline runnable(pipeline::State* st, bool& pending) {
+    Compiled* k = obtain(st, true);
+    pending = false;
+    if (k->translated.load(std::memory_order_acquire) && k->ok && !k->compute.load() && !k->fast_claimed.load() &&
+        !k->fast_queued.exchange(true))
+        job([k] { fast_build(k); }, true);
+    auto have = [k] {
+        if (!k->translated.load(std::memory_order_acquire)) return false;
+        return !k->ok || k->compute.load() || k->fast.load() || k->ready.load();
+    };
+    if (!wait_budget(have)) {
+        pending = true;
+        return VK_NULL_HANDLE;
     }
-    wait_for([k] { return k->compute.load() || k->fast.load() || k->ready.load(); });
+    if (!k->ok) return VK_NULL_HANDLE;
     VkPipeline p = k->compute.load(std::memory_order_acquire);
     return p ? p : k->fast.load(std::memory_order_acquire);
 }
@@ -674,7 +759,7 @@ uint64_t request_variant(Compiled* k, pipeline::State* st, const Attachments& a,
 VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo) {
     uint64_t key = request_variant(k, st, a, topo, true);
     VkPipeline out = VK_NULL_HANDLE;
-    wait_briefly([&] {
+    wait_budget([&] {
         std::lock_guard g(st->lock);
         if (k->pending.count(key)) return false;
         out = k->variants[key];
@@ -1099,10 +1184,9 @@ struct Builder {
     bool draw_setup(bool indexed) {
         pipeline::State* st = bind[1].pso;
         if (!st || st->compute) return false;
-        Compiled* k = compile(st, false);
-        if (!wait_briefly([k] { return k->translated.load(std::memory_order_acquire); })) {
-            once("draws whose pipeline is still compiling are skipped meanwhile");
-            stats::add(stats::WaitingOnCompile);
+        Compiled* k = obtain(st, true);
+        if (!wait_budget([k] { return k->translated.load(std::memory_order_acquire); })) {
+            dropped("draw");
             return false;
         }
         if (!k->ok) {
@@ -1177,9 +1261,11 @@ struct Builder {
     Compiled* dispatch_setup() {
         pipeline::State* st = bind[0].pso;
         if (!st || !st->compute) return nullptr;
-        VkPipeline p = runnable(st);
+        bool pending;
+        VkPipeline p = runnable(st, pending);
         if (!p) {
-            once("a dispatch whose pipeline could not be built was dropped");
+            if (pending) dropped("dispatch");
+            else once("a dispatch whose pipeline could not be built was dropped");
             return nullptr;
         }
         Compiled* k = static_cast<Compiled*>(st->host);
@@ -1717,6 +1803,7 @@ bool start() {
     li.pPushConstantRanges = &pc;
     if (!KL_VK_CHECK(vk::vkCreatePipelineLayout(h.device, &li, nullptr, &g_layout))) return false;
     open_cache();
+    open_used();
     {
         auto code = shader::dispatch_clamp();
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -1739,7 +1826,15 @@ bool start() {
 }
 
 void prepare(pipeline::State* st) {
-    if (g_started && st) obtain(st);
+    if (!g_started || !st || st->shaders.empty()) return;
+    bool early;
+    {
+        std::lock_guard g(g_used_lock);
+        early = g_used_before.count(pipeline_key(st)) != 0;
+    }
+    if (!early) return;
+    ++g_started_early;
+    obtain(st, false);
 }
 
 int queue_for(uint32_t kind) { return kind == 2 ? COMPUTE : GRAPHICS; }
@@ -1761,7 +1856,6 @@ void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs) {
 }  // namespace
 
 void execute(int qi, uint32_t count, void* const* lists) {
-    t_wait_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
     HostQueue& h = g_q[qi & 1];
     {
         std::lock_guard g(h.lock);
