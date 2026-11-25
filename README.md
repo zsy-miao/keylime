@@ -29,6 +29,45 @@ from the console's RDNA 2 machine code to **SPIR-V**.
 
 ## How keylime differs from other approaches
 
+Several projects are trying to get GTA VI's Xbox build running on PC. keylime
+sits in the same family as VIctory and XCL (the console's own x86-64 code runs
+natively, with the system libraries and GPU replaced around it), but it takes
+a different graphics path: everything else here that says what it targets goes
+through Direct3D 12 and DXIL, while keylime drives Vulkan and emits SPIR-V
+itself.
+
+| Project | Approach | Scope | Graphics path |
+|---|---|---|---|
+| **keylime** | native runtime, C++20, written from scratch | GTA VI first | Vulkan; RDNA 2 machine code → SPIR-V directly |
+| [VIctory](https://github.com/Marvisak/VIctory) | compatibility layer, Rust | GTA VI only | RDNA 2 machine code → DXIL, compiled by DXC |
+| [hyphennn's fork](https://github.com/fxceless/victory-fork) | VIctory plus its own rendering and speed fixes | GTA VI only | same as VIctory |
+| [XCL](https://github.com/xcl-dev/xcl) | Wine-style compatibility layer | any Xbox Series game | RDNA 2 programs → HLSL → DXIL |
+| [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) | static recompilation: code and shaders turned into Windows C++ ahead of time | any Xbox Series game | DXIL |
+| [TuxBox](https://github.com/brcly/TuxBox) | native-first layer for unpacked games, mostly tested on Linux via Proton | any Xbox Series game | not stated |
+| [xbox-emulator](https://github.com/omonkeyz/xbox-emulator) | Rust runtime running dumped builds as Windows processes (continues TomBox) | any Xbox Series game | not stated |
+| [ScarlettX](https://github.com/Freminet/ScarlettX) | clean-room HLE emulator of the Scarlett OS and GDK runtime | any Xbox Series game | not stated |
+| [OpenScarlett CE](https://github.com/OpenCommunityEdition/OpenScarlett) | AGPL C++ layer that swaps console DLLs for PC ones | any Xbox Series game | Direct3D 12 |
+
+What that means in practice:
+
+- **No DXC round trip.** Only 52 of 320 sampled GTA VI shaders carry DXIL
+  bitcode, so every layer has to translate the GFX10 machine code. keylime
+  writes SPIR-V straight from it instead of going through HLSL or DXIL, which
+  keeps driver compiles fast (VIctory's DXIL path takes 30-325 s for big
+  compute shaders).
+- **The console's memory model, kept.** Shaders read raw 64-bit pointers and
+  real RDNA 2 descriptor words, as on the hardware, instead of VIctory's
+  descriptor heaps mirrored to host heaps every frame.
+- **GTA VI first.** Like VIctory, keylime targets one game rather than every
+  Xbox Series title. It builds on VIctory's reverse-engineered interface
+  layouts (see [Credits](#credits-and-licence)) but not on its GPU path.
+
+Where it stands: keylime is behind the leading projects. The game's main loop
+runs at 30 fps, but no frames are drawn yet (see [Status](#status)). The other
+projects' progress is their own reporting, mostly unverified.
+
+### Design choices
+
 | | keylime |
 |---|---|
 | Graphics API | Vulkan 1.3/1.4 |
