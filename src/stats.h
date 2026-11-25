@@ -16,7 +16,7 @@ enum Counter : int {
     GpuUs0, GpuUs1, RecordUs, CompileWaitUs, FrameWorstUs /* max */, DispatchesSkipped,
     ShadersTranslated, ShadersCached, TranslateUs, SpirvBytes, BlocksTotal, BlocksGuarded,
     GraphicsBuilt, GraphicsUs, QuickBuilt, QuickUs, OptimizedBuilt, OptimizedUs, OptimizedWorstUs /* max */,
-    CompileQueue /* gauge */, PrecompileListed /* gauge */, PrecompileDone,
+    CompileQueue /* gauge */, CompileUrgent /* gauge */, CompileOptimized /* gauge */, PrecompileListed /* gauge */, PrecompileDone,
     // gauges (set, not added): GPU memory state
     ImagesResident, ImageMiB, VramBudgetMiB, MemoryImports, Evictions, Count
 };

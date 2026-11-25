@@ -60,12 +60,13 @@ void run() {
             auto each = [](uint64_t us, uint64_t n) { return n ? us / 1000.0 / double(n) : 0.0; };
             KL_INFO("status", "compile: %llu shaders translated (%.1f ms each, %llu KB SPIR-V, %llu%% of blocks still dispatched by number), "
                     "%llu from the disk cache | built %llu graphics (%.0f ms each), %llu quick compute (%.0f ms each), %llu optimized compute "
-                    "(%.0f ms each, worst %.1f s) | %llu jobs queued | precompile %llu of %llu",
+                    "(%.0f ms each, worst %.1f s) | %llu jobs queued (%llu urgent, %llu optimized builds) | precompile %llu of %llu",
                     (unsigned long long)d[ShadersTranslated], each(d[TranslateUs], d[ShadersTranslated]), (unsigned long long)(d[SpirvBytes] >> 10),
                     (unsigned long long)(d[BlocksTotal] ? d[BlocksGuarded] * 100 / d[BlocksTotal] : 0), (unsigned long long)d[ShadersCached],
                     (unsigned long long)d[GraphicsBuilt], each(d[GraphicsUs], d[GraphicsBuilt]), (unsigned long long)d[QuickBuilt],
                     each(d[QuickUs], d[QuickBuilt]), (unsigned long long)d[OptimizedBuilt], each(d[OptimizedUs], d[OptimizedBuilt]),
-                    opt_worst / 1e6, (unsigned long long)now[CompileQueue], (unsigned long long)now[PrecompileDone],
+                    opt_worst / 1e6, (unsigned long long)now[CompileQueue], (unsigned long long)now[CompileUrgent],
+                    (unsigned long long)now[CompileOptimized], (unsigned long long)now[PrecompileDone],
                     (unsigned long long)now[PrecompileListed]);
         }
     }

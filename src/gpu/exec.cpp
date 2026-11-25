@@ -639,9 +639,7 @@ VkShaderModule module(const shader::Program& p, const shader::Options& given, ui
 
 // Pipelines are built by workers: one driver compile can take many seconds, and the queue
 // thread (the title's) never makes one. A first use queues the pipeline ahead of the rest and
-// waits for it within a small budget per frame over all threads (4 ms for draws); past it, draws
-// whose pipeline is not ready are dropped. Dispatches always wait: later work, the title's GPU
-// waits and its CPU read results they write, and garbage there crashes the game. A compute
+// waits for it within a budget per frame (BUDGET_US); past it, the draw or dispatch is skipped. A compute
 // pipeline gets a quick unoptimized build first (well under a second), then the optimized one. Pipelines an earlier run used (listed in
 // cache\used-pipelines.txt) start building as soon as the title creates them.
 std::mutex g_jobs_lock, g_done_lock;
@@ -651,15 +649,20 @@ std::condition_variable g_jobs_cv, g_done_cv;
 // big translated compute shaders) can never hold up a dispatch the title is waiting on.
 // g_warm: early starts (translation and quick build of pipelines earlier runs used), taken by
 // every worker whenever nothing urgent waits, so they are ready before the scene needs them;
-// g_jobs: optimized builds, on two low-priority workers during play.
+// g_jobs: optimized builds, on two background workers, and on any idle non-strict worker at lowest priority.
 std::deque<std::function<void()>> g_jobs, g_urgent, g_warm;
+void queue_gauges() {
+    stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size() + g_warm.size());
+    stats::set(stats::CompileUrgent, g_urgent.size());
+    stats::set(stats::CompileOptimized, g_jobs.size());
+}
 void notify() {
     { std::lock_guard g(g_done_lock); }
     g_done_cv.notify_all();
 }
 
-// Driver pipeline cache, kept in cache\pipelines.bin across runs: written every 30 s while
-// new pipelines are being built.
+// Driver pipeline cache, kept in cache\pipelines.bin across runs: written at most every 2 minutes,
+// when nothing urgent or early is queued, and on a hang (the copy of a 3 GB cache stalls the workers).
 constexpr const char* CACHE_FILE = "cache\\pipelines.bin";
 void open_cache() {
     std::vector<uint8_t> data;
@@ -688,7 +691,11 @@ void save_cache(bool force = false) {
     if (!g || !g_cache) return;
     uint64_t built = stats::g_counters[stats::PipelinesBuilt].load();
     auto now = std::chrono::steady_clock::now();
-    if (built == saved_at || (!force && now - last < std::chrono::seconds(30))) return;
+    if (built == saved_at || (!force && now - last < std::chrono::minutes(2))) return;
+    if (!force) {
+        std::lock_guard j(g_jobs_lock);
+        if (!g_urgent.empty() || !g_warm.empty()) return;
+    }
     last = now, saved_at = built;
     size_t n = 0;
     static std::atomic<int> fails{0};
@@ -725,10 +732,7 @@ void job(std::function<void()> f, bool urgent = false, bool front = false, bool 
     stats::add(stats::Compiling);
     static std::once_flag once;
     std::call_once(once, [] {
-        // Background (optimized) builds take up to a minute of CPU each; during play they get 2
-        // low-priority workers so the quick builds a dispatch waits for keep the CPU (with 16
-        // of them, quick builds took 35-60 s in the opening cutscene). `keylime precompile`
-        // uses every core.
+        // Background (optimized) builds: 2 workers, plus up to a quarter of the cores while idle, at lowest priority.
         unsigned cores = std::max(4u, std::thread::hardware_concurrency());
         unsigned n = g_precompiling ? std::min(16u, cores * 2 / 3) : 2;
         const unsigned URGENT_ONLY = g_precompiling ? 8 : std::max(4u, std::min(16u, cores / 2));
@@ -736,23 +740,36 @@ void job(std::function<void()> f, bool urgent = false, bool front = false, bool 
         // one), the rest of the urgent pool urgent then warm, and n background workers urgent,
         // warm, then optimized builds.
         constexpr unsigned STRICT_URGENT = 4;
+        static unsigned borrowed = 0;
+        const unsigned BORROW = std::max(2u, cores / 4);
         for (unsigned i = 0; i < n + URGENT_ONLY; ++i)
-            std::thread([urgent_only = i >= n, strict = i >= n + URGENT_ONLY - std::min(STRICT_URGENT, URGENT_ONLY)] {
+            std::thread([urgent_only = i >= n, strict = i >= n + URGENT_ONLY - std::min(STRICT_URGENT, URGENT_ONLY), BORROW] {
                 SetThreadDescription(GetCurrentThread(), strict ? L"keylime-compile-strict" : urgent_only ? L"keylime-compile-urgent" : L"keylime-compile");
                 SetThreadPriority(GetCurrentThread(), strict ? THREAD_PRIORITY_ABOVE_NORMAL : urgent_only ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST);
                 for (;;) {
                     std::function<void()> f;
+                    bool background = false;
                     {
                         std::unique_lock g(g_jobs_lock);
-                        g_jobs_cv.wait(g, [urgent_only, strict] {
-                            return !g_urgent.empty() || (!strict && !g_warm.empty()) || (!urgent_only && !g_jobs.empty());
-                        });
-                        auto& from = !g_urgent.empty() ? g_urgent : (!strict && !g_warm.empty()) ? g_warm : g_jobs;
+                        auto jobs_ok = [&] { return !g_jobs.empty() && (!urgent_only || borrowed < BORROW); };
+                        g_jobs_cv.wait(g, [&] { return !g_urgent.empty() || (!strict && (!g_warm.empty() || jobs_ok())); });
+                        auto& from = !g_urgent.empty() ? g_urgent : !g_warm.empty() ? g_warm : g_jobs;
+                        background = &from == &g_jobs && urgent_only;
+                        if (background) ++borrowed;
                         f = std::move(from.front());
                         from.pop_front();
-                        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size() + g_warm.size());
+                        queue_gauges();
                     }
+                    if (background) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                     f();
+                    if (background) {
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        {
+                            std::lock_guard g(g_jobs_lock);
+                            --borrowed;
+                        }
+                        g_jobs_cv.notify_all();
+                    }
                     stats::g_counters[stats::Compiling].fetch_sub(1);
                     notify();
                     save_cache();
@@ -766,35 +783,52 @@ void job(std::function<void()> f, bool urgent = false, bool front = false, bool 
         else if (urgent) g_urgent.push_back(std::move(f));
         else if (warm) g_warm.push_back(std::move(f));
         else g_jobs.push_back(std::move(f));
-        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size() + g_warm.size());
+        queue_gauges();
     }
     // notify_one could wake an urgent-only worker for normal work and lose the wakeup.
     g_jobs_cv.notify_all();
 }
-// Waiting allowed per shown frame, over all threads: [0] draws, [1] dispatches. Past it, a
-// draw or dispatch whose pipeline is still compiling is skipped this frame (as VIctory does with
-// its shared 500 ms budget) instead of holding the title until hundreds of compiles finish.
-// KEYLIME_DISPATCH_WAIT_MS sets the dispatch budget (default 500).
-const uint64_t BUDGET_US[2] = {4000, [] {
-                                   char v[16]{};
-                                   return uint64_t(GetEnvironmentVariableA("KEYLIME_DISPATCH_WAIT_MS", v, 16) ? atoi(v) : 500) * 1000;
-                               }()};
-std::atomic<uint64_t> g_budget_frame[2]{~0ull, ~0ull}, g_waited_us[2]{}, g_waited_total{0};
+// Per shown frame, one window shared by all waiting threads: KEYLIME_DRAW_WAIT_MS (4000), KEYLIME_DISPATCH_WAIT_MS (12000).
+uint64_t budget_ms(const char* name, uint64_t fallback) {
+    char v[16]{};
+    return GetEnvironmentVariableA(name, v, 16) ? uint64_t(atoi(v)) : fallback;
+}
+const uint64_t BUDGET_US[2] = {budget_ms("KEYLIME_DRAW_WAIT_MS", 4000) * 1000, budget_ms("KEYLIME_DISPATCH_WAIT_MS", 12000) * 1000};
+struct FrameWait {
+    std::mutex m;
+    uint64_t frame = ~0ull, spent_us = 0;
+    unsigned waiting = 0;
+    std::chrono::steady_clock::time_point since;
+};
+FrameWait g_frame_wait[2];
+std::atomic<uint64_t> g_waited_total{0};
 template <class F>
 bool wait_budget(F done, int kind) {
     if (done()) return true;
+    using clock = std::chrono::steady_clock;
+    auto us_since = [](clock::time_point t) { return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t).count()); };
     uint64_t frame = stats::g_counters[stats::FramesShown].load(std::memory_order_relaxed);
-    if (g_budget_frame[kind].exchange(frame) != frame) g_waited_us[kind].store(0);
-    uint64_t waited = g_waited_us[kind].load();
-    if (waited >= BUDGET_US[kind]) return false;
-    auto t0 = std::chrono::steady_clock::now();
+    auto& w = g_frame_wait[kind];
+    uint64_t left;
+    {
+        std::lock_guard g(w.m);
+        if (w.frame != frame) w.frame = frame, w.spent_us = 0, w.waiting = 0;
+        uint64_t used = w.spent_us + (w.waiting ? us_since(w.since) : 0);
+        if (used >= BUDGET_US[kind]) return false;
+        left = BUDGET_US[kind] - used;
+        if (!w.waiting++) w.since = clock::now();
+    }
+    auto t0 = clock::now();
     bool ok;
     {
         std::unique_lock g(g_done_lock);
-        ok = g_done_cv.wait_until(g, t0 + std::chrono::microseconds(BUDGET_US[kind] - waited), done);
+        ok = g_done_cv.wait_until(g, t0 + std::chrono::microseconds(left), done);
     }
-    uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
-    g_waited_us[kind] += us;
+    uint64_t us = us_since(t0);
+    {
+        std::lock_guard g(w.m);
+        if (w.frame == frame && w.waiting && !--w.waiting) w.spent_us += us_since(w.since);
+    }
     g_waited_total += us;
     stats::add(stats::CompileWaitUs, us);
     return ok;
@@ -802,8 +836,8 @@ bool wait_budget(F done, int kind) {
 void dropped(const char* what) {
     static std::atomic<bool> told{false};
     if (!told.exchange(true))
-        KL_INFO("gpu", "draws whose pipeline is not ready within 4 ms a frame, and dispatches past %llu ms a frame, are skipped meanwhile",
-                (unsigned long long)(BUDGET_US[1] / 1000));
+        KL_INFO("gpu", "draws whose pipeline is not ready within %llu ms a frame, and dispatches past %llu ms a frame, are skipped meanwhile",
+                (unsigned long long)(BUDGET_US[0] / 1000), (unsigned long long)(BUDGET_US[1] / 1000));
     stats::add(stats::WaitingOnCompile);
     if (what[1] != 'r') stats::add(stats::DispatchesSkipped);
 }
