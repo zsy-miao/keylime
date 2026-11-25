@@ -354,6 +354,22 @@ void gpu_free(void* p) {
 WriteHook g_write_hook = nullptr, g_remap_hook = nullptr;
 void set_remap_hook(WriteHook h) { g_remap_hook = h; }
 
+// True if any page of [va, va + len) is physical memory shown at another address too
+// (writes there change this range without touching it).
+bool aliased(uint64_t va, uint64_t len) {
+    std::lock_guard g(g_lock);
+    for (uint64_t a = va & ~uint64_t(kPage - 1); a < va + len; a += kPage) {
+        auto it = g_phys.views.upper_bound(uintptr_t(a));
+        if (it == g_phys.views.begin()) continue;
+        --it;
+        if (a >= it->first + it->second.first) continue;
+        Slice s{it->second.second.section, it->second.second.index + (a - it->first) / kPage};
+        auto sh = g_phys.shown.find(s.key(0));
+        if (sh != g_phys.shown.end() && sh->second.size() > 1) return true;
+    }
+    return false;
+}
+
 // Shows the physical pages mapped at [from, from + len) at `to` as well (in place of what `to`
 // showed); `from` 0 unmaps. The GPU queue's page-mapping copies: titles stream into pool pages and
 // map them into a tiled heap this way. False if a source page is not mapped physical memory.

@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -13,6 +14,7 @@
 #include "gpu/resource.h"
 #include "gpu/retire.h"
 #include "gpu/texture.h"
+#include "hle/xmem.h"
 #include "log.h"
 #include "stats.h"
 
@@ -201,6 +203,11 @@ struct Image {
     VkImageView sampled = VK_NULL_HANDLE, storage_view = VK_NULL_HANDLE;
     uint32_t slot = 0;
     bool initialized = false, dirty = true, gpu_owned = false, watched = false, dead = false;
+    // Memory shown at other addresses too (writes there never fault): checked by content hash
+    // each frame while draws use it.
+    bool aliased = false;
+    uint64_t mem_hash = 0, last_used = 0, checked = ~0ull;
+    bool in_recent = false;
     std::map<uint64_t, VkImageView> targets;
 };
 
@@ -518,6 +525,22 @@ bool detile_guarded(const texture::Layout& l, const void* surface, uint32_t mip,
     }
 }
 
+// A fast content hash of title memory (0 if it cannot be read).
+uint64_t hash_words(const uint64_t* p, size_t n) {
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 0xff51afd7ed558ccdull, h ^= h >> 29;
+    return h;
+}
+uint64_t hash_memory(uint64_t a, uint64_t n) {
+    __try {
+        return hash_words(reinterpret_cast<const uint64_t*>(a), size_t(n / 8)) | 1;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return 0;
+    }
+}
+std::atomic<uint64_t> g_frame{0};
+std::vector<Image*> g_recent;  // aliased images draws used lately
+
 uint64_t linear_size(const Image* im) {
     const auto& l = im->layout;
     uint64_t total = 0;
@@ -724,6 +747,21 @@ void prepare(VkCommandBuffer cb) {
     std::vector<Image*> work;
     {
         std::lock_guard g(g_lock);
+        // Aliased images in use: new contents written through another address show as a new hash.
+        uint64_t frame = g_frame.load();
+        for (size_t i = 0; i < g_recent.size();) {
+            Image* im = g_recent[i];
+            if (im->dead || frame - im->last_used > 90) {
+                im->in_recent = false;
+                g_recent[i] = g_recent.back(), g_recent.pop_back();
+                continue;
+            }
+            ++i;
+            if (im->checked == frame || im->dirty || im->gpu_owned) continue;
+            im->checked = frame;
+            uint64_t h = hash_memory(im->address, im->size);
+            if (h && h != im->mem_hash) mark_dirty(im);
+        }
         if (g_pending.empty()) return;
         work.swap(g_pending);
         static int n = 0;
@@ -764,9 +802,14 @@ void prepare(VkCommandBuffer cb) {
                     g_pending.push_back(im);  // not mapped yet: try again later
                     continue;
                 }
+                uint64_t need = linear_size(im);
+                if (total && total + need > (256ull << 20)) {
+                    g_pending.push_back(im);  // this batch is full: the next submission takes it
+                    continue;
+                }
                 im->dirty = false;
                 ups.push_back({im, total});
-                total += linear_size(im);
+                total += need;
             }
         }
     }
@@ -802,6 +845,11 @@ void prepare(VkCommandBuffer cb) {
                 // Watch from now on: a write after this point re-uploads (protect first, then read).
                 protect(lo4k(im->address), hi4k(im->address + im->size), PAGE_READONLY);
                 im->watched = true;
+            }
+            {
+                std::lock_guard g(g_lock);
+                im->mem_hash = hash_memory(im->address, im->size);
+                im->aliased = xmem::aliased(im->address, im->size);
             }
             const auto& l = im->layout;
             uint64_t at = u.at;
@@ -871,6 +919,19 @@ void written(uint64_t address, uint64_t len) {
     if (!g_started || g_images.empty()) return;
     overlapping(address, address + len, [](Image* im) { mark_dirty(im); });
 }
+
+void touch(uint64_t address) {
+    std::lock_guard g(g_lock);
+    auto it = g_images.find(address);
+    if (it == g_images.end()) return;
+    Image* im = it->second;
+    im->last_used = g_frame.load();
+    if (im->aliased && !im->in_recent) {
+        im->in_recent = true;
+        g_recent.push_back(im);
+    }
+}
+void frame_done() { ++g_frame; }
 
 VkFormat vk_format(uint32_t dxgi) { return format_of(dxgi).vk; }
 

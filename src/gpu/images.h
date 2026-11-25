@@ -55,6 +55,10 @@ void gpu_wrote(Image* i);
 // Title memory changed without a CPU write we could see (streaming writes through other mappings).
 void written(uint64_t address, uint64_t len);
 
+// A draw samples the image at this T# base address (keeps aliased images checked for new contents).
+void touch(uint64_t address);
+void frame_done();  // once per presented frame
+
 VkFormat vk_format(uint32_t dxgi);
 const char* describe(uint64_t address);  // diagnostics: what the image at a T# base address is
 bool is_depth_format(uint32_t dxgi);

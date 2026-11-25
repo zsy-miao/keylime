@@ -18,6 +18,7 @@ void set_write_hook(WriteHook h);
 // Called (outside xmem's lock) when a title range starts showing other pages.
 void set_remap_hook(WriteHook h);
 bool map_alias(uint64_t to, uint64_t from, uint64_t len);
+bool aliased(uint64_t va, uint64_t len);
 
 // Title memory sizes for the current console: (GPU-optimal, standard).
 void title_memory(size_t& gpu_optimal, size_t& standard);

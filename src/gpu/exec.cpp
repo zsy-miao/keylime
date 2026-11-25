@@ -643,6 +643,19 @@ struct Builder {
         }
     }
 
+    // The textures a program samples through tables: tell the image registry they are in use.
+    void touch_images(const shader::Program& p, const Bind& b) {
+        for (auto& u : p.used) {
+            if (u.kind != shader::ResourceType::Srv || u.root != shader::RootType::Table) continue;
+            uint64_t table = b.args[u.slot & 63].value;
+            if (!table || (table >> 32)) continue;
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(table + uint64_t(u.table_offset_dwords) * 4);
+            uint32_t type = w[3] >> 28;
+            if (type < 8) continue;  // a buffer, not an image
+            images::touch((uint64_t(w[0]) | uint64_t(w[1] & 0xff) << 32) << 8);
+        }
+    }
+
     void push(uint64_t rec) {
         uint64_t pc[4] = {rec, memory::page_table(), images::table(), 0};
         vk::vkCmdPushConstants(cb, g_layout, VK_SHADER_STAGE_ALL, 0, 32, pc);
@@ -775,6 +788,8 @@ struct Builder {
         memset(r, 0, RECORD_DWORDS * 4);
         sgprs(*k->vs, bind[1], r);
         if (k->ps) sgprs(*k->ps, bind[1], r + 32);
+        if (k->ps) touch_images(*k->ps, bind[1]);
+        touch_images(*k->vs, bind[1]);
         push(rec);
         trace_draw("draw", st, k, r);
         // Viewport (flipped: D3D's y points down in NDC terms), scissor.
@@ -836,6 +851,7 @@ struct Builder {
         if (!r) return;
         memset(r, 0, RECORD_DWORDS * 4);
         sgprs(*k->cs, bind[0], r);
+        touch_images(*k->cs, bind[0]);
         push(rec);
         vk::vkCmdDispatch(cb, d.x, d.y, d.z);
         stats::add(stats::DispatchesRun);

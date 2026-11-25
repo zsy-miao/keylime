@@ -321,6 +321,7 @@ bool show(int q, images::Image* src) {
 
 HRESULT present(int q, uint32_t planes, const void* plane_list, const void*) {
     stats::add(stats::Presents);
+    images::frame_done();
     static int n = 0;
     if (n++ < 1) KL_INFO("gpu", "PresentX: %u planes", planes);
     images::Image* src = nullptr;
