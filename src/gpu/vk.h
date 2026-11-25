@@ -31,7 +31,7 @@
     X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCreatePipelineCache) X(vkGetPipelineCacheData)          \
     X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults)                              \
     X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT) \
-    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT) X(vkQueueBindSparse)
+    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT) X(vkResetQueryPool) X(vkQueueBindSparse)
 
 namespace kl::vk {
 #define KL_VK_DECLARE(name) extern PFN_##name name;

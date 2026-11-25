@@ -107,11 +107,19 @@ void paint() {
 }  // namespace
 
 namespace {
+// One display plane of PresentX (0x48 bytes; VIctory's layout).
 struct Plane {
     uint64_t token;
     uint32_t count;
+    uint32_t pad0;
     void* const* resources;
+    const int32_t* src_rects;
+    const int32_t* dst_rects;
+    uint32_t color_space, scale_filter, extended_count, pad1;
+    const void* extended;
+    uint32_t flags, pad2;
 };
+static_assert(sizeof(Plane) == 0x48);
 
 struct Swap {
     HWND window = nullptr;
@@ -261,6 +269,9 @@ void write_bmp(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h) {
 }
 
 // Shows `src` in the window; false if it could not.
+// The part of the source shown: the title renders below its target's size at times (dynamic
+// resolution) and says which rectangle holds the picture.
+int32_t g_src_rect[4] = {};
 bool show(int q, images::Image* src) {
     auto& h = host::get();
     Swap& w = g_swap;
@@ -276,9 +287,13 @@ bool show(int q, images::Image* src) {
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return false;
     auto f = images::facts(src);
     VkImage dst = w.images[idx];
+    int32_t sx0 = 0, sy0 = 0, sx1 = int32_t(f.width), sy1 = int32_t(f.height);
+    if (g_src_rect[2] > g_src_rect[0] && g_src_rect[3] > g_src_rect[1] && g_src_rect[0] >= 0 && g_src_rect[1] >= 0 &&
+        g_src_rect[2] <= int32_t(f.width) && g_src_rect[3] <= int32_t(f.height))
+        sx0 = g_src_rect[0], sy0 = g_src_rect[1], sx1 = g_src_rect[2], sy1 = g_src_rect[3];
     // Fit the frame to the window, keeping its aspect.
-    double sx = double(w.extent.width) / f.width, sy = double(w.extent.height) / f.height, s = std::min(sx, sy);
-    int32_t dw = int32_t(f.width * s), dh = int32_t(f.height * s);
+    double sx = double(w.extent.width) / (sx1 - sx0), sy = double(w.extent.height) / (sy1 - sy0), s = std::min(sx, sy);
+    int32_t dw = int32_t((sx1 - sx0) * s), dh = int32_t((sy1 - sy0) * s);
     int32_t ox = (int32_t(w.extent.width) - dw) / 2, oy = (int32_t(w.extent.height) - dh) / 2;
     static uint64_t frame = 0;
     ++frame;
@@ -293,7 +308,8 @@ bool show(int q, images::Image* src) {
         layout(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageBlit b{};
         b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        b.srcOffsets[1] = {int32_t(f.width), int32_t(f.height), 1};
+        b.srcOffsets[0] = {sx0, sy0, 0};
+        b.srcOffsets[1] = {sx1, sy1, 1};
         b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         b.dstOffsets[0] = {ox, oy, 0};
         b.dstOffsets[1] = {ox + dw, oy + dh, 1};
@@ -337,12 +353,31 @@ bool show(int q, images::Image* src) {
 HRESULT present(int q, uint32_t planes, const void* plane_list, const void*) {
     stats::add(stats::Presents);
     images::frame_done();
-    static int n = 0;
-    if (n++ < 1) KL_INFO("gpu", "PresentX: %u planes", planes);
+    static uint32_t seen_planes = ~0u;
+    if (planes != seen_planes && plane_list) {  // how many planes, and what each shows (the world may not be the first)
+        seen_planes = planes;
+        auto* pl = static_cast<const Plane*>(plane_list);
+        for (uint32_t i = 0; i < planes && i < 4; ++i) {
+            images::Image* im = pl[i].count && pl[i].resources ? images::of_resource(pl[i].resources[0]) : nullptr;
+            auto fa = im ? images::facts(im) : images::Facts{};
+            int32_t r[4] = {};
+            if (pl[i].src_rects) memcpy(r, pl[i].src_rects, sizeof r);
+            KL_INFO("gpu", "PresentX: plane %u of %u: %ux%u format %d, flags %x, color space %u, src rect %d,%d-%d,%d", i, planes, fa.width,
+                    fa.height, int(fa.format), pl[i].flags, pl[i].color_space, r[0], r[1], r[2], r[3]);
+        }
+    }
     images::Image* src = nullptr;
     if (planes && plane_list) {
         auto* p = static_cast<const Plane*>(plane_list);
         if (p->count && p->resources && p->resources[0]) src = images::of_resource(p->resources[0]);
+        static int32_t last[4] = {};
+        if (p->src_rects) memcpy(g_src_rect, p->src_rects, sizeof g_src_rect);
+        else memset(g_src_rect, 0, sizeof g_src_rect);
+        if (memcmp(last, g_src_rect, sizeof last)) {
+            static int told = 0;
+            if (told++ < 40) KL_INFO("gpu", "PresentX: source rectangle %d,%d-%d,%d", g_src_rect[0], g_src_rect[1], g_src_rect[2], g_src_rect[3]);
+            memcpy(last, g_src_rect, sizeof last);
+        }
     }
     if (src && show(q, src)) {
         if (!g_shown) g_shown = true, KL_INFO("gpu", "first frame shown: the title's own image is on screen now");

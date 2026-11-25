@@ -15,6 +15,11 @@ if (-not (Test-Path $exe)) {
     & (Join-Path $PSScriptRoot 'build.ps1')
     if ($LASTEXITCODE -ne 0) { Write-Host 'Build failed.' -ForegroundColor Red; Read-Host 'Press Enter'; exit 1 }
 }
+if (Get-Process keylime-precompile -ErrorAction SilentlyContinue) {
+    Write-Host 'The shader cache is still being built (keylime-precompile). Playing now compiles shaders twice and' -ForegroundColor Yellow
+    Write-Host 'the two can overwrite each other''s cache file. Waiting for it to finish (Ctrl+C to stop)...' -ForegroundColor Yellow
+    while (Get-Process keylime-precompile -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 10 }
+}
 if ($Trace) { $env:KEYLIME_TRACE = '1' }
 Set-Location $root
 Write-Host ("keylime " + (git -C $root rev-parse --short HEAD) + " - GTA VI") -ForegroundColor Green

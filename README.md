@@ -185,7 +185,7 @@ build\keylime.exe run <dir>\game_scarlett_master.exe --execute
 | Command | What it does |
 |---|---|
 | `keylime run <exe> --execute` | Run the game |
-| `keylime precompile <dir>` | Build every compute shader dumped in `<dir>` into the caches, on all cores |
+| `keylime precompile <dir>` | Build every compute shader in `<dir>` (`*.bin` containers) into the caches; resumable |
 | `keylime imports <exe>` | Map and bind only; list unimplemented functions |
 | `keylime shader <dir\|file> [--dis]` | Parse or disassemble console shader containers |
 | `keylime shader <dir> --spirv` | Translate shaders and build them as driver pipelines |
@@ -205,16 +205,23 @@ A keyboard stands in for a controller (any XInput pad works too).
 
 ### Shader cache
 
-The first time the game uses a shader, it has to be translated and compiled — that's what makes a
-first run stutter. To build the cache ahead of time:
+Console games ship shaders as finished AMD machine code, so each one has to be translated to
+SPIR-V and compiled by the driver once. keylime does that for the whole game up front, like a PC
+game's "compiling shaders" screen:
 
 ```powershell
-$env:KEYLIME_DUMP_SHADERS = "D:\keylime\logs\dump"   # 1. play once: every shader is saved here
-build\keylime.exe precompile D:\keylime\logs\dump     # 2. build them all on every core
+tools\build-shader-cache.ps1     # extracts all 26,503 shaders the game ships, compiles the compute ones
 ```
 
-Later runs load them from `cache\spirv` and `cache\pipelines.bin`. A change to the translator
-starts the cache over.
+- `tools/extract_shaders.py` pulls every shader out of `shaders.rpf` (its records are plain
+  deflate streams even though the pack's table is encrypted); `tools/extract_embedded_shaders.py`
+  finds the ones inside the executable and DLLs (BVH builder, AMD upscaler). Files are named by
+  the same FNV-1a hash the runtime keys its caches by.
+- The results live in `cache\spirv` (our translations) and `cache\pipelines.bin` (the driver's).
+- **The cache is keyed by `TRANSLATOR_VERSION` in `src/shader/translate.cpp`, not by the build.**
+  Rebuilding keylime or changing anything else keeps every shader. Raise the version only for a
+  translation fix that must reach shaders already cached.
+- An NVIDIA driver update empties the driver's half (as for every PC game); run the script again.
 
 ### Environment variables
 
@@ -232,6 +239,9 @@ starts the cache over.
 | `KEYLIME_BACKLOG_DRAW_WAIT_MS=10` | The draw wait while more urgent builds are queued than the workers clear in a few seconds |
 | `KEYLIME_BACKLOG_DISPATCH_WAIT_MS=30` | The same for compute dispatches |
 | `KEYLIME_WATCHDOG=1` | Let the game's GPU watchdog end the game |
+| `KEYLIME_PROFILE=1` | Log the GPU time of the heaviest pipelines every 10 s |
+| `KEYLIME_PRECOMPILE_WORKERS=8` | Driver compiles at once in `precompile` (each big shader takes gigabytes) |
+| `KEYLIME_FLAT=0` | Reach title memory through the page table instead of the flat sparse view |
 | `KEYLIME_VALIDATION=1` | Vulkan validation layers |
 
 ## Troubleshooting
@@ -277,10 +287,16 @@ src/hle/                   console system libraries (kernel, files, xmem, dstora
 src/hle/xgr/               xgameruntime (user, store, saves, async, other areas)
 src/formats/               BCPack decoder
 src/audio/                 AcpHal (XMA), xapu (Opus), chad (DSP)
-src/gpu/                   D3D12.X objects on Vulkan, command execution, pipeline compiles
-src/shader/                containers, GFX10 decoder, control-flow structuring, SPIR-V translator
+src/gpu/                   D3D12.X objects on Vulkan: memory (flat sparse view), images, present
+src/gpu/exec.cpp           the command executor; its parts in src/gpu/exec/:
+  queues.inc                 host queues, GPU waits on memory, submission
+  pipelines.inc              shader modules, caches, compile workers, wait budgets
+  builder.inc                recording a title command list into Vulkan commands
+src/shader/                containers, GFX10 decoder, control-flow structuring
+src/shader/translate.cpp   the RDNA2 -> SPIR-V translator; its parts in src/shader/translate/:
+  helpers, memory, setup, results, alu, vmem, atomics, image, export, control
 third_party/               miniz, libopus, AMD addrlib, Vulkan and SPIR-V headers
-tools/                     build.ps1, play.ps1
+tools/                     build, play, update, saves, build-shader-cache, shader extractors
 ```
 
 ## Credits and licence
