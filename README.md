@@ -39,7 +39,9 @@ shortly after. What changed, waiting for a test run:
   loaded. Driver compiles are kept across runs in `cache\pipelines.bin`.
 - `ExecuteIndirect` runs for Draw, DrawIndexed and Dispatch signatures
   (counted too), and GPU waits on memory hold later work until the value
-  matches (polled on the CPU, 1 s timeout).
+  matches (polled on the CPU, 250 ms timeout). Indirect arguments are
+  checked on the GPU first: a command past the count or with sizes no frame
+  would use (memory a dropped dispatch never wrote) becomes empty.
 - The bindless texture table has 1M entries and a better hash (it ran out of
   room at about 42k images), and up to 262144 image slots.
 - Mesh shader dispatches and multi-argument `ExecuteIndirect` signatures are

@@ -1689,7 +1689,7 @@ struct T {
             b.label(cont);
             Id t = iadd(load(trips, t_u32), u(1));
             store(trips, t);
-            Id again = b.op(spv::OpLogicalAnd, t_bool, {pc_in(r.lo, r.hi), b.op(spv::OpULessThan, t_bool, {t, u(1u << 20)})});
+            Id again = b.op(spv::OpLogicalAnd, t_bool, {pc_in(r.lo, r.hi), b.op(spv::OpULessThan, t_bool, {t, u(1u << 18)})});
             b.op_void(spv::OpBranchConditional, {again, header, merge});
             b.label(merge);
         });

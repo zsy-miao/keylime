@@ -73,7 +73,7 @@ struct HostQueue {
 HostQueue g_q[2];
 VkPipelineLayout g_layout = VK_NULL_HANDLE;
 VkPipelineCache g_cache = VK_NULL_HANDLE;
-VkPipeline g_clamp = VK_NULL_HANDLE;  // indirect dispatch arguments past the GPU-side count -> zero
+VkPipeline g_clamp[3] = {};  // ExecuteIndirect arguments, checked on the GPU (draw, indexed draw, dispatch)
 memory::Block g_zero;  // binds where a vertex stream is missing
 bool g_started = false;
 
@@ -236,7 +236,8 @@ void submit(HostQueue& h, const std::vector<Cb*>& cbs, const std::vector<Semapho
     for (Cb* c : cbs) c->value = value, h.busy.push_back(c);
 }
 
-// Opens each queue's gates in order, once the memory compares as asked (or after a second).
+// Opens each queue's gates in order, once the memory compares as asked (or after 250 ms: what
+// should write it may have been dropped, and the GPU must not stall for it).
 void gatekeeper(HostQueue& h) {
     for (;;) {
         std::pair<cmd::WaitValue, uint64_t> g;
@@ -251,12 +252,12 @@ void gatekeeper(HostQueue& h) {
         auto t0 = std::chrono::steady_clock::now();
         while (!met(g.first)) {
             auto dt = std::chrono::steady_clock::now() - t0;
-            if (dt > std::chrono::seconds(1)) {
+            if (dt > std::chrono::milliseconds(250)) {
                 uint64_t v = 0;
                 safe_move(uint64_t(&v), g.first.address, 8);
                 static int n = 0;
                 if (n++ < 16)
-                    KL_WARN("gpu", "a GPU wait on memory %llx (comparison %llu, value %llx, wanted %llx) gave up after 1 s",
+                    KL_WARN("gpu", "a GPU wait on memory %llx (comparison %llu, value %llx, wanted %llx) gave up after 250 ms",
                             (unsigned long long)g.first.address, (unsigned long long)g.first.compare, (unsigned long long)v,
                             (unsigned long long)g.first.reference);
                 break;
@@ -1328,47 +1329,40 @@ struct Builder {
             once("ExecuteIndirect with a count the GPU cannot see (%llx) is skipped", (unsigned long long)x.count);
             return;
         }
-        if (type == 2) return indirect_dispatch(ab, aoff, counted ? device_of(cbuf, coff) : 0, stride, max);
+        // Arguments go through a GPU pass first: past the count, or sizes no frame would use
+        // (memory a dropped dispatch never wrote), a command becomes empty instead of a GPU hang.
+        uint32_t words = bytes[type] / 4;
+        uint64_t tight;
+        uint32_t* r = g_clamp[type] ? record(c, max * words + 1, tight) : nullptr;
+        if (!r) return;
+        r[max * words] = max;
+        auto& blk = c->records[c->block];
+        VkBuffer db = blk.buffer;
+        VkDeviceSize doff = tight - blk.device;
+        end_rendering();
+        full_barrier(cb);
+        vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_clamp[type]);
+        bound = g_clamp[type];
+        struct {
+            uint64_t src, dst, count;
+            uint32_t stride, max;
+        } pc{device_of(ab, aoff), tight, counted ? device_of(cbuf, coff) : tight + uint64_t(max) * words * 4, stride, max};
+        vk::vkCmdPushConstants(cb, g_layout, VK_SHADER_STAGE_ALL, 0, 32, &pc);
+        vk::vkCmdDispatch(cb, (max + 63) / 64, 1, 1);
+        full_barrier(cb);
+        if (type == 2) {
+            if (!dispatch_setup()) return;
+            for (uint32_t i = 0; i < max; ++i) vk::vkCmdDispatchIndirect(cb, db, doff + VkDeviceSize(i) * 12);
+            stats::add(stats::DispatchesRun, max);
+            return;
+        }
         if (!draw_setup(type == 1)) {
             stats::add(stats::DrawsSkipped);
             return;
         }
-        if (type == 0) {
-            if (counted) vk::vkCmdDrawIndirectCount(cb, ab, aoff, cbuf, coff, max, stride);
-            else vk::vkCmdDrawIndirect(cb, ab, aoff, max, stride);
-        } else {
-            if (counted) vk::vkCmdDrawIndexedIndirectCount(cb, ab, aoff, cbuf, coff, max, stride);
-            else vk::vkCmdDrawIndexedIndirect(cb, ab, aoff, max, stride);
-        }
+        if (type == 0) vk::vkCmdDrawIndirect(cb, db, doff, max, 16);
+        else vk::vkCmdDrawIndexedIndirect(cb, db, doff, max, 20);
         stats::add(stats::DrawsRun);
-    }
-
-    // Vulkan has no counted indirect dispatch: with a count, the arguments are first copied to
-    // a tight array with those past the count zeroed, then every one is dispatched.
-    void indirect_dispatch(VkBuffer ab, VkDeviceSize aoff, uint64_t count, uint32_t stride, uint32_t max) {
-        end_rendering();
-        VkBuffer db = ab;
-        VkDeviceSize doff = aoff;
-        uint32_t dstride = stride;
-        if (count) {
-            uint64_t tight;
-            if (!g_clamp || !record(c, max * 3, tight)) return;
-            auto& blk = c->records[c->block];
-            db = blk.buffer, doff = tight - blk.device, dstride = 12;
-            full_barrier(cb);
-            vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_clamp);
-            bound = g_clamp;
-            struct {
-                uint64_t src, dst, count;
-                uint32_t stride, max;
-            } pc{device_of(ab, aoff), tight, count, stride, max};
-            vk::vkCmdPushConstants(cb, g_layout, VK_SHADER_STAGE_ALL, 0, 32, &pc);
-            vk::vkCmdDispatch(cb, (max + 63) / 64, 1, 1);
-            full_barrier(cb);
-        }
-        if (!dispatch_setup()) return;
-        for (uint32_t i = 0; i < max; ++i) vk::vkCmdDispatchIndirect(cb, db, doff + VkDeviceSize(i) * dstride);
-        stats::add(stats::DispatchesRun, max);
     }
 
     // A title buffer range as (buffer, offset); false if the GPU cannot see it.
@@ -1804,8 +1798,8 @@ bool start() {
     if (!KL_VK_CHECK(vk::vkCreatePipelineLayout(h.device, &li, nullptr, &g_layout))) return false;
     open_cache();
     open_used();
-    {
-        auto code = shader::dispatch_clamp();
+    for (uint32_t t = 0; t < 3; ++t) {
+        auto code = shader::indirect_clamp(t);
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = code.size() * 4;
         mi.pCode = code.data();
@@ -1814,7 +1808,7 @@ bool start() {
             VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
             ci.layout = g_layout;
-            KL_VK_CHECK(vk::vkCreateComputePipelines(h.device, g_cache, 1, &ci, nullptr, &g_clamp));
+            KL_VK_CHECK(vk::vkCreateComputePipelines(h.device, g_cache, 1, &ci, nullptr, &g_clamp[t]));
             vk::vkDestroyShaderModule(h.device, m, nullptr);
         }
     }

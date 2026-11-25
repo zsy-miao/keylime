@@ -5,7 +5,8 @@
 namespace kl::shader {
 using sp::Id;
 
-std::vector<uint32_t> dispatch_clamp() {
+std::vector<uint32_t> indirect_clamp(uint32_t type) {
+    const uint32_t words = type == 0 ? 4 : type == 1 ? 5 : 3;
     sp::Builder b;
     b.capability(spv::CapabilityShader);
     b.capability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -39,11 +40,26 @@ std::vector<uint32_t> dispatch_clamp() {
     b.label(yes);
     Id count = b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb, {member(2)}), uint32_t(spv::MemoryAccessAlignedMask), 4});
     Id live = b.op(spv::OpULessThan, t_bool, {i, count});
-    Id src = b.op(spv::OpIMul, t_u32, {i, member(3)}), dst = b.op(spv::OpIMul, t_u32, {i, b.c_u32(12)});
-    for (uint32_t k = 0; k < 3; ++k) {
-        Id v = b.op(spv::OpLoad, t_u32, {at(member(0), b.op(spv::OpIAdd, t_u32, {src, b.c_u32(4 * k)})), uint32_t(spv::MemoryAccessAlignedMask), 4});
-        v = b.op(spv::OpSelect, t_u32, {live, v, b.c_u32(0)});
-        b.op_void(spv::OpStore, {at(member(1), b.op(spv::OpIAdd, t_u32, {dst, b.c_u32(4 * k)})), v, uint32_t(spv::MemoryAccessAlignedMask), 4});
+    Id src = b.op(spv::OpIMul, t_u32, {i, member(3)}), dst = b.op(spv::OpIMul, t_u32, {i, b.c_u32(4 * words)});
+    std::vector<Id> v;
+    for (uint32_t k = 0; k < words; ++k)
+        v.push_back(b.op(spv::OpLoad, t_u32, {at(member(0), b.op(spv::OpIAdd, t_u32, {src, b.c_u32(4 * k)})), uint32_t(spv::MemoryAccessAlignedMask), 4}));
+    auto le = [&](Id x, uint32_t lim) { return b.op(spv::OpULessThanEqual, t_bool, {x, b.c_u32(lim)}); };
+    auto both = [&](Id a, Id c) { return b.op(spv::OpLogicalAnd, t_bool, {a, c}); };
+    auto wide = [&](Id x) { return b.op(spv::OpUConvert, t_u64, {x}); };
+    Id ok;
+    if (type == 2) {
+        Id groups = b.op(spv::OpIMul, t_u64, {b.op(spv::OpIMul, t_u64, {wide(v[0]), wide(v[1])}), wide(v[2])});
+        ok = both(both(le(v[0], 65535), le(v[1], 65535)), le(v[2], 65535));
+        ok = both(ok, b.op(spv::OpULessThanEqual, t_bool, {groups, b.c_u64(1ull << 24)}));
+    } else {
+        Id work = b.op(spv::OpIMul, t_u64, {wide(v[0]), wide(v[1])});
+        ok = both(both(le(v[0], 1u << 24), le(v[1], 1u << 20)), b.op(spv::OpULessThanEqual, t_bool, {work, b.c_u64(1ull << 27)}));
+    }
+    live = both(live, ok);
+    for (uint32_t k = 0; k < words; ++k) {
+        Id x = b.op(spv::OpSelect, t_u32, {live, v[k], b.c_u32(0)});
+        b.op_void(spv::OpStore, {at(member(1), b.op(spv::OpIAdd, t_u32, {dst, b.c_u32(4 * k)})), x, uint32_t(spv::MemoryAccessAlignedMask), 4});
     }
     b.op_void(spv::OpBranch, {after});
     b.label(after);
