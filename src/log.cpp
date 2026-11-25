@@ -56,7 +56,7 @@ void logf(Level level, const char* area, const char* fmt, ...) {
         fflush(stdout);
         if (g_file) {
             fwrite(line, 1, size_t(n), g_file);
-            if (level >= Level::Warn) fflush(g_file);
+            fflush(g_file);
         }
     }
 }

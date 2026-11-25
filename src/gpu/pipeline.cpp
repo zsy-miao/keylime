@@ -1,6 +1,10 @@
 // keylime GPU: pipeline state objects. For now they keep copies of their
 // shader binaries (RDNA 2 code) and the stream they came from; translation
 // happens later, first for the UI shaders.
+#include <windows.h>
+
+#include <atomic>
+#include <cstdio>
 #include <mutex>
 #include <vector>
 
@@ -53,9 +57,29 @@ void** table() {
     return t;
 }
 
+// KEYLIME_DUMP_SHADERS=<dir>: writes the first 400 distinct shader blobs there (for study).
+void dump(uint32_t stage, const uint8_t* c, size_t n) {
+    static char dir[MAX_PATH] = {};
+    static bool on = GetEnvironmentVariableA("KEYLIME_DUMP_SHADERS", dir, MAX_PATH) > 0;
+    static std::atomic<int> count{0};
+    if (!on || count >= 400) return;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ c[i]) * 0x100000001b3ull;
+    char path[MAX_PATH + 64];
+    static const char* names[] = {"vs", "ps", "ds", "hs", "gs", "cs", "as", "ms"};
+    snprintf(path, sizeof path, "%s/%s-%016llx.bin", dir, names[stage & 7], (unsigned long long)h);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+    if (FILE* f = fopen(path, "wb")) {
+        fwrite(c, 1, n, f);
+        fclose(f);
+        ++count;
+    }
+}
+
 void keep(Pipeline* p, uint32_t stage, const Bytecode& b) {
     if (!b.code || !b.size) return;
     auto* c = static_cast<const uint8_t*>(b.code);
+    dump(stage, c, b.size);
     p->shaders.push_back({stage, std::vector<uint8_t>(c, c + b.size)});
     g_bytes += b.size;
 }
