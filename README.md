@@ -12,6 +12,26 @@ from the console's RDNA 2 machine code to **SPIR-V**.
 > keylime contains **no game files, keys or console SDK code**. You need your
 > own copy of the game. Nothing here downloads or distributes game content.
 
+## Progress
+
+The real retail GTA VI exe boots natively, and keylime now renders the game's
+frames on Vulkan.
+
+- [x] Retail exe boots natively: archives stream through DirectStorage
+      (thousands of requests, 260+ MB), audio starts, main loop holds 30 fps
+- [x] All 320 sampled shaders translate GFX10 → SPIR-V directly, pass
+      `spirv-val` and build as NVIDIA pipelines
+- [x] The game's command lists run on the host GPU: about 650 draws and 60
+      dispatches every 2 s with none skipped, 2,052 images, 600+ frames
+      presented to the swap chain (one test run)
+- [x] Title memory imported zero-copy behind a GPU page table; textures as
+      Vulkan images (addrlib detiling, bindless hash table); rect/quad lists
+      through a geometry shader
+- [x] The game's frames render on Vulkan and present to the window
+- [ ] BCPack-compressed textures
+- [ ] Remaining `xgameruntime` areas (networking, package, storage, display,
+      speech, game, system); without them the game exits on some runs
+
 ## Status
 
 | Area | State |
@@ -24,8 +44,8 @@ from the console's RDNA 2 machine code to **SPIR-V**.
 | XG texture layouts (AMD addrlib) | working |
 | GPU objects: device, DXGI, queues, fences, lists, heaps, resources, views, pipelines | working; the game's main loop runs at 30 fps |
 | Shader containers + GFX10 decoder | working (320/320 sampled shaders decode) |
-| GFX10 → SPIR-V translator | in progress |
-| Drawing the game's frames | not yet (the window shows keylime's live status) |
+| GFX10 → SPIR-V translator | working (320/320 sampled shaders pass `spirv-val`) |
+| Executing the game's command lists and rendering its frames on Vulkan | working |
 
 ## How keylime differs from other approaches
 
@@ -62,8 +82,9 @@ What that means in practice:
   Xbox Series title. It builds on VIctory's reverse-engineered interface
   layouts (see [Credits](#credits-and-licence)) but not on its GPU path.
 
-Where it stands: keylime is behind the leading projects. The game's main loop
-runs at 30 fps, but no frames are drawn yet (see [Status](#status)). The other
+Where it stands: keylime is behind the leading projects. The game boots and its
+frames render on Vulkan, but it isn't playable yet (see
+[Progress](#progress)). The other
 projects' progress is their own reporting, mostly unverified.
 
 ### Design choices
