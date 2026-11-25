@@ -108,7 +108,7 @@ bool start() {
     open_cache();
     open_used();
     for (uint32_t t = 0; t < 4; ++t) {
-        auto code = shader::indirect_clamp(t);
+        auto code = shader::indirect_clamp(t, t == 2 ? std::min(h.props.limits.maxComputeWorkGroupCount[0], 1u << 24) : 65535);
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = code.size() * 4;
         mi.pCode = code.data();

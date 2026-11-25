@@ -5,7 +5,7 @@
 namespace kl::shader {
 using sp::Id;
 
-std::vector<uint32_t> indirect_clamp(uint32_t type) {
+std::vector<uint32_t> indirect_clamp(uint32_t type, uint32_t max_x) {
     const uint32_t words = type == 0 ? 4 : type == 1 ? 5 : 3;
     sp::Builder b;
     b.capability(spv::CapabilityShader);
@@ -50,7 +50,7 @@ std::vector<uint32_t> indirect_clamp(uint32_t type) {
     Id ok, units;
     if (type >= 2) {
         Id groups = b.op(spv::OpIMul, t_u64, {b.op(spv::OpIMul, t_u64, {wide(v[0]), wide(v[1])}), wide(v[2])});
-        ok = both(both(le(v[0], 65535), le(v[1], 65535)), le(v[2], 65535));
+        ok = both(both(le(v[0], type == 2 ? max_x : 65535), le(v[1], 65535)), le(v[2], 65535));
         ok = both(ok, b.op(spv::OpULessThanEqual, t_bool, {groups, b.c_u64(type == 3 ? 1ull << 22 : 1ull << 24)}));
         units = b.op(spv::OpShiftRightLogical, t_u64, {b.op(spv::OpIAdd, t_u64, {groups, b.c_u64(511)}), b.c_u64(9)});
     } else {
