@@ -52,7 +52,8 @@ struct T {
     std::map<uint8_t, Id> vs_inputs, vs_outputs, ps_inputs, ps_outputs;  // by row / mrt
     Id sampled_images = 0, samplers = 0, storage_images = 0, p_uc_image = 0, p_uc_sampler = 0, t_image2d = 0, t_simage2d = 0, t_storage2d = 0;
     // registers (Function vars, made on first use)
-    Id s[SGPRS] = {}, v[VGPRS] = {}, scc = 0, pc = 0, lane = 0;
+    Id s[SGPRS] = {}, v[VGPRS] = {}, scc = 0, pc = 0, lane = 0, lane_bit = 0;
+    std::unordered_map<Id, uint32_t> consts;
     std::vector<Inst> insts;
     std::map<uint32_t, uint32_t> block_of;
     // DPP / SDWA: source overrides and destination handling for the current instruction.
@@ -72,7 +73,15 @@ struct T {
     }
 
     // ---------------------------------------------------------- helpers ----
-    Id u(uint32_t x) { return b.c_u32(x); }
+    Id u(uint32_t x) {
+        Id c = b.c_u32(x);
+        consts[c] = x;
+        return c;
+    }
+    Id shift_amount(Id n) {
+        auto it = consts.find(n);
+        return it != consts.end() ? u(it->second & 31) : band(n, u(31));
+    }
     Id f(float x) { return b.c_f32(x); }
     // Register variables keep their last value per basic block: a load after a store or load of
     // the same register in the same block reuses the value (far less SPIR-V for the driver).
@@ -107,9 +116,9 @@ struct T {
     Id bor(Id a, Id z) { return b.op(spv::OpBitwiseOr, t_u32, {a, z}); }
     Id bxor(Id a, Id z) { return b.op(spv::OpBitwiseXor, t_u32, {a, z}); }
     Id bnot(Id a) { return b.op(spv::OpNot, t_u32, {a}); }
-    Id shl(Id a, Id n) { return b.op(spv::OpShiftLeftLogical, t_u32, {a, band(n, u(31))}); }
-    Id shr(Id a, Id n) { return b.op(spv::OpShiftRightLogical, t_u32, {a, band(n, u(31))}); }
-    Id sar(Id a, Id n) { return b.op(spv::OpShiftRightArithmetic, t_u32, {a, band(n, u(31))}); }
+    Id shl(Id a, Id n) { return b.op(spv::OpShiftLeftLogical, t_u32, {a, shift_amount(n)}); }
+    Id shr(Id a, Id n) { return b.op(spv::OpShiftRightLogical, t_u32, {a, shift_amount(n)}); }
+    Id sar(Id a, Id n) { return b.op(spv::OpShiftRightArithmetic, t_u32, {a, shift_amount(n)}); }
     Id ne0(Id a) { return b.op(spv::OpINotEqual, t_bool, {a, u(0)}); }
     Id b2u(Id c) { return sel(t_u32, c, u(1), u(0)); }
     Id tof(Id x) { return bc(t_f32, x); }
@@ -126,6 +135,7 @@ struct T {
     }
     Id get_s(uint16_t i) { return i == SNULL ? u(0) : load(sreg(i), t_u32); }
     void set_s(uint16_t i, Id x) {
+        if (i == EXEC_LO) ++exec_gen;
         if (i != SNULL && i < SGPRS) store(sreg(i), x);
     }
     Id get_scc() { return load(scc, t_bool); }
@@ -200,13 +210,12 @@ struct T {
     Id pack_half(Id lo, Id hi) { return ext(GLSLstd450PackHalf2x16, t_u32, {b.op(spv::OpCompositeConstruct, t_v2f, {lo, hi})}); }
 
     // Lane state.
-    Id act_exec = 0, act_value = 0;
-    uint32_t act_block = ~0u;
+    Id act_value = 0;
+    uint32_t act_block = ~0u, act_gen = ~0u, exec_gen = 0;
     Id active() {
-        Id e = get_s(EXEC_LO);
-        if (e == act_exec && act_block == b.labels) return act_value;
-        act_exec = e, act_block = b.labels;
-        return act_value = ne0(band(shr(e, lane), u(1)));
+        if (act_gen == exec_gen && act_block == b.labels) return act_value;
+        act_gen = exec_gen, act_block = b.labels;
+        return act_value = mask_bit(get_s(EXEC_LO));
     }
     void set_v(uint16_t i, Id x) {
         Id old = get_v(i);
@@ -235,7 +244,7 @@ struct T {
         set_s(sdst, m);
         if (sdst != SNULL && p.wave64) set_s(uint16_t(sdst + 1), u(0));
     }
-    Id mask_bit(Id mask) { return ne0(band(shr(mask, lane), u(1))); }
+    Id mask_bit(Id mask) { return ne0(band(mask, lane_bit)); }
     Id fclamp(Id x, bool clamp) { return clamp ? ext(GLSLstd450FClamp, t_f32, {x, f(0), f(1)}) : x; }
     Id omod(Id x, uint8_t m) {
         if (m == 1) return b.op(spv::OpFMul, t_f32, {x, f(2)});
@@ -556,6 +565,7 @@ struct T {
     // Initial register state: user SGPRs from push constants, system values.
     void prologue() {
         lane = load(lane_var, t_u32);
+        lane_bit = shl(u(1), lane);
         // User SGPRs from this draw's record (push constant 0 points at it): only those root
         // parameters arrive in, the host leaves the rest zero (as the registers start).
         {
