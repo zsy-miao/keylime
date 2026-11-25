@@ -26,6 +26,7 @@ constexpr uint64_t TABLE = GIB / PAGE;          // 16384 entries per 1 GiB table
 constexpr uint64_t TABLE_BYTES = TABLE * 8;     // 128 KiB
 constexpr uint64_t POOL_TABLES = 256;           // tables per pool block (32 MiB)
 constexpr uint64_t GUARD = 1ull << 63;          // page-table entry bit: no GPU allocation covers the page
+constexpr uint64_t NEXT = 1ull << 62;           // page-table entry bit: the next page follows on the device (one load may span both)
 constexpr uint64_t GUARD_RECORD = DIRECTORY * 8; // in the directory block: u32 count, u32 shader, u64 address
 
 struct Region {
@@ -51,7 +52,7 @@ std::map<std::pair<uint64_t, uint64_t>, Shadow> g_shadows;  // (section, chunk)
 
 std::mutex g_lock;
 std::map<uint64_t, Region> g_regions;  // by start
-Block g_dir, g_scratch;
+Block g_dir, g_scratch, g_sink;  // sink: where shader stores that must not land go (no branch in the shader)
 std::vector<Block> g_pools;
 uint32_t g_pool_used = POOL_TABLES;  // tables used in the last pool
 uint64_t* g_tables[DIRECTORY] = {};   // host view of each directory entry's table (null: the empty one)
@@ -121,6 +122,21 @@ void map_pages(uint64_t start, uint64_t end, uint64_t device) {
         uint64_t e = device ? device + (p - start) : g_scratch.device;  // wraps for a partial first page
         if (device && g_guard && !g_owned.count(p >> 16)) e |= GUARD;
         t[(p >> 16) & (TABLE - 1)] = e;
+    }
+    // NEXT bits of the pages around the range: set where the following page continues on the device.
+    auto slot = [](uint64_t p) -> uint64_t* {
+        uint64_t d = p >> 30;
+        if (d >= DIRECTORY || !g_tables[d]) return nullptr;
+        return &g_tables[d][(p >> 16) & (TABLE - 1)];
+    };
+    uint64_t first = (start & ~(PAGE - 1)) - PAGE;
+    for (uint64_t p = first; p < end; p += PAGE) {
+        uint64_t* cur = slot(p);
+        if (!cur) continue;
+        uint64_t* nxt = slot(p + PAGE);
+        uint64_t a = *cur & ~(GUARD | NEXT), z = nxt ? *nxt & ~(GUARD | NEXT) : 0;
+        bool cont = nxt && a != g_scratch.device && z == a + PAGE && ((*cur ^ *nxt) & GUARD) == 0;
+        *cur = cont ? *cur | NEXT : *cur & ~NEXT;
     }
 }
 
@@ -380,9 +396,11 @@ bool start() {
         return false;
     }
     // Scratch: where unmapped pages lead (one page plus room for a wide access past its end).
-    if (!make_block(2 * PAGE, true, g_scratch) || !make_block(GUARD_RECORD + 64, true, g_dir)) return false;
+    if (!make_block(2 * PAGE, true, g_scratch) || !make_block(GUARD_RECORD + 64, true, g_dir) || !make_block(PAGE, false, g_sink)) return false;
     memset(g_scratch.map, 0, size_t(g_scratch.size));
     memset(g_dir.map + GUARD_RECORD, 0, 64);
+    memcpy(g_dir.map + GUARD_RECORD + 16, &g_sink.device, 8);     // shaders read the sink's address here
+    memcpy(g_dir.map + GUARD_RECORD + 24, &g_scratch.device, 8);  // and a zero page's
     char v[4];
     g_guard = !(GetEnvironmentVariableA("KEYLIME_STORE_GUARD", v, sizeof v) && v[0] == '0');
     if (g_guard) std::thread(watch_guard).detach();

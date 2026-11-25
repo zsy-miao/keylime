@@ -283,10 +283,19 @@ struct T {
 
     // -------------------------------------------------------- memory ----
     // title address -> device address through the 2-level page table (1 GiB, 64 KiB pages).
-    Id page_table() { return load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(1)}), t_u64); }
+    // The page table's address and the sink page's (loaded once, in the entry block).
+    Id pt_base = 0, sink_base = 0, zero_base = 0;
+    Id page_table() { return pt_base ? pt_base : load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(1)}), t_u64); }
+    void memory_bases() {
+        pt_base = page_table();
+        Id at = b.op(spv::OpIAdd, t_u64, {pt_base, b.c_u64((1ull << 17) * 8 + 16)});
+        sink_base = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {at}), uint32_t(spv::MemoryAccessAlignedMask), 8});
+        Id at2 = b.op(spv::OpIAdd, t_u64, {pt_base, b.c_u64((1ull << 17) * 8 + 24)});
+        zero_base = b.op(spv::OpLoad, t_u64, {b.op(spv::OpConvertUToPtr, p_psb_u64, {at2}), uint32_t(spv::MemoryAccessAlignedMask), 8});
+    }
     Id translate_addr(Id addr) { return dev_of(page_entry(addr), addr); }
     Id dev_of(Id entry, Id addr) {
-        Id page = b.op(spv::OpBitwiseAnd, t_u64, {entry, b.c_u64(~(1ull << 63))});
+        Id page = b.op(spv::OpBitwiseAnd, t_u64, {entry, b.c_u64(~(3ull << 62))});  // bits 63 guard, 62 next-page-follows
         return b.op(spv::OpIAdd, t_u64, {page, b.op(spv::OpBitwiseAnd, t_u64, {addr, b.c_u64(0xffff)})});
     }
     // Entries of imported pages that no GPU resource or heap covers carry bit 63: stores there
@@ -326,63 +335,49 @@ struct T {
     // `count` consecutive dwords from `addr64`: one instruction touches at most two 64 KiB pages,
     // so two page-table walks serve all of them (the walks are half of a shader's driver
     // compile time when done per dword).
+    // `count` consecutive dwords from `addr64` with one page walk, at contiguous device addresses
+    // the driver can fetch as one load (per-dword page selects cost a third of a big shader's
+    // compile time). Spanning into the next page is fine where the host marked it as following
+    // on the device (bit 62, true inside every import); an access spanning two separate imports
+    // reads zeros.
     std::vector<Id> mem_load_n(Id addr64, int count) {
         std::vector<Id> out;
         auto word = [&](Id dev) {
             return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), uint32_t(spv::MemoryAccessAlignedMask), 4});
         };
-        Id dev0 = translate_addr(addr64);
+        Id e0 = page_entry(addr64);
+        Id dev0 = dev_of(e0, addr64);
         if (count == 1) return {word(dev0)};
-        Id last = b.op(spv::OpIAdd, t_u64, {addr64, b.c_u64(uint64_t(4 * (count - 1)))});
-        Id devl = translate_addr(last);
-        Id in_page = b.op(spv::OpBitwiseAnd, t_u64, {addr64, b.c_u64(0xffff)});
-        for (int k = 0; k < count; ++k) {
-            Id first = b.op(spv::OpULessThan, t_bool, {b.op(spv::OpIAdd, t_u64, {in_page, b.c_u64(uint64_t(4 * k))}), b.c_u64(0x10000)});
-            Id a = b.op(spv::OpIAdd, t_u64, {dev0, b.c_u64(uint64_t(4 * k))});
-            Id z = b.op(spv::OpISub, t_u64, {devl, b.c_u64(uint64_t(4 * (count - 1 - k)))});
-            out.push_back(word(b.op(spv::OpSelect, t_u64, {first, a, z})));
-        }
+        Id in_page = band(b.op(spv::OpUConvert, t_u32, {addr64}), u(0xffff));
+        Id fits = b.op(spv::OpULessThanEqual, t_bool, {in_page, u(uint32_t(0x10000 - 4 * count))});
+        Id next = b.op(spv::OpINotEqual, t_bool, {b.op(spv::OpBitwiseAnd, t_u64, {e0, b.c_u64(1ull << 62)}), b.c_u64(0)});
+        Id base = b.op(spv::OpSelect, t_u64, {b.op(spv::OpLogicalOr, t_bool, {fits, next}), dev0, zero_base});
+        for (int k = 0; k < count; ++k) out.push_back(word(b.op(spv::OpIAdd, t_u64, {base, b.c_u64(uint64_t(4 * k))})));
         return out;
     }
     Id mem_load(Id addr64) {
         Id dev = translate_addr(addr64);
         return b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), uint32_t(spv::MemoryAccessAlignedMask), 4});
     }
+    // Branch-free: lanes that must not store (inactive, address 0, or a page no GPU resource or
+    // heap covers) store to the sink page instead (a branch per store cost the driver much of
+    // its compile time).
     void mem_store_n(Id addr64, Id go, const std::vector<Id>& vals) {
         int count = int(vals.size());
-        Id yes = b.id(), after = b.id();
         go = b.op(spv::OpLogicalAnd, t_bool, {go, b.op(spv::OpINotEqual, t_bool, {addr64, b.c_u64(0)})});
-        b.op_void(spv::OpSelectionMerge, {after, 0});
-        b.op_void(spv::OpBranchConditional, {go, yes, after});
-        b.label(yes);
-        Id e0 = page_entry(addr64), el = e0, in_page = 0;
-        Id dev0 = dev_of(e0, addr64), devl = dev0;
-        if (count > 1) {
-            Id last = b.op(spv::OpIAdd, t_u64, {addr64, b.c_u64(uint64_t(4 * (count - 1)))});
-            el = page_entry(last);
-            devl = dev_of(el, last);
-            in_page = b.op(spv::OpBitwiseAnd, t_u64, {addr64, b.c_u64(0xffff)});
+        Id e0 = page_entry(addr64);
+        Id ok = b.op(spv::OpLogicalAnd, t_bool, {go, b.op(spv::OpLogicalNot, t_bool, {guarded(e0)})});
+        if (count > 1) {  // one walk, contiguous on the device (see mem_load_n); else the sink
+            Id in_page = band(b.op(spv::OpUConvert, t_u32, {addr64}), u(0xffff));
+            Id fits = b.op(spv::OpULessThanEqual, t_bool, {in_page, u(uint32_t(0x10000 - 4 * count))});
+            Id next = b.op(spv::OpINotEqual, t_bool, {b.op(spv::OpBitwiseAnd, t_u64, {e0, b.c_u64(1ull << 62)}), b.c_u64(0)});
+            ok = b.op(spv::OpLogicalAnd, t_bool, {ok, b.op(spv::OpLogicalOr, t_bool, {fits, next})});
         }
-        Id bad = guarded(b.op(spv::OpBitwiseOr, t_u64, {e0, el}));
-        Id store_ = b.id(), skip = b.id();
-        b.op_void(spv::OpSelectionMerge, {skip, 0});
-        b.op_void(spv::OpBranchConditional, {bad, skip, store_});
-        b.label(store_);
+        Id base = b.op(spv::OpSelect, t_u64, {ok, dev_of(e0, addr64), sink_base});
         for (int k = 0; k < count; ++k) {
-            Id dev = dev0;
-            if (count > 1) {
-                Id first = b.op(spv::OpULessThan, t_bool, {b.op(spv::OpIAdd, t_u64, {in_page, b.c_u64(uint64_t(4 * k))}), b.c_u64(0x10000)});
-                Id a = b.op(spv::OpIAdd, t_u64, {dev0, b.c_u64(uint64_t(4 * k))});
-                Id z = b.op(spv::OpISub, t_u64, {devl, b.c_u64(uint64_t(4 * (count - 1 - k)))});
-                dev = b.op(spv::OpSelect, t_u64, {first, a, z});
-            }
+            Id dev = b.op(spv::OpIAdd, t_u64, {base, b.c_u64(uint64_t(4 * k))});
             b.op_void(spv::OpStore, {b.op(spv::OpConvertUToPtr, p_psb_u32, {dev}), vals[size_t(k)], uint32_t(spv::MemoryAccessAlignedMask), 4});
         }
-        b.op_void(spv::OpBranch, {skip});
-        b.label(skip);
-        report_guard(bad, addr64);
-        b.op_void(spv::OpBranch, {after});
-        b.label(after);
     }
     void mem_store(Id addr64, Id val) { mem_store_n(addr64, b.c_bool(true), {val}); }
     Id add64(Id a64, Id off32) { return b.op(spv::OpIAdd, t_u64, {a64, b.op(spv::OpUConvert, t_u64, {off32})}); }
@@ -633,6 +628,7 @@ struct T {
 
     // Initial register state: user SGPRs from push constants, system values.
     void prologue() {
+        memory_bases();
         lane = load(lane_var, t_u32);
         lane_bit = shl(u(1), lane);
         // User SGPRs from this draw's record (push constant 0 points at it): only those root
@@ -1819,7 +1815,6 @@ struct T {
         Id go = b.op(spv::OpLogicalAnd, t_bool, {in_bounds, active()});
         Id a = b.op(spv::OpSelect, t_u64, {go, addr, b.c_u64(0)});
         Id bad = guarded(page_entry(a));
-        report_guard(bad, a);
         Id dev = translate_addr(b.op(spv::OpSelect, t_u64, {bad, b.c_u64(0), a}));
         Id ptr = b.op(spv::OpConvertUToPtr, p_psb_u32, {dev});
         Id v_ = get_v(data);
