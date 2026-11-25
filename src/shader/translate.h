@@ -27,6 +27,7 @@ struct Translation {
     std::vector<uint8_t> vs_input_rows, vs_output_rows, ps_input_rows;
     uint8_t mrt_mask = 0;
     bool writes_depth = false, discards = false;
+    uint32_t blocks = 0, guarded_blocks = 0;
 };
 
 // Host choices for one translation.

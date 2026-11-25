@@ -7,6 +7,7 @@
 // program order, loops only where the code branches backwards (see body()).
 // Memory goes through the title page table.
 #include "shader/translate.h"
+#include "shader/structure.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1682,6 +1683,10 @@ struct T {
     }
 
     void loop(Region& r, const std::vector<uint32_t>& starts) {
+        loop(r, [&] { range(r.lo, r.hi, starts, false); });
+    }
+
+    void loop(Region& r, const std::function<void()>& inner) {
         r.active = true;
         if_then(pc_in(r.lo, r.hi), [&] {
             Id header = b.id(), body_ = b.id(), cont = b.id(), merge = b.id();
@@ -1691,7 +1696,7 @@ struct T {
             b.op_void(spv::OpLoopMerge, {merge, cont, 0});
             b.op_void(spv::OpBranch, {body_});
             b.label(body_);
-            range(r.lo, r.hi, starts, false);
+            inner();
             b.op_void(spv::OpBranch, {cont});
             b.label(cont);
             Id t = iadd(load(trips, t_u32), u(1));
@@ -1701,6 +1706,70 @@ struct T {
             b.label(merge);
         });
         r.active = false;
+    }
+
+    std::vector<cfg::Term> terms() const {
+        std::vector<cfg::Term> out(end_block);
+        for (uint32_t bi = 0; bi < end_block; ++bi) {
+            cfg::Term& t = out[bi];
+            t.kind = cfg::Exit::End;
+            for (size_t ii = first_inst[bi]; ii < insts.size(); ++ii) {
+                const Inst& i = insts[ii];
+                if (ii != first_inst[bi] && block_of.count(i.offset)) {
+                    t.kind = cfg::Exit::Next;
+                    break;
+                }
+                if (gfx10::ends_program(i)) break;
+                uint32_t target;
+                if (!gfx10::branch_target(i, target)) continue;
+                auto tb = block_of.find(target);
+                auto fb = block_of.find(i.offset + i.size);
+                t.t = tb != block_of.end() ? tb->second : end_block;
+                t.f = fb != block_of.end() ? fb->second : end_block;
+                t.kind = std::string_view(i.name) == "s_branch" ? cfg::Exit::Jump : cfg::Exit::Branch;
+                break;
+            }
+        }
+        return out;
+    }
+
+    void if_else(Id cond, const std::function<void()>& f, const std::function<void()>& g) {
+        Id yes = b.id(), no = b.id(), after = b.id();
+        b.op_void(spv::OpSelectionMerge, {after, 0});
+        b.op_void(spv::OpBranchConditional, {cond, yes, no});
+        b.label(yes);
+        f();
+        b.op_void(spv::OpBranch, {after});
+        b.label(no);
+        g();
+        b.op_void(spv::OpBranch, {after});
+        b.label(after);
+    }
+
+    void count_plan(const std::vector<cfg::Node>& nodes) {
+        out.blocks = end_block;
+        std::function<void(const std::vector<cfg::Node>&)> walk = [&](const std::vector<cfg::Node>& ns) {
+            for (auto& x : ns) {
+                if (x.kind == cfg::Node::Range) out.guarded_blocks += x.b - x.a + 1;
+                walk(x.body);
+                walk(x.other);
+            }
+        };
+        walk(nodes);
+    }
+
+    Id pc_is(uint32_t k) { return b.op(spv::OpIEqual, t_bool, {load(pc, t_u32), u(k)}); }
+
+    void run(const std::vector<cfg::Node>& nodes, const std::vector<uint32_t>& starts) {
+        for (auto& x : nodes) {
+            switch (x.kind) {
+                case cfg::Node::Block: block(x.a, starts[x.a]); break;
+                case cfg::Node::If: if_then(pc_is(x.a), [&] { run(x.body, starts); }); break;
+                case cfg::Node::IfElse: if_else(pc_is(x.a), [&] { run(x.body, starts); }, [&] { run(x.other, starts); }); break;
+                case cfg::Node::Range: range(x.a, x.b, starts, false); break;
+                case cfg::Node::Loop: loop(regions[x.a], [&] { run(x.body, starts); }); break;
+            }
+        }
     }
 
     void range(uint32_t lo, uint32_t hi, const std::vector<uint32_t>& starts, bool top) {
@@ -1738,7 +1807,11 @@ struct T {
         }
         end_block = uint32_t(starts.size());
         find_regions();
-        range(0, end_block - 1, starts, true);
+        std::vector<cfg::Region> cr;
+        for (auto& r : regions) cr.push_back({r.lo, r.hi});
+        auto nodes = cfg::plan(terms(), cr);
+        count_plan(nodes);
+        run(nodes, starts);
         b.op_void(spv::OpReturn, {});
         b.end_function();
         // Entry point.
