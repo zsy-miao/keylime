@@ -27,7 +27,7 @@
     X(vkCmdPipelineBarrier2) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage)                \
     X(vkCmdBlitImage) X(vkCmdClearColorImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer)                      \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR)   \
-    X(vkQueuePresentKHR) X(vkGetMemoryHostPointerPropertiesEXT)
+    X(vkQueuePresentKHR) X(vkGetMemoryHostPointerPropertiesEXT)                              X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateComputePipelines)              X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets)     X(vkUpdateDescriptorSets) X(vkCreateSampler) X(vkDestroySampler) X(vkCmdBindPipeline)                      X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdDraw) X(vkCmdDrawIndexed)        X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdSetViewport) X(vkCmdSetScissor)
 
 namespace kl::vk {
 #define KL_VK_DECLARE(name) extern PFN_##name name;

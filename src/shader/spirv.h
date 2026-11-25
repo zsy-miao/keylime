@@ -40,6 +40,7 @@ public:
     Id t_f32() { return t_float(32); }
     Id t_vec(Id component, uint32_t n);
     Id t_array(Id element, uint32_t n);
+    Id t_array_fresh(Id element, uint32_t n);  // not cached (for types carrying layout decorations)
     Id t_runtime_array(Id element);
     Id t_struct(const std::vector<Id>& members);  // not cached
     Id t_ptr(spv::StorageClass sc, Id type);

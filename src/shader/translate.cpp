@@ -229,7 +229,7 @@ struct T {
         b.capability(spv::CapabilityImageQuery);
         types();
         // Push constants.
-        Id a32 = b.t_array(t_u32, 32), a4 = b.t_array(t_u32, 4);
+        Id a32 = b.t_array_fresh(t_u32, 32), a4 = b.t_array_fresh(t_u32, 4);
         b.decorate(a32, spv::DecorationArrayStride, {4});
         b.decorate(a4, spv::DecorationArrayStride, {4});
         Id st = b.t_struct({a32, t_u64, t_u64, a4});
@@ -258,7 +258,7 @@ struct T {
             interface.push_back(vars[i]);
         }
         lane_var = input(t_u32, spv::BuiltInSubgroupLocalInvocationId);
-        b.decorate(lane_var, spv::DecorationFlat);
+        if (p.stage == HwStage::Ps) b.decorate(lane_var, spv::DecorationFlat);
         if (p.stage == HwStage::Vs) {
             vertex_index = input(t_i32, spv::BuiltInVertexIndex);
             instance_index = input(t_i32, spv::BuiltInInstanceIndex);
@@ -364,9 +364,11 @@ struct T {
         auto code = p.patched_code();
         uint32_t at = 0;
         std::set<uint32_t> leaders = {0};
+        bool ended = false;
         while (at < code.size()) {
             Inst i;
             if (!gfx10::decode(code.data(), code.size(), at, i)) {
+                if (ended) break;  // data after the program's end
                 char e[64];
                 snprintf(e, sizeof e, "undecodable instruction at 0x%x", at);
                 error = e;
@@ -376,6 +378,7 @@ struct T {
             uint32_t target;
             if (gfx10::branch_target(i, target)) leaders.insert(target), leaders.insert(at + i.size);
             if (gfx10::ends_program(i)) {
+                ended = true;
                 leaders.insert(at + i.size);
                 // Code after the end may be data or unreachable padding; keep decoding while it decodes.
             }
@@ -1072,8 +1075,9 @@ struct T {
             Id texel = b.op(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
             // Only active lanes store: branch around.
             Id yes = b.id(), after = b.id();
+            Id act = active();
             b.op_void(spv::OpSelectionMerge, {after, 0});
-            b.op_void(spv::OpBranchConditional, {active(), yes, after});
+            b.op_void(spv::OpBranchConditional, {act, yes, after});
             b.label(yes);
             b.op_void(spv::OpImageWrite, {img, coord, texel});
             b.op_void(spv::OpBranch, {after});
@@ -1123,8 +1127,9 @@ struct T {
             if (i.exp_done) {
                 // Lanes not in EXEC at the final export are discarded.
                 Id kill = b.id(), keep = b.id();
+                Id act = active();
                 b.op_void(spv::OpSelectionMerge, {keep, 0});
-                b.op_void(spv::OpBranchConditional, {active(), keep, kill});
+                b.op_void(spv::OpBranchConditional, {act, keep, kill});
                 b.label(kill);
                 b.op_void(spv::OpKill, {});
                 b.label(keep);
@@ -1151,8 +1156,8 @@ struct T {
         // Case labels per block.
         std::vector<std::pair<uint32_t, Id>> cases;
         for (auto& [off, n] : block_of) cases.push_back({n, b.id()});
-        b.op_void(spv::OpSelectionMerge, {sw_merge, 0});
         std::vector<uint32_t> sw = {load(pc, t_u32), sw_merge};
+        b.op_void(spv::OpSelectionMerge, {sw_merge, 0});
         for (auto& [n, l] : cases) sw.push_back(n), sw.push_back(l);
         b.op_void(spv::OpSwitch, sw);
         // Emit blocks.

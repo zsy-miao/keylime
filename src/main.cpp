@@ -20,7 +20,7 @@ namespace fs = std::filesystem;
 namespace kl {
 
 namespace cpu { void install(); }
-namespace shader { int tool(const std::filesystem::path&, bool); }
+namespace shader { int tool(const std::filesystem::path&, bool); int validate(const std::filesystem::path&, bool driver); }
 static Runtime g_runtime;
 Runtime& runtime() { return g_runtime; }
 
@@ -126,6 +126,10 @@ static int run(const fs::path& exe, bool execute, bool list_only) {
 int wmain(int argc, wchar_t** argv) {
     using namespace kl;
     SetConsoleOutputCP(CP_UTF8);
+    if (argc >= 4 && !wcscmp(argv[1], L"shader") && (!wcscmp(argv[3], L"--spirv") || !wcscmp(argv[3], L"--spirv-only"))) {
+        log_open(nullptr);
+        return shader::validate(argv[2], !wcscmp(argv[3], L"--spirv"));
+    }
     if (argc >= 3 && !wcscmp(argv[1], L"shader")) return shader::tool(argv[2], argc > 3 && !wcscmp(argv[3], L"--dis"));
     if (argc < 3 || (wcscmp(argv[1], L"run") != 0 && wcscmp(argv[1], L"imports") != 0)) {
         fprintf(stderr, "keylime run <title.exe> [--execute] [--console series-x|series-s]\n"

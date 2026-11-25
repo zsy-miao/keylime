@@ -109,6 +109,12 @@ Id Builder::t_array(Id e, uint32_t n) {
     Id len = c_u32(n);
     KL_TYPE((std::vector<uint32_t>{uint32_t(spv::OpTypeArray), e, len}), spv::OpTypeArray, e, len);
 }
+Id Builder::t_array_fresh(Id e, uint32_t n) {
+    Id len = c_u32(n);
+    Id r = id();
+    emit(globals_, spv::OpTypeArray, {r, e, len});
+    return r;
+}
 Id Builder::t_runtime_array(Id e) { KL_TYPE((std::vector<uint32_t>{uint32_t(spv::OpTypeRuntimeArray), e}), spv::OpTypeRuntimeArray, e); }
 Id Builder::t_struct(const std::vector<Id>& members) {
     Id r = id();
