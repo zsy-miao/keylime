@@ -17,6 +17,7 @@
 #include "hle/files.h"
 #include "hle/hle.h"
 #include "hle/xmem.h"
+#include "formats/bcpack.h"
 #include "log.h"
 #include "stats.h"
 #include "miniz.h"
@@ -199,11 +200,6 @@ HRESULT execute(const Request& r) {
     if (r.options & ~(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE)) return E_NOTIMPL;
     if (!r.source || !r.destination) return E_INVALIDARG;
     const unsigned bc = unsigned((r.options & BCPACK) >> 1);
-    if (bc) {
-        static std::atomic<bool> warned{false};
-        if (!warned.exchange(true)) KL_WARN("dstorage", "BCPack requests fail for now (BC format %u)", bc);
-        return E_NOTIMPL;
-    }
     // Source bytes.
     std::vector<uint8_t> src_buf;
     const uint8_t* src = nullptr;
@@ -220,7 +216,27 @@ HRESULT execute(const Request& r) {
     const bool zlib = r.options & ZLIB;
     size_t out_len = zlib ? r.destination_size : r.source_size;
     if (!zlib && r.source_size > r.destination_size) return E_INVALIDARG;
+    if (bc) out_len = r.destination_size;
     auto fill = [&](uint8_t* out) -> HRESULT {
+        if (bc) {
+            // The console's order: zlib first (into the intermediate size), then BCPack.
+            std::vector<uint8_t> packed;
+            const uint8_t* in = src;
+            size_t in_len = r.source_size;
+            if (zlib) {
+                packed.resize(r.intermediate_size ? r.intermediate_size : size_t(r.source_size) * 4);
+                size_t n = tinfl_decompress_mem_to_mem(packed.data(), packed.size(), src, r.source_size, TINFL_FLAG_PARSE_ZLIB_HEADER);
+                if (n == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) return INVALID_DATA;
+                in = packed.data(), in_len = n;
+            }
+            if (const char* why = bcpack::decode(bc, in, in_len, out, r.destination_size)) {
+                static std::atomic<int> warned{0};
+                if (warned++ < 8) KL_WARN("dstorage", "BCPack (BC%u, %zu -> %u bytes): %s", bc, in_len, r.destination_size, why);
+                return INVALID_DATA;
+            }
+            stats::add(stats::BcpackBytes, r.destination_size);
+            return S_OK;
+        }
         if (!zlib) {
             memcpy(out, src, r.source_size);
             return S_OK;

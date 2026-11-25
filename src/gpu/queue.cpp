@@ -18,6 +18,8 @@
 #include "gpu/list.h"
 #include "gpu/present.h"
 #include "gpu/stream.h"
+#include "hle/xmem.h"
+#include <atomic>
 #include "log.h"
 #include "stats.h"
 
@@ -86,6 +88,44 @@ HRESULT WINAPI present_x(Queue* q, uint32_t planes, const void* plane_list, cons
     return present::present(q->host, planes, plane_list, params);
 }
 
+// CopyPageMappingsBatchX(count, batches, pool, pool pages, flags): maps pages of a pool (memory the
+// title mapped physical pages into) at the batches' addresses. GTA VI streams textures into pool
+// pages and maps them into its tiled heap this way. Layout and semantics as VIctory found them
+// (queue.rs). Done at once: earlier work on the GPU sees the old mapping only if it already ran,
+// which is how titles use it (after their fences).
+struct PageRange { uint32_t kind, start, count; };  // kind: 0 pool pages from start, 1 page start each, 2 unmap, 3 keep
+struct PageBatch { uint64_t destination; uint32_t count; const PageRange* ranges; };
+HRESULT WINAPI copy_page_mappings(Queue*, uint32_t count, const PageBatch* batches, uint64_t pool, uint32_t pool_pages, uint32_t) {
+    constexpr uint64_t PAGE = 64 << 10;
+    if (!batches && count) return E_INVALIDARG;
+    bool ok = true;
+    for (uint32_t i = 0; i < count; ++i) {
+        const PageBatch& b = batches[i];
+        if (!b.ranges) continue;
+        uint64_t at = b.destination;
+        for (uint32_t k = 0; k < b.count; ++k) {
+            const PageRange& r = b.ranges[k];
+            uint64_t len = uint64_t(r.count) * PAGE, src = pool + uint64_t(r.start) * PAGE;
+            auto inside = [&](uint64_t pages) { return uint64_t(r.start) + pages <= pool_pages; };
+            switch (r.kind) {
+                case 0: ok &= inside(r.count) && xmem::map_alias(at, src, len); break;
+                case 1:
+                    if (!inside(1)) ok = false;
+                    else
+                        for (uint32_t p = 0; p < r.count; ++p) ok &= xmem::map_alias(at + p * PAGE, src, PAGE);
+                    break;
+                case 2: ok &= xmem::map_alias(at, 0, len); break;
+                case 3: break;
+                default: ok = false;
+            }
+            at += len;
+        }
+    }
+    static std::atomic<int> warned{0};
+    if (!ok && warned++ < 4) KL_WARN("gpu", "a page mapping into the tiled heap failed (pool %llx)", (unsigned long long)pool);
+    return S_OK;
+}
+
 void** make(bool newer) {
     void** t = make_table(Kind::Queue, 40);
     fill_object(t, (void*)&query);
@@ -99,6 +139,7 @@ void** make(bool newer) {
     at(15, (void*)&wait);                 // 0x78 (0x88)
     at(16, (void*)&timestamp_frequency);  // 0x80 (0x90)
     at(26, (void*)&get_desc);             // 0xd0
+    at(29, (void*)&copy_page_mappings);   // 0xe8 (0xf8)
     at(30, (void*)&present_x);            // 0xf0 (0x100)
     at(32, (void*)&signal2_x);            // 0x100
     at(33, (void*)&execute_x);            // 0x108 (0x118)

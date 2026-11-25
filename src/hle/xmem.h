@@ -15,6 +15,9 @@ bool write_physical_locked(const uint64_t* pages, size_t page_count, size_t offs
 // Called (outside xmem's lock) with each title range write_physical changed.
 using WriteHook = void (*)(uint64_t address, uint64_t len);
 void set_write_hook(WriteHook h);
+// Called (outside xmem's lock) when a title range starts showing other pages.
+void set_remap_hook(WriteHook h);
+bool map_alias(uint64_t to, uint64_t from, uint64_t len);
 
 // Title memory sizes for the current console: (GPU-optimal, standard).
 void title_memory(size_t& gpu_optimal, size_t& standard);

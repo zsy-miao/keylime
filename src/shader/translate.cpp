@@ -1324,7 +1324,9 @@ struct T {
     Id slot_of(Id key_lo, Id key_hi) {
         Id tt = load(b.op(spv::OpAccessChain, p_pc_u64, {push, u(2)}), t_u64);
         Id mask = b.op(spv::OpLoad, t_u32, {b.op(spv::OpConvertUToPtr, p_psb_u32, {tt}), uint32_t(spv::MemoryAccessAlignedMask), 4});
-        Id h = band(bxor(key_lo, b.op(spv::OpIMul, t_u32, {key_hi, u(0x9e3779b1)})), mask);
+        // Hash (must match images.cpp): x = lo * K1 ^ hi * K2; x ^= x >> 15.
+        Id hx = bxor(b.op(spv::OpIMul, t_u32, {key_lo, u(0x9e3779b1u)}), b.op(spv::OpIMul, t_u32, {key_hi, u(0x85ebca6bu)}));
+        Id h = band(bxor(hx, shr(hx, u(15))), mask);
         Id result = u(0);
         // Up to 8 probes, unrolled (the host keeps the load factor low).
         for (int probe = 7; probe >= 0; --probe) {

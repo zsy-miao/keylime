@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <string>
 #include <vector>
 
 #include "hle/hle.h"
@@ -189,8 +190,48 @@ bool focused() {
     return pid == GetCurrentProcessId();
 }
 
+// KEYLIME_KEYS="14:RETURN,30:A": keys held for 300 ms at those seconds after start (for testing
+// without a person at the keyboard). Names: RETURN, ESCAPE, BACK, TAB, UP, DOWN, LEFT, RIGHT, SPACE, or one character.
+std::vector<std::pair<double, int>> scripted() {
+    std::vector<std::pair<double, int>> out;
+    char buf[1024]{};
+    if (!GetEnvironmentVariableA("KEYLIME_KEYS", buf, sizeof buf)) return out;
+    std::string all = buf;
+    size_t at = 0;
+    while (at < all.size()) {
+        size_t end = all.find(',', at);
+        std::string item = all.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        at = end == std::string::npos ? all.size() : end + 1;
+        size_t colon = item.find(':');
+        if (colon == std::string::npos) continue;
+        double t = atof(item.substr(0, colon).c_str());
+        std::string name = item.substr(colon + 1);
+        static const std::pair<const char*, int> names[] = {{"RETURN", VK_RETURN}, {"ESCAPE", VK_ESCAPE}, {"BACK", VK_BACK},
+                                                            {"TAB", VK_TAB},       {"UP", VK_UP},         {"DOWN", VK_DOWN},
+                                                            {"LEFT", VK_LEFT},     {"RIGHT", VK_RIGHT},   {"SPACE", VK_SPACE}};
+        int vk = 0;
+        for (auto& [n, v] : names)
+            if (name == n) vk = v;
+        if (!vk && name.size() == 1) vk = toupper(uint8_t(name[0]));
+        if (vk) out.push_back({t, vk});
+    }
+    return out;
+}
+
 std::vector<KeyState> host_keys() {
     std::vector<KeyState> keys;
+    static const auto script = scripted();
+    static const uint64_t start = GetTickCount64();
+    if (!script.empty()) {
+        double now = double(GetTickCount64() - start) / 1000.0;
+        for (auto& [t, vk] : script)
+            if (now >= t && now < t + 0.3) {
+                KeyState k{};
+                k.virtual_key = uint8_t(vk);
+                k.scan_code = MapVirtualKeyW(UINT(vk), MAPVK_VK_TO_VSC_EX);
+                keys.push_back(k);
+            }
+    }
     if (!focused()) return keys;
     for (int vk = 8; vk < 256; ++vk) {
         if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) continue;  // sided ones are reported

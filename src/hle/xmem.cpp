@@ -351,7 +351,30 @@ void gpu_free(void* p) {
     if (p) VirtualFree(p, 0, MEM_RELEASE);
 }
 
-WriteHook g_write_hook = nullptr;
+WriteHook g_write_hook = nullptr, g_remap_hook = nullptr;
+void set_remap_hook(WriteHook h) { g_remap_hook = h; }
+
+// Shows the physical pages mapped at [from, from + len) at `to` as well (in place of what `to`
+// showed); `from` 0 unmaps. The GPU queue's page-mapping copies: titles stream into pool pages and
+// map them into a tiled heap this way. False if a source page is not mapped physical memory.
+bool map_alias(uint64_t to, uint64_t from, uint64_t len) {
+    bool ok = true;
+    {
+        std::lock_guard g(g_lock);
+        unmap(g_phys, uintptr_t(to), size_t(len));
+        for (uint64_t k = 0; from && k < len; k += kPage) {
+            uintptr_t at = uintptr_t(from + k);
+            auto it = g_phys.views.upper_bound(at);
+            if (it == g_phys.views.begin()) { ok = false; break; }
+            --it;
+            if (at >= it->first + it->second.first) { ok = false; break; }
+            Slice s{it->second.second.section, it->second.second.index + (at - it->first) / kPage};
+            if (!map_view(g_phys, uintptr_t(to + k), kPage, s)) { ok = false; break; }
+        }
+    }
+    if (g_remap_hook) g_remap_hook(to, len);  // new contents there (outside our lock)
+    return ok;
+}
 thread_local std::vector<std::pair<uint64_t, uint64_t>> g_notes;
 
 void set_write_hook(WriteHook h) { g_write_hook = h; }

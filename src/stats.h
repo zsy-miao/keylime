@@ -11,7 +11,7 @@ enum Counter : int {
     Presents, Submits, Lists, Draws, Dispatches, Copies, Barriers, OtherCommands,
     Pipelines, Resources, StorageRequests, StorageBytes, StorageFailures, FilesOpened,
     XmaVoices, XmaFrames, OpusPackets, AudioCommands, InputReadings, Stubs,
-    Images, TextureUploads, TextureWrites, DrawsRun, DispatchesRun, DrawsSkipped, FramesShown, Count
+    Images, TextureUploads, TextureWrites, DrawsRun, DispatchesRun, DrawsSkipped, FramesShown, BcpackBytes, Count
 };
 
 extern std::atomic<uint64_t> g_counters[Count];

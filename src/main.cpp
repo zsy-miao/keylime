@@ -2,9 +2,11 @@
 //   keylime run <title.exe> [--execute] [--console series-x|series-s]
 //   keylime imports <title.exe>        list what the title imports and how we would bind it
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <cstdio>
 #include <fstream>
+#include <thread>
 #include <sstream>
 #include <string>
 
@@ -74,6 +76,60 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// KEYLIME_STACKS_AT=<seconds>: logs where every thread is at that moment (title return addresses
+// on each stack), for finding what a stalled title waits on. Addresses are gathered while the
+// thread is suspended (no allocation), described after it resumes.
+static void stacks_later() {
+    char v[16]{};
+    if (!GetEnvironmentVariableA("KEYLIME_STACKS_AT", v, 16)) return;
+    double at = atof(v);
+    std::thread([at] {
+        Sleep(DWORD(at * 1000));
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te{sizeof te};
+        DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        uintptr_t exe = uintptr_t(GetModuleHandleW(nullptr));
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            uintptr_t found[12] = {};
+            int n = 0;
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_FULL;
+            if (SuspendThread(h) != DWORD(-1)) {
+                if (GetThreadContext(h, &c)) {
+                    found[n++] = c.Rip;
+                    auto* sp = reinterpret_cast<const uintptr_t*>(c.Rsp);
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (VirtualQuery(sp, &mbi, sizeof mbi)) {
+                        auto* end = reinterpret_cast<const uintptr_t*>(static_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize);
+                        for (int i = 0; i < 4096 && sp + i < end && n < 12; ++i) {
+                            DWORD64 base = 0;
+                            // Code only: return addresses inside functions with unwind data, in title images or ours.
+                            if ((loader().find(sp[i]) || (sp[i] >= exe && sp[i] < exe + (32u << 20))) &&
+                                RtlLookupFunctionEntry(sp[i], &base, nullptr))
+                                found[n++] = sp[i];
+                        }
+                    }
+                }
+                ResumeThread(h);
+            }
+            PWSTR desc = nullptr;
+            std::string name;
+            if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc) {
+                for (PWSTR q = desc; *q; ++q) name.push_back(char(*q));
+                LocalFree(desc);
+            }
+            CloseHandle(h);
+            if (!n) continue;
+            KL_INFO("stacks", "thread %lu %s: at %s", te.th32ThreadID, name.c_str(), describe(found[0]).c_str());
+            for (int i = 1; i < n; ++i) KL_INFO("stacks", "    %s", describe(found[i]).c_str());
+        }
+        CloseHandle(snap);
+    }).detach();
+}
+
 // ------------------------------------------------------------------- run ----
 
 static uint32_t title_id_from_manifest(const fs::path& dir) {
@@ -114,7 +170,8 @@ static int run(const fs::path& exe, bool execute, bool list_only) {
         return 0;
     }
     AddVectoredExceptionHandler(1, on_exception);
-    cpu::install();  // first: AMD-only instructions are emulated before any report
+    cpu::install();
+    stacks_later();  // first: AMD-only instructions are emulated before any report
     stats::start();
     uint32_t code = l.run_main();
     KL_INFO("main", "title exited with %u", code);

@@ -135,7 +135,14 @@ HRESULT WINAPI D3D12XboxCreateDevice(void*, const uint32_t* parameters, const Ii
     bool ok = true;
     std::call_once(once, [&] {
         ok = host::start() && memory::start() && images::start() && exec::start();
-        if (ok) xmem::set_write_hook([](uint64_t a, uint64_t n) { images::written(a, n); });
+        if (ok) {
+            xmem::set_write_hook([](uint64_t a, uint64_t n) { images::written(a, n); });
+            // Other pages there now: imports of the old ones go, textures there reload.
+            xmem::set_remap_hook([](uint64_t a, uint64_t n) {
+                memory::forget(a, n);
+                images::written(a, n);
+            });
+        }
     });
     if (!ok || !host::ready()) {
         KL_ERROR("gpu", "no host GPU: the title cannot draw");

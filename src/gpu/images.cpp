@@ -23,6 +23,9 @@ constexpr uint32_t IMAGE_SLOTS = 65536, SAMPLER_SLOTS = 4096, STORAGE_SLOTS = 16
 constexpr uint32_t TABLE_ENTRIES = 1u << 17;  // power of two; entries of 16 bytes after a 16-byte header
 constexpr uint64_t CHUNK = 256ull << 20;
 constexpr uint64_t PAGE4K = 4096;
+uint64_t lo4k(uint64_t a) { return a & ~(PAGE4K - 1); }
+uint64_t hi4k(uint64_t a) { return (a + PAGE4K - 1) & ~(PAGE4K - 1); }
+uint64_t g_max_span = PAGE4K;  // the largest image's rounded size (for overlap searches)
 
 // ------------------------------------------------------------ formats ----
 struct Format {
@@ -217,7 +220,10 @@ bool g_started = false, g_watch = true;
 std::vector<uint32_t> g_families;
 
 // ----------------------------------------------------------- the table ----
-uint32_t hash(uint32_t lo, uint32_t hi) { return (lo ^ (hi * 0x9e3779b1u)) & (TABLE_ENTRIES - 1); }
+uint32_t hash(uint32_t lo, uint32_t hi) {  // must match the translator's slot_of
+    uint32_t x = lo * 0x9e3779b1u ^ hi * 0x85ebca6bu;
+    return (x ^ (x >> 15)) & (TABLE_ENTRIES - 1);
+}
 
 bool table_put(uint32_t lo, uint32_t hi, uint32_t slot) {
     auto* e = reinterpret_cast<volatile uint32_t*>(g_table.map + 16);
@@ -301,6 +307,7 @@ Image* create(uint64_t address, const resource::ResourceDesc& d) {
     im->fmt = fmt;
     im->has_layout = resource::texture_layout(d, im->layout);
     im->size = im->has_layout ? im->layout.size : 0;
+    if (hi4k(im->size) > g_max_span) g_max_span = hi4k(im->size);
     im->width = uint32_t(std::max<uint64_t>(1, d.width));
     im->height = d.dimension == resource::TEX1D ? 1 : std::max(1u, d.height);
     im->layers = std::max<uint32_t>(1, d.depth_or_array);  // 3D textures become arrays of their slices
@@ -411,32 +418,45 @@ void protect(uint64_t start, uint64_t end, DWORD prot) {
         at = rend;
     }
 }
-uint64_t lo4k(uint64_t a) { return a & ~(PAGE4K - 1); }
-uint64_t hi4k(uint64_t a) { return (a + PAGE4K - 1) & ~(PAGE4K - 1); }
+
+// Opens [start, end) for writing and marks every image there changed. Lock held.
+// Calls f(image) for every image whose (4 KiB-rounded) range overlaps [s, e). Lock held.
+template <class F>
+void overlapping(uint64_t s, uint64_t e, F f) {
+    auto it = g_images.lower_bound(e);
+    while (it != g_images.begin()) {
+        --it;
+        if (it->first + g_max_span + PAGE4K <= s) break;
+        Image* im = it->second;
+        if (hi4k(im->address + im->size) > s && lo4k(im->address) < e) f(im);
+    }
+}
+void mark_dirty(Image* im) {
+    if (!im->gpu_owned && !im->dirty && im->has_layout && !im->dead) {
+        im->dirty = true;
+        g_pending.push_back(im);
+    }
+}
 
 // Opens [start, end) for writing and marks every image there changed. Lock held.
 void open_range(uint64_t start, uint64_t end) {
     uint64_t s = start, e = end;
+    bool any_watched = false;
     // Every watched image touching the range opens entirely (so none keeps a half-open page).
     for (bool grew = true; grew;) {
         grew = false;
-        auto it = g_images.lower_bound(s > (64ull << 20) ? s - (64ull << 20) : 0);
-        for (; it != g_images.end() && it->first < e; ++it) {
-            Image* im = it->second;
+        overlapping(s, e, [&](Image* im) {
             uint64_t a = lo4k(im->address), b = hi4k(im->address + im->size);
-            if (b <= s || a >= e) continue;
             if (im->watched) {
                 im->watched = false;
+                any_watched = true;
                 if (a < s) s = a, grew = true;
                 if (b > e) e = b, grew = true;
             }
-            if (!im->gpu_owned && !im->dirty && im->has_layout) {
-                im->dirty = true;
-                g_pending.push_back(im);
-            }
-        }
+            mark_dirty(im);
+        });
     }
-    protect(lo4k(s), hi4k(e), PAGE_READWRITE);
+    if (any_watched) protect(lo4k(s), hi4k(e), PAGE_READWRITE);
 }
 
 LONG CALLBACK on_fault(EXCEPTION_POINTERS* x) {
@@ -846,9 +866,10 @@ void gpu_wrote(Image* im) {
 }
 
 void written(uint64_t address, uint64_t len) {
+    // Writes through another mapping (streaming): they never fault, so only the copies are stale.
     std::lock_guard g(g_lock);
     if (!g_started || g_images.empty()) return;
-    open_range(address, address + len);
+    overlapping(address, address + len, [](Image* im) { mark_dirty(im); });
 }
 
 VkFormat vk_format(uint32_t dxgi) { return format_of(dxgi).vk; }

@@ -66,6 +66,16 @@ uint64_t completed(HostQueue& h) {
     return v;
 }
 
+// A CPU copy that survives memory the title has not mapped (yet).
+bool safe_move(uint64_t dst, uint64_t src, uint64_t len) {
+    __try {
+        memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), size_t(len));
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
 // ---------------------------------------------------------- retiring ----
 struct Retiree {
     uint64_t need[2];
@@ -870,8 +880,8 @@ struct Builder {
             vk::vkCmdCopyBuffer(cb, sb, db, 1, &r);
             full_barrier(cb);
             images::written(dst, len);
-        } else {
-            memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), size_t(len));
+        } else if (!safe_move(dst, src, len)) {
+            once("a copy between unmapped title memory (%llx <- %llx) was dropped", (unsigned long long)dst, (unsigned long long)src);
         }
     }
 
