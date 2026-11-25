@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "gpu/descriptor.h"
@@ -1222,7 +1223,8 @@ VkPrimitiveTopology vk_topology(uint32_t t) {
     }
 }
 
-void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, uint64_t key);
+enum class Build { Optimized, Urgent, Rebuild };
+void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, uint64_t key, Build how = Build::Optimized);
 uint64_t request_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, bool urgent) {
     uint64_t key = 0xcbf29ce484222325ull;
     auto mix = [&](uint64_t v) { key = (key ^ v) * 0x100000001b3ull; };
@@ -1236,11 +1238,11 @@ uint64_t request_variant(Compiled* k, pipeline::State* st, const Attachments& a,
             k->variants[key] = VK_NULL_HANDLE;
             k->pending.insert(key);
             if (urgent) k->urgent_variants.insert(key);
-            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, urgent, urgent, !urgent);  // early ones: warm tier
+            job([k, st, a, topo, key, urgent] { build_variant(k, st, a, topo, key, urgent ? Build::Urgent : Build::Optimized); }, urgent, urgent, !urgent);  // early ones: warm tier
         } else if (urgent && k->pending.count(key) && k->urgent_variants.insert(key).second) {
             // An early start asked for it at low priority (behind thousands of background builds): a
             // draw waits now, so it gets an urgent build of its own; the first one done is kept.
-            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key); }, true, true);
+            job([k, st, a, topo, key] { build_variant(k, st, a, topo, key, Build::Urgent); }, true, true);
         }
     }
     return key;
@@ -1257,13 +1259,26 @@ VkPipeline variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
     return out;
 }
 
-void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, uint64_t key) {
-    {
+// During a build backlog a draw's variant is built unoptimized (several times faster in the
+// driver), and the optimized one replaces it later from the background queue.
+void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint32_t topo, uint64_t key, Build how) {
+    if (how != Build::Rebuild) {
         std::lock_guard g(st->lock);
         if (!k->pending.count(key)) return;  // the other (urgent or early) build got there first
     }
+    bool quick = how == Build::Urgent && backlogged() && !g_precompiling;
     int expand = topo == RECTLIST ? 0 : topo == QUADLIST ? 1 : -1;
     auto finish = [&](VkPipeline p) {
+        if (how == Build::Rebuild) {
+            if (!p) return;
+            VkPipeline old;
+            {
+                std::lock_guard g(st->lock);
+                old = std::exchange(k->variants[key], p);
+            }
+            if (old) retire([old] { vk::vkDestroyPipeline(dev(), old, nullptr); });
+            return;
+        }
         {
             std::lock_guard g(st->lock);
             if (!k->pending.count(key)) {  // built twice: keep the first
@@ -1274,6 +1289,7 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
             k->pending.erase(key);
         }
         precompiled(k);
+        if (quick && p) job([k, st, a, topo, key] { build_variant(k, st, a, topo, key, Build::Rebuild); });
     };
     VkPipelineShaderStageCreateInfo stages[3];
     uint32_t nstages = 0;
@@ -1366,6 +1382,7 @@ void build_variant(Compiled* k, pipeline::State* st, const Attachments& a, uint3
     ci.pColorBlendState = &bs;
     ci.pDynamicState = &dy;
     ci.layout = g_layout;
+    if (quick) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     VkPipeline p = VK_NULL_HANDLE;
     auto t0 = std::chrono::steady_clock::now();
     VkResult res = vk::vkCreateGraphicsPipelines(dev(), g_cache, 1, &ci, nullptr, &p);
