@@ -188,6 +188,7 @@ bool start() {
     vk::vkGetPhysicalDeviceFeatures2(h.physical, &f2);
     h.caps.buffer_address = f12.bufferDeviceAddress;
     h.caps.int64_atomics = f12.shaderBufferInt64Atomics;
+    h.caps.cache_control = f13.pipelineCreationCacheControl;
     if (!h.caps.buffer_address || !f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         KL_ERROR("vk", "the GPU lacks buffer device address / dynamic rendering / sync2 / timeline semaphores");
         return false;

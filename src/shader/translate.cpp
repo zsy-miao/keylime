@@ -1936,13 +1936,15 @@ struct T {
     }
 
     Id pc_is(uint32_t k) { return b.op(spv::OpIEqual, t_bool, {load(pc, t_u32), u(k)}); }
+    // A guard in front of block a; b > a when loops start at a (pc may name any block in them).
+    Id pc_at(const cfg::Node& x) { return x.b > x.a ? pc_in(x.a, x.b) : pc_is(x.a); }
 
     void run(const std::vector<cfg::Node>& nodes, const std::vector<uint32_t>& starts) {
         for (auto& x : nodes) {
             switch (x.kind) {
                 case cfg::Node::Block: block(x.a, starts[x.a]); break;
-                case cfg::Node::If: if_then(pc_is(x.a), [&] { run(x.body, starts); }); break;
-                case cfg::Node::IfElse: if_else(pc_is(x.a), [&] { run(x.body, starts); }, [&] { run(x.other, starts); }); break;
+                case cfg::Node::If: if_then(pc_at(x), [&] { run(x.body, starts); }); break;
+                case cfg::Node::IfElse: if_else(pc_at(x), [&] { run(x.body, starts); }, [&] { run(x.other, starts); }); break;
                 case cfg::Node::Range: range(x.a, x.b, starts, false); break;
                 case cfg::Node::Loop: loop(regions[x.a], [&] { run(x.body, starts); }); break;
             }

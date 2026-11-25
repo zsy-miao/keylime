@@ -53,12 +53,12 @@ void** table() {
     return t;
 }
 
-// KEYLIME_DUMP_SHADERS=<dir>: writes the first 400 distinct shader blobs there (for study).
+// KEYLIME_DUMP_SHADERS=<dir>: writes the first 20000 distinct shader blobs there (for study).
 void dump(uint32_t stage, const uint8_t* c, size_t n) {
     static char dir[MAX_PATH] = {};
     static bool on = GetEnvironmentVariableA("KEYLIME_DUMP_SHADERS", dir, MAX_PATH) > 0;
     static std::atomic<int> count{0};
-    if (!on || count >= 400) return;
+    if (!on || count >= 20000) return;
     uint64_t h = 0xcbf29ce484222325ull;
     for (size_t i = 0; i < n; ++i) h = (h ^ c[i]) * 0x100000001b3ull;
     char path[MAX_PATH + 64];

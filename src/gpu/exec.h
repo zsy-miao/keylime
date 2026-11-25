@@ -21,6 +21,10 @@ namespace kl::gpu::exec {
 bool start();  // once, after images::start
 // A pipeline state object was created: its shaders start translating and compiling now.
 void prepare(pipeline::State* st);
+// The title recorded a list that sets this pipeline: a compute pipeline starts its quick build
+// now, so the dispatches that use it find it ready instead of waiting for builds one by one.
+void wanted(void* pipeline_object);
+int precompile(const char* dir);  // keylime precompile <dir>
 
 constexpr int GRAPHICS = 0, COMPUTE = 1;
 int queue_for(uint32_t list_kind);  // D3D12 list type -> our queue

@@ -17,6 +17,9 @@
 
 #include "gpu/exec.h"
 #include "gpu/fence.h"
+#include "gpu/host.h"
+#include "gpu/images.h"
+#include "gpu/memory.h"
 #include "hle/files.h"
 #include "hle/hle.h"
 #include "loader.h"
@@ -105,7 +108,32 @@ static void minidump(EXCEPTION_POINTERS* ep) {
 // First-chance faults: many are handled (our probes, the title's own SEH), so each distinct
 // faulting address is reported once and the search goes on. The real crash is reported again,
 // with a minidump, by the unhandled filter.
+// The title's GPU watchdog ("GPU Loc Sig") ends the game with `mov dword [0], 0x4d8bd421` when
+// GPU work it waits on has not finished for ~25 s, as happens while new pipelines compile. Only
+// that thread is parked; the game goes on once the work does (as VIctory's forks do).
+// KEYLIME_WATCHDOG=1 lets it end the game as before.
+static bool park_watchdog(EXCEPTION_POINTERS* ep) {
+    static const bool off = [] {
+        char v[8]{};
+        return GetEnvironmentVariableA("KEYLIME_WATCHDOG", v, sizeof v) && v[0] == '1';
+    }();
+    auto* r = ep->ExceptionRecord;
+    if (off || r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[1] != 0) return false;
+    static const uint8_t stop[11] = {0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D};
+    uint8_t code[11]{};
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ep->ContextRecord->Rip), code, sizeof code, &got) || got != sizeof code ||
+        memcmp(code, stop, sizeof code) != 0)
+        return false;
+    static std::atomic<bool> once{false};
+    if (!once.exchange(true))
+        KL_WARN("main", "the title's GPU watchdog fired (its GPU work did not finish for ~25 s): that thread is parked and the game goes on "
+                        "(KEYLIME_WATCHDOG=1 lets it end the game)");
+    for (;;) Sleep(INFINITE);
+}
+
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
+    park_watchdog(ep);
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION &&
@@ -286,6 +314,14 @@ int wmain(int argc, wchar_t** argv) {
     if (argc >= 4 && !wcscmp(argv[1], L"shader") && (!wcscmp(argv[3], L"--spirv") || !wcscmp(argv[3], L"--spirv-only"))) {
         log_open(nullptr);
         return shader::validate(argv[2], !wcscmp(argv[3], L"--spirv"));
+    }
+    if (argc >= 3 && !wcscmp(argv[1], L"precompile")) {
+        // keylime precompile <dump dir>: builds dumped compute shaders into the caches a run uses.
+        log_open(nullptr);
+        if (!gpu::host::start() || !gpu::memory::start() || !gpu::images::start() || !gpu::exec::start()) return 2;
+        char dir[MAX_PATH];
+        WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, dir, sizeof dir, nullptr, nullptr);
+        return gpu::exec::precompile(dir);
     }
     if (argc >= 3 && !wcscmp(argv[1], L"shader")) return shader::tool(argv[2], argc > 3 && !wcscmp(argv[3], L"--dis"));
     if (argc < 3 || (wcscmp(argv[1], L"run") != 0 && wcscmp(argv[1], L"imports") != 0)) {

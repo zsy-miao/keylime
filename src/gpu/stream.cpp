@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 
+#include "gpu/exec.h"
 #include "gpu/memory.h"
 #include "gpu/resource.h"
 #include "log.h"
@@ -146,6 +147,11 @@ void WINAPI state1(void* l, uint64_t a) {
     if (auto* s = S(l)) s->add(OP, a);
     stats::add(stats::OtherCommands);
 }
+void WINAPI set_pipeline(void* l, uint64_t a) {
+    if (auto* s = S(l)) s->add(Op::SetPipeline, a);
+    stats::add(stats::OtherCommands);
+    exec::wanted(reinterpret_cast<void*>(a));
+}
 // Root arguments: G = 1 graphics, 0 compute.
 template <uint32_t G>
 void WINAPI root_signature(void* l, void* r) {
@@ -249,7 +255,7 @@ void fill_list_methods(void** t, bool newer) {
     at(22, (void*)&scissors);
     at(23, (void*)&blend_factor);
     at(24, (void*)&state1<Op::StencilRef>);
-    at(25, (void*)&state1<Op::SetPipeline>);
+    at(25, (void*)&set_pipeline);
     at(26, (void*)&barrier);
     at(28, (void*)&ignored);
     at(29, (void*)&ignored);

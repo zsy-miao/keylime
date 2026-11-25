@@ -625,7 +625,10 @@ VkShaderModule module(const shader::Program& p, const shader::Options& o, uint64
 // cache\used-pipelines.txt) start building as soon as the title creates them.
 std::mutex g_jobs_lock, g_done_lock;
 std::condition_variable g_jobs_cv, g_done_cv;
-std::deque<std::function<void()>> g_jobs;
+// g_urgent: what a draw or dispatch waits for now (first-use translations, quick compute
+// builds). Some workers take only those, so a backlog of optimized builds (30-90 s each for
+// big translated compute shaders) can never hold up a dispatch the title is waiting on.
+std::deque<std::function<void()>> g_jobs, g_urgent;
 void notify() {
     { std::lock_guard g(g_done_lock); }
     g_done_cv.notify_all();
@@ -680,18 +683,20 @@ void job(std::function<void()> f, bool urgent = false) {
     static std::once_flag once;
     std::call_once(once, [] {
         unsigned n = std::max(4u, std::min(16u, std::thread::hardware_concurrency() * 2 / 3));
-        for (unsigned i = 0; i < n; ++i)
-            std::thread([] {
-                SetThreadDescription(GetCurrentThread(), L"keylime-compile");
-                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        constexpr unsigned URGENT_ONLY = 8;
+        for (unsigned i = 0; i < n + URGENT_ONLY; ++i)
+            std::thread([urgent_only = i >= n] {
+                SetThreadDescription(GetCurrentThread(), urgent_only ? L"keylime-compile-urgent" : L"keylime-compile");
+                SetThreadPriority(GetCurrentThread(), urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
                 for (;;) {
                     std::function<void()> f;
                     {
                         std::unique_lock g(g_jobs_lock);
-                        g_jobs_cv.wait(g, [] { return !g_jobs.empty(); });
-                        f = std::move(g_jobs.front());
-                        g_jobs.pop_front();
-                        stats::set(stats::CompileQueue, g_jobs.size());
+                        g_jobs_cv.wait(g, [urgent_only] { return !g_urgent.empty() || (!urgent_only && !g_jobs.empty()); });
+                        auto& from = !g_urgent.empty() ? g_urgent : g_jobs;
+                        f = std::move(from.front());
+                        from.pop_front();
+                        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size());
                     }
                     f();
                     stats::g_counters[stats::Compiling].fetch_sub(1);
@@ -703,11 +708,12 @@ void job(std::function<void()> f, bool urgent = false) {
     });
     {
         std::lock_guard g(g_jobs_lock);
-        if (urgent) g_jobs.push_front(std::move(f));
+        if (urgent) g_urgent.push_back(std::move(f));
         else g_jobs.push_back(std::move(f));
-        stats::set(stats::CompileQueue, g_jobs.size());
+        stats::set(stats::CompileQueue, g_jobs.size() + g_urgent.size());
     }
-    g_jobs_cv.notify_one();
+    // notify_one could wake an urgent-only worker for normal work and lose the wakeup.
+    g_jobs_cv.notify_all();
 }
 constexpr uint64_t BUDGET_US[2] = {4000, 120000000};
 std::atomic<uint64_t> g_budget_frame[2]{~0ull, ~0ull}, g_waited_us[2]{}, g_waited_total{0};
@@ -802,7 +808,7 @@ void save_used(bool force) {
 }
 
 void shaders(pipeline::State* st, Compiled* k);
-VkPipeline compute_pipeline(Compiled* k, bool fast);
+VkPipeline compute_pipeline(Compiled* k, bool fast, bool only_cached = false);
 void prepare_and_submit(HostQueue& h, int qi, std::vector<Cb*> cbs);
 void optimize(Compiled* k);
 bool prebuild(pipeline::State* st, Compiled* k);
@@ -810,6 +816,20 @@ bool prebuild(pipeline::State* st, Compiled* k);
 // A worker translates the shaders; a compute pipeline a dispatch waits for gets a quick
 // unoptimized build first, then the optimized one (queued behind what draws wait for).
 void fast_build(Compiled* k);
+VkPipeline compute_pipeline(Compiled* k, bool fast, bool only_cached);
+std::atomic<bool> g_precompiling{false};
+// The optimized pipeline if the driver's cache already holds it (no compile).
+bool cached_optimized(Compiled* k) {
+    if (!host::get().caps.cache_control) return false;
+    VkPipeline p = compute_pipeline(k, false, true);
+    if (!p) return false;
+    k->compute.store(p, std::memory_order_release);
+    k->ready.store(true, std::memory_order_release);
+    stats::add(stats::PipelinesBuilt);
+    precompiled(k);
+    notify();
+    return true;
+}
 void translate_claimed(pipeline::State* st, Compiled* k, bool first_use) {
     shaders(st, k);
     k->translated.store(true, std::memory_order_release);
@@ -817,12 +837,19 @@ void translate_claimed(pipeline::State* st, Compiled* k, bool first_use) {
     if (!k->ok) precompiled(k);
     notify();
     if (st->compute && k->ok) {
-        if (first_use) {
-            fast_build(k);
-            job([k] { optimize(k); });
-        } else {
-            optimize(k);
+        // Already in the driver's cache (an earlier run or `keylime precompile`): ready now.
+        if (cached_optimized(k)) return;
+        // Early starts too: a quick build makes it runnable within about a second, the
+        // optimized one (up to a minute for big translated shaders) follows on a worker.
+        fast_build(k);
+        if (g_precompiling) {
+            // `keylime precompile`: the quick build is what a run needs at once (about a second
+            // each on all cores); optimized builds follow during play.
+            k->ready.store(true, std::memory_order_release);
+            notify();
+            return;
         }
+        job([k] { optimize(k); });
     } else if (k->ok) {
         if (!prebuild(st, k)) precompiled(k);
     }
@@ -909,13 +936,15 @@ VkPipeline runnable(pipeline::State* st, bool& pending) {
     return p ? p : k->fast.load(std::memory_order_acquire);
 }
 
-VkPipeline compute_pipeline(Compiled* k, bool fast) {
+VkPipeline compute_pipeline(Compiled* k, bool fast, bool only_cached) {
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.flags = fast ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
+    if (only_cached) ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, k->csm, "main", nullptr};
     ci.layout = g_layout;
     VkPipeline p = VK_NULL_HANDLE;
     VkResult r = vk::vkCreateComputePipelines(dev(), g_cache, 1, &ci, nullptr, &p);
+    if (only_cached && r != VK_SUCCESS) return VK_NULL_HANDLE;
     if (r != VK_SUCCESS) {
         static int n = 0;
         if (n++ < 16) KL_WARN("gpu", "compute pipeline not built by the driver%s: %s", fast ? " (unoptimized)" : "", vk::result_text(r));
@@ -2218,6 +2247,64 @@ void prepare(pipeline::State* st) {
     obtain(st, false)->early = true;
 }
 
+void wanted(void* obj) {
+    if (!g_started) return;
+    pipeline::State* st = pipeline::state(obj);
+    if (!st || !st->compute || st->shaders.empty()) return;
+    Compiled* k = obtain(st, true);
+    if (k->translated.load(std::memory_order_acquire) && k->ok && !k->compute.load() && !k->fast_claimed.load() &&
+        !k->fast_queued.exchange(true))
+        job([k] { fast_build(k); }, true);
+}
+
+// keylime precompile <dir>: builds every compute shader dumped there (KEYLIME_DUMP_SHADERS) into
+// cache\spirv and the driver cache (cache\pipelines.bin) on all workers, as a run would, so the
+// game finds them ready.
+int precompile(const char* dir) {
+    g_precompiling = true;
+    std::vector<std::pair<std::string, uint64_t>> files;
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA((std::string(dir) + "/cs-*.bin").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            unsigned long long h = 0;
+            if (sscanf(fd.cFileName, "cs-%llx.bin", &h) == 1) files.push_back({std::string(dir) + "\\" + fd.cFileName, uint64_t(h)});
+        } while (FindNextFileA(f, &fd));
+        FindClose(f);
+    }
+    printf("precompile: %zu compute shaders in %s\n", files.size(), dir);
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<Compiled*> all;
+    for (auto& [path, h] : files) {
+        FILE* in = fopen(path.c_str(), "rb");
+        if (!in) continue;
+        pipeline::Shader sh{5, {}, h};
+        fseek(in, 0, SEEK_END);
+        sh.code.resize(size_t(ftell(in)));
+        fseek(in, 0, SEEK_SET);
+        bool ok = fread(sh.code.data(), 1, sh.code.size(), in) == sh.code.size();
+        fclose(in);
+        if (!ok) continue;
+        auto* st = new pipeline::State();
+        st->compute = true;
+        st->shaders.push_back(std::move(sh));
+        all.push_back(obtain(st, true));
+    }
+    for (;;) {
+        size_t done = 0;
+        for (auto* k : all) done += k->ready.load();
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        printf("precompile: %zu of %zu built, %.0f s\n", done, all.size(), sec);
+        fflush(stdout);
+        if (done == all.size()) break;
+        Sleep(5000);
+    }
+    save_cache(true);
+    save_used(true);
+    printf("precompile: done in %.0f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return 0;
+}
+
 int queue_for(uint32_t kind) { return kind == 2 ? COMPUTE : GRAPHICS; }
 VkQueue vk_queue(int q) { return g_q[q & 1].q; }
 
@@ -2353,7 +2440,8 @@ void dump_state() {
     size_t jobs;
     {
         std::lock_guard g(g_jobs_lock);
-        jobs = g_jobs.size();
+        jobs = g_jobs.size() + g_urgent.size();
+        if (!g_urgent.empty()) KL_INFO("hang", "pipelines: %zu urgent compile jobs queued", g_urgent.size());
     }
     KL_INFO("hang", "pipelines: %zu compile jobs queued, %llu compiling, %llu built, %llu draws or dispatches dropped waiting",
             jobs, (unsigned long long)stats::g_counters[stats::Compiling].load(),
